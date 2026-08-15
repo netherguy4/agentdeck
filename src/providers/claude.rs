@@ -553,7 +553,7 @@ fn backoff_seconds(failures: u32) -> i64 {
     (MIN_POLL_SECONDS.saturating_mul(1 << shift)).min(BACKOFF_MAX_SECONDS)
 }
 
-fn humanize_age(seconds: i64) -> String {
+pub(crate) fn humanize_age(seconds: i64) -> String {
     let minutes = seconds / 60;
     match minutes {
         ..=0 => "меньше минуты".to_owned(),

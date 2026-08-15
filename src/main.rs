@@ -447,6 +447,7 @@ async fn daemon() -> Result<()> {
         let config = config::load()?;
         let state = refresh(&config).await;
         write_state(&state)?;
+        log_cycle(&state);
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(config.refresh_interval())) => {},
@@ -512,6 +513,31 @@ async fn refresh(config: &config::Config) -> AppState {
         updated_at: util::unix_now(),
         accounts,
     }
+}
+
+/// Однострочный итог цикла в journal: статус, возраст данных и ошибка каждого
+/// аккаунта. Без него причину «старых цифр» приходится выкапывать из state.json
+/// руками. Смотреть: journalctl --user -u ai-usage.service
+fn log_cycle(state: &AppState) {
+    let summary = state
+        .accounts
+        .iter()
+        .map(|account| {
+            let age = state.updated_at.saturating_sub(account.updated_at);
+            let mut part = format!(
+                "{}={} (данные: {})",
+                account.id,
+                account.status,
+                providers::claude::humanize_age(age)
+            );
+            if let Some(error) = &account.error {
+                part.push_str(&format!(" [{}]", error.replace('\n', "; ")));
+            }
+            part
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    eprintln!("[цикл] {summary}");
 }
 
 fn read_state() -> Option<AppState> {
