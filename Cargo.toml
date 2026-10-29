@@ -5,7 +5,11 @@ edition = "2021"
 description = "GNOME panel widget backend for Claude, Codex, Antigravity and DeepSeek usage"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/netherguy4/ai-usage-gnome"
-rust-version = "1.86"
+rust-version = "1.93"
+
+[workspace]
+members = [".", "crates/*"]
+resolver = "2"
 
 [dependencies]
 anyhow = "1.0"

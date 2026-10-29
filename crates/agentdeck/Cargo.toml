@@ -1,0 +1,13 @@
+[package]
+name = "agentdeck"
+version = "0.1.0"
+edition = "2024"
+description = "Manage Claude Code, Codex, OpenCode and Antigravity accounts"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/netherguy4/agentdeck"
+rust-version = "1.93"
+
+[dependencies]
+agentdeck-core = { path = "../agentdeck-core" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
