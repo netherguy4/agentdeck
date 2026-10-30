@@ -9,6 +9,7 @@ rust-version = "1.93"
 
 [workspace]
 members = [".", "crates/*"]
+default-members = [".", "crates/*"]
 resolver = "2"
 
 [dependencies]
