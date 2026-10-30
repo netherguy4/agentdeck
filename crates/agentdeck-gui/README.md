@@ -23,8 +23,8 @@ ISC License:
 > OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 > CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-## Design variants (temporary)
+## Review shots
 
-`AGENTDECK_UI_VARIANT=a|b|c` picks T3 Minimal (default), Cosmic Glass or
-Dense Console until one is chosen. Review shots:
-`AGENTDECK_VARIANT_SHOTS=<dir> cargo test -p agentdeck-gui --test gui variant_review_shots`.
+`AGENTDECK_SHOTS=<dir> cargo test -p agentdeck-gui --test overflow` renders
+every page at the minimum window size (900x560) with very long fixture names,
+in EN and RU, into `<dir>`.

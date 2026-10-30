@@ -690,11 +690,11 @@ fn plugins_page_preview_cancel_and_snapshots() {
 
     // Enable flow: the preview lists changes, Cancel drops it without writes.
     agentdeck_gui::i18n::set_language("en");
-    let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Enable agent-process").expect("enable button");
-    for message in ui.into_messages() {
-        let _ = app::update(&mut state, message);
-    }
+    // The card's toggle sends this.
+    let _ = app::update(
+        &mut state,
+        app::Message::EnablePlugin("agent-process".into()),
+    );
     let mut ui = iced_test::simulator(app::view(&state));
     ui.find("Confirm").expect("preview confirm button");
     ui.click("Cancel").expect("preview cancel button");
@@ -875,7 +875,8 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
     assert!(state.proc_ui().pending.is_some());
     let _ = app::update(&mut state, app::Message::ProcCancel);
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("ses1 (abc)").expect("group row toggles");
+    // The row shows the short title; the run id is in the expanded view.
+    ui.click("ses1").expect("group row toggles");
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
@@ -902,48 +903,4 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
         let _ = app::update(&mut state, message);
     }
     assert!(state.proc_ui().pending.is_none());
-}
-
-/// Review shots of the three design variants (Instances, Processes, Stop
-/// modal) for the owner; runs only with AGENTDECK_VARIANT_SHOTS=<dir>.
-#[test]
-fn variant_review_shots() {
-    let Some(dir) = std::env::var_os("AGENTDECK_VARIANT_SHOTS").map(PathBuf::from) else {
-        return;
-    };
-    use agentdeck_gui::style::{Variant, set_variant};
-    let env = lock_env();
-    let (data, paths, _guard) = load_with_fixtures("variants", &env);
-    std::fs::create_dir_all(&dir).unwrap();
-    agentdeck_gui::i18n::set_language("en");
-    for (variant, tag) in [
-        (Variant::Minimal, "a"),
-        (Variant::Glass, "b"),
-        (Variant::Console, "c"),
-    ] {
-        set_variant(variant);
-        let theme = agentdeck_gui::style::theme(true);
-        let instances = app::State::for_tests(paths.clone(), data.clone());
-        let procs = processes_state(&paths);
-        let mut modal = processes_state(&paths);
-        let _ = app::update(&mut modal, app::Message::ProcStop(0));
-        for (name, state) in [
-            ("instances", &instances),
-            ("processes", &procs),
-            ("modal", &modal),
-        ] {
-            let mut ui = iced_test::Simulator::with_size(
-                iced::Settings::default(),
-                (1100.0, 700.0),
-                app::view(state),
-            );
-            let shot = ui.snapshot(&theme).expect("headless snapshot");
-            let stem = dir.join(format!("{tag}-{name}"));
-            let written = dir.join(format!("{tag}-{name}-wgpu.png"));
-            let _ = std::fs::remove_file(&written);
-            assert!(shot.matches_image(stem.with_extension("png")).unwrap());
-            std::fs::rename(&written, stem.with_extension("png")).unwrap();
-        }
-    }
-    set_variant(Variant::Minimal);
 }

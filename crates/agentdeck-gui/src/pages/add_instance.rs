@@ -1,5 +1,6 @@
-//! Add-instance wizard: form, change preview, embedded PTY login, optional
-//! wrapper install and T3 sync. Core logic lives in `agentdeck-core`; this
+//! Add-instance wizard, a stepper: Details (form), Preview (core change
+//! list), Login (embedded PTY login), Finish (optional wrapper install and
+//! T3 sync). Core logic lives in `agentdeck-core`; this
 //! module is view state plus thin async wiring. Long work runs off the UI
 //! thread via `Task::perform`; login PTY output is drained from the login
 //! event channel on a 200 ms tick subscription (never blocking the UI).
@@ -12,8 +13,8 @@ use agentdeck_core::login::{self, LoginEvent, LoginSession, LoginTarget};
 use agentdeck_core::registry::{AddSpec, Harness};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, radio, row, scrollable, text_input};
-use iced::{Element, Subscription, Task};
+use iced::widget::{Space, column, container, radio, row, text_input};
+use iced::{Alignment, Element, Length, Subscription, Task};
 
 use crate::app::Message;
 use crate::i18n::loader;
@@ -179,6 +180,27 @@ pub struct Wizard {
     pub login: LoginState,
     pub wrapper: Preview,
     pub t3: Preview,
+    /// Login step left for Finish.
+    pub finish: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Details,
+    Preview,
+    Login,
+    Finish,
+}
+
+/// The step follows from the wizard state, so every existing message keeps
+/// working; only Next and Edit move between steps explicitly.
+pub fn step(wiz: &Wizard) -> Step {
+    match (&wiz.added_id, &wiz.preview) {
+        (Some(_), _) if wiz.finish => Step::Finish,
+        (Some(_), _) => Step::Login,
+        (None, Preview::Ready(_) | Preview::Working) => Step::Preview,
+        _ => Step::Details,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +211,10 @@ pub enum AddMsg {
     Home(String),
     UseSuggestion,
     Preview,
+    /// Back from Preview to Details.
+    Edit,
+    /// Login to Finish.
+    Next,
     PreviewReady(Result<Vec<String>, String>),
     Apply,
     ApplyDone(Result<Vec<String>, String>),
@@ -478,6 +504,14 @@ pub fn update_wizard(wiz: &mut Wizard, msg: AddMsg, paths: &Paths) -> Task<Messa
             wiz.home_dirty = false;
             Task::none()
         }
+        AddMsg::Edit => {
+            wiz.preview = Preview::Idle;
+            Task::none()
+        }
+        AddMsg::Next => {
+            wiz.finish = true;
+            Task::none()
+        }
         AddMsg::Preview => match spec_of(wiz) {
             Ok(spec) => {
                 wiz.preview = Preview::Working;
@@ -655,7 +689,7 @@ fn preview_lines(preview: &Preview) -> Vec<Element<'_, Message>> {
         Preview::Working => vec![st::muted(fl!(loader(), "add-working")).into()],
         Preview::Ready(lines) | Preview::Done(lines) => lines
             .iter()
-            .map(|line| st::body(line.clone()).into())
+            .map(|line| st::mono(line.as_str()).into())
             .collect(),
         Preview::Error(e) => vec![st::body(fl!(loader(), "load-error", what = e)).into()],
     }
@@ -672,12 +706,10 @@ fn optional_section(
         title,
         preview_lines(preview),
         vec![
-            button(st::body(fl!(loader(), "add-preview")))
-                .style(button::secondary)
+            st::btn(st::Btn::Quiet, fl!(loader(), "add-preview"))
                 .on_press(Message::Add(on_preview))
                 .into(),
-            button(st::body(fl!(loader(), "add-apply")))
-                .style(button::secondary)
+            st::btn(st::Btn::Quiet, fl!(loader(), "add-apply"))
                 .on_press_maybe(ready.then_some(Message::Add(on_apply)))
                 .into(),
         ],
@@ -700,8 +732,7 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
             }
             let is_codex = wiz.harness == HarnessChoice::Codex;
             col = col.push(
-                button(st::body(fl!(loader(), "add-login-start")))
-                    .style(button::secondary)
+                st::btn(st::Btn::Quiet, fl!(loader(), "add-login-start"))
                     .on_press(Message::Add(AddMsg::LoginStart)),
             );
             if is_codex {
@@ -719,28 +750,24 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
             col = col.push(st::body(fl!(loader(), "load-error", what = e)));
             if e.contains(PORT_BUSY_HINT) {
                 col = col.push(
-                    button(st::body(fl!(loader(), "add-login-retry-device")))
-                        .style(button::secondary)
+                    st::btn(st::Btn::Quiet, fl!(loader(), "add-login-retry-device"))
                         .on_press(Message::Add(AddMsg::RetryDeviceAuth)),
                 );
             } else {
                 col = col.push(
-                    button(st::body(fl!(loader(), "add-login-start")))
-                        .style(button::secondary)
+                    st::btn(st::Btn::Quiet, fl!(loader(), "add-login-start"))
                         .on_press(Message::Add(AddMsg::LoginStart)),
                 );
             }
         }
         LoginStatus::Active => {
             if let Some(url) = &login.url {
-                col = col.push(st::body(url.clone()));
+                col = col.push(st::fit(url.as_str(), st::Role::Mono, st::Cut::Middle));
                 col = col.push(
                     row![
-                        button(st::body(fl!(loader(), "add-login-copy")))
-                            .style(button::secondary)
+                        st::btn(st::Btn::Quiet, fl!(loader(), "add-login-copy"))
                             .on_press(Message::Add(AddMsg::LoginCopy)),
-                        button(st::body(fl!(loader(), "add-login-open")))
-                            .style(button::secondary)
+                        st::btn(st::Btn::Quiet, fl!(loader(), "add-login-open"))
                             .on_press(Message::Add(AddMsg::LoginOpen)),
                     ]
                     .spacing(st::SPACE_S),
@@ -761,8 +788,7 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
                     row![
                         text_input(&fl!(loader(), "add-login-code"), &login.code)
                             .on_input(|c| Message::Add(AddMsg::LoginCodeInput(c))),
-                        button(st::body(fl!(loader(), "add-login-send")))
-                            .style(button::secondary)
+                        st::btn(st::Btn::Quiet, fl!(loader(), "add-login-send"))
                             .on_press(Message::Add(AddMsg::LoginSend)),
                     ]
                     .spacing(st::SPACE_S),
@@ -770,12 +796,11 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
             }
             let mut tail = column![].spacing(st::SPACE_XS);
             for line in &login.tail {
-                tail = tail.push(st::muted(line.clone()));
+                tail = tail.push(st::mono_muted(line.as_str()));
             }
             col = col.push(tail);
             col = col.push(
-                button(st::body(fl!(loader(), "add-login-cancel")))
-                    .style(button::secondary)
+                st::btn(st::Btn::Quiet, fl!(loader(), "add-login-cancel"))
                     .on_press(Message::Add(AddMsg::LoginCancel)),
             );
         }
@@ -785,8 +810,7 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
         LoginStatus::Failed(reason) => {
             col = col.push(st::body(fl!(loader(), "add-login-failed", reason = reason)));
             col = col.push(
-                button(st::body(fl!(loader(), "add-login-start")))
-                    .style(button::secondary)
+                st::btn(st::Btn::Quiet, fl!(loader(), "add-login-start"))
                     .on_press(Message::Add(AddMsg::LoginStart)),
             );
         }
@@ -794,82 +818,195 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
     col.into()
 }
 
+fn stepper(current: Step) -> Element<'static, Message> {
+    let look = st::look();
+    let steps = [
+        (Step::Details, fl!(loader(), "add-step-details")),
+        (Step::Preview, fl!(loader(), "add-step-preview")),
+        (Step::Login, fl!(loader(), "add-step-login")),
+        (Step::Finish, fl!(loader(), "add-step-finish")),
+    ];
+    let at = steps.iter().position(|(s, _)| *s == current).unwrap_or(0);
+    let mut line = row![].spacing(st::SPACE_S).align_y(Alignment::Center);
+    for (n, (_, label)) in steps.into_iter().enumerate() {
+        if n > 0 {
+            line = line.push(st::hairline());
+        }
+        let tone = match n.cmp(&at) {
+            std::cmp::Ordering::Less => st::Tone::Ok,
+            std::cmp::Ordering::Equal => st::Tone::Accent,
+            std::cmp::Ordering::Greater => st::Tone::Neutral,
+        };
+        let label = if n == at {
+            st::nowrap(st::body(label))
+        } else {
+            st::nowrap(st::muted(label))
+        };
+        line = line.push(
+            row![st::pill((n + 1).to_string(), tone), label]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        );
+    }
+    container(line).padding([0.0, look.card_pad]).into()
+}
+
+fn field<'a>(label: String, input: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    column![st::caption(label), input.into()].spacing(4).into()
+}
+
+/// Step body in a card with its buttons right-aligned below.
+fn step_card<'a>(
+    body: Vec<Element<'a, Message>>,
+    actions: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let look = st::look();
+    let footer = row![Space::new().width(Length::Fill)]
+        .extend(actions)
+        .spacing(st::SPACE_S)
+        .align_y(Alignment::Center);
+    st::card(
+        column(body)
+            .push(st::hairline())
+            .push(footer)
+            .spacing(look.gap.max(12.0)),
+    )
+}
+
+fn details(wiz: &Wizard) -> Element<'_, Message> {
+    let size = st::look().body;
+    let harness = |label: &'static str, h: HarnessChoice| {
+        radio(label, h, Some(wiz.harness), |h| {
+            Message::Add(AddMsg::Harness(h))
+        })
+        .text_size(size)
+    };
+    let mut body: Vec<Element<'_, Message>> = vec![
+        field(
+            fl!(loader(), "add-harness"),
+            row![
+                harness("Claude", HarnessChoice::Claude),
+                harness("Codex", HarnessChoice::Codex),
+                harness("OpenCode", HarnessChoice::Opencode),
+                harness("agy", HarnessChoice::Agy),
+            ]
+            .spacing(st::SPACE_L)
+            .wrap(),
+        ),
+        column![
+            st::caption(fl!(loader(), "add-id")),
+            text_input("claude-second", &wiz.id)
+                .on_input(|s| Message::Add(AddMsg::Id(s)))
+                .size(size),
+            st::caption(fl!(loader(), "add-id-note")),
+        ]
+        .spacing(4)
+        .into(),
+        field(
+            fl!(loader(), "add-display-name"),
+            text_input("", &wiz.display_name)
+                .on_input(|s| Message::Add(AddMsg::DisplayName(s)))
+                .size(size),
+        ),
+        field(
+            fl!(loader(), "add-home"),
+            row![
+                text_input(&suggest_home(wiz.harness, &wiz.id), &wiz.home)
+                    .on_input(|s| Message::Add(AddMsg::Home(s)))
+                    .size(size)
+                    .width(Length::Fill),
+                st::btn(st::Btn::Quiet, fl!(loader(), "add-home-use-suggestion"))
+                    .on_press(Message::Add(AddMsg::UseSuggestion)),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        ),
+    ];
+    body.extend(preview_lines(&wiz.preview));
+    step_card(
+        body,
+        vec![
+            st::btn(st::Btn::Primary, fl!(loader(), "add-preview"))
+                .on_press(Message::Add(AddMsg::Preview))
+                .into(),
+        ],
+    )
+}
+
 pub fn view(wiz: &Wizard) -> Element<'_, Message> {
-    let mut form = column![
-        st::title(fl!(loader(), "add-title")),
-        st::body(fl!(loader(), "add-harness")),
-        row![
-            radio("Claude", HarnessChoice::Claude, Some(wiz.harness), |h| {
-                Message::Add(AddMsg::Harness(h))
-            },),
-            radio("Codex", HarnessChoice::Codex, Some(wiz.harness), |h| {
-                Message::Add(AddMsg::Harness(h))
-            },),
-            radio(
-                "OpenCode",
-                HarnessChoice::Opencode,
-                Some(wiz.harness),
-                |h| { Message::Add(AddMsg::Harness(h)) },
+    let look = st::look();
+    let current = step(wiz);
+    let content = match current {
+        Step::Details => details(wiz),
+        Step::Preview => {
+            let mut body = vec![st::heading(fl!(loader(), "add-step-preview")).into()];
+            body.extend(preview_lines(&wiz.preview));
+            step_card(
+                body,
+                vec![
+                    st::btn(st::Btn::Quiet, fl!(loader(), "add-edit"))
+                        .on_press(Message::Add(AddMsg::Edit))
+                        .into(),
+                    st::btn(st::Btn::Primary, fl!(loader(), "add-apply"))
+                        .on_press_maybe(
+                            matches!(wiz.preview, Preview::Ready(_))
+                                .then(|| Message::Add(AddMsg::Apply)),
+                        )
+                        .into(),
+                ],
+            )
+        }
+        Step::Login => step_card(
+            vec![
+                row![
+                    st::icon_colored(st::Icon::CircleCheck, look.body + 2.0, |c| c.ok),
+                    st::fit(
+                        fl!(
+                            loader(),
+                            "add-added",
+                            id = wiz.added_id.clone().unwrap_or_default()
+                        ),
+                        st::Role::Body,
+                        st::Cut::Middle,
+                    ),
+                ]
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center)
+                .into(),
+                login_panel(wiz),
+            ],
+            vec![
+                st::btn(st::Btn::Primary, fl!(loader(), "add-next"))
+                    .on_press_maybe((!wiz.login.active()).then_some(Message::Add(AddMsg::Next)))
+                    .into(),
+            ],
+        ),
+        Step::Finish => column![
+            st::muted(fl!(loader(), "add-finish-note")),
+            optional_section(
+                fl!(loader(), "add-wrapper-title"),
+                &wiz.wrapper,
+                AddMsg::WrapperPreview,
+                AddMsg::WrapperApply,
             ),
-            radio("agy", HarnessChoice::Agy, Some(wiz.harness), |h| {
-                Message::Add(AddMsg::Harness(h))
-            },),
+            optional_section(
+                fl!(loader(), "add-t3-title"),
+                &wiz.t3,
+                AddMsg::T3Preview,
+                AddMsg::T3Apply,
+            ),
+            row![
+                Space::new().width(Length::Fill),
+                st::btn(st::Btn::Primary, fl!(loader(), "add-done"))
+                    .on_press(Message::SelectPage(crate::app::Page::Instances)),
+            ],
         ]
-        .spacing(st::SPACE_M),
-        st::body(fl!(loader(), "add-id")),
-        text_input("claude-second", &wiz.id).on_input(|s| Message::Add(AddMsg::Id(s))),
-        st::muted(fl!(loader(), "add-id-note")),
-        st::body(fl!(loader(), "add-display-name")),
-        text_input("", &wiz.display_name).on_input(|s| Message::Add(AddMsg::DisplayName(s))),
-        st::body(fl!(loader(), "add-home")),
-        row![
-            text_input(&suggest_home(wiz.harness, &wiz.id), &wiz.home)
-                .on_input(|s| Message::Add(AddMsg::Home(s)))
-                .width(400),
-            button(st::body(fl!(loader(), "add-home-use-suggestion")))
-                .style(button::secondary)
-                .on_press(Message::Add(AddMsg::UseSuggestion)),
-        ]
-        .spacing(st::SPACE_S),
-        row![
-            button(st::body(fl!(loader(), "add-preview")))
-                .style(button::secondary)
-                .on_press(Message::Add(AddMsg::Preview)),
-            button(st::body(fl!(loader(), "add-apply")))
-                .style(button::primary)
-                .on_press_maybe(
-                    matches!(wiz.preview, Preview::Ready(_)).then(|| Message::Add(AddMsg::Apply))
-                ),
-        ]
-        .spacing(st::SPACE_S),
-    ]
-    .spacing(st::SPACE_S);
-    for line in preview_lines(&wiz.preview) {
-        form = form.push(line);
-    }
-    let mut col = column![
-        button(st::body(fl!(loader(), "add-back")))
-            .style(button::secondary)
-            .on_press(Message::SelectPage(crate::app::Page::Instances)),
-        form,
-    ]
-    .spacing(st::SPACE_M);
-    if wiz.added_id.is_some() {
-        col = col.push(login_panel(wiz));
-        col = col.push(optional_section(
-            fl!(loader(), "add-wrapper-title"),
-            &wiz.wrapper,
-            AddMsg::WrapperPreview,
-            AddMsg::WrapperApply,
-        ));
-        col = col.push(optional_section(
-            fl!(loader(), "add-t3-title"),
-            &wiz.t3,
-            AddMsg::T3Preview,
-            AddMsg::T3Apply,
-        ));
-    }
-    scrollable(col).into()
+        .spacing(look.gap.max(st::SPACE_S))
+        .into(),
+    };
+    column![stepper(current), content]
+        .spacing(look.gap.max(12.0))
+        .into()
 }
 
 #[cfg(test)]

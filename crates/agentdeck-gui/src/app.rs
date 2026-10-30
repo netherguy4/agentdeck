@@ -67,6 +67,7 @@ pub enum Message {
     ProcDone { result: String, error: bool },
     ProcToggle(u32, u64),
     ProcFilter(String),
+    PluginDetail(String),
     Escape,
     Enter,
     ThemeMode(iced::theme::Mode),
@@ -103,6 +104,11 @@ fn load_data(paths: agentdeck_core::Paths) -> Task<Message> {
     )
 }
 
+fn load_drift(paths: &agentdeck_core::Paths) -> Task<Message> {
+    let ctx = drift_ctx(paths);
+    Task::perform(async move { drift::load(ctx) }, Message::Drift)
+}
+
 fn drift_ctx(paths: &agentdeck_core::Paths) -> DriftCtx {
     DriftCtx {
         paths: paths.clone(),
@@ -123,6 +129,8 @@ pub struct State {
     remove: Option<RemoveAsk>,
     pending: Option<Pending>,
     proc_ui: crate::pages::processes::ProcUi,
+    /// Plugins whose technical status is expanded.
+    plugin_open: std::collections::HashSet<String>,
     pool: pool::State,
     shared: shared::State,
     harnesses: harnesses::State,
@@ -167,6 +175,7 @@ impl State {
                 remove: None,
                 pending: None,
                 proc_ui: crate::pages::processes::ProcUi::default(),
+                plugin_open: Default::default(),
                 pool: pool::State::default(),
                 shared: shared::State::default(),
                 harnesses: harnesses::State::default(),
@@ -176,7 +185,8 @@ impl State {
             },
             Task::batch([
                 match first {
-                    Some(paths) => load_data(paths),
+                    // Drift loads up front too: the sidebar badge needs it.
+                    Some(paths) => Task::batch([load_data(paths.clone()), load_drift(&paths)]),
                     None => Task::none(),
                 },
                 iced::system::theme().map(Message::ThemeMode),
@@ -196,6 +206,7 @@ impl State {
             remove: None,
             pending: None,
             proc_ui: crate::pages::processes::ProcUi::default(),
+            plugin_open: Default::default(),
             pool: pool::State::default(),
             shared: shared::State::default(),
             harnesses: harnesses::State::default(),
@@ -255,21 +266,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Tick => match state.paths.clone() {
             Some(paths) if !state.loading => {
                 state.loading = true;
-                let load = load_data(paths.clone());
-                if state.page == Page::Drift {
-                    Task::batch([
-                        load,
-                        Task::perform(
-                            async move {
-                                let ctx = drift_ctx(&paths);
-                                drift::load(ctx)
-                            },
-                            Message::Drift,
-                        ),
-                    ])
-                } else {
-                    load
-                }
+                Task::batch([load_data(paths.clone()), load_drift(&paths)])
             }
             _ => Task::none(),
         },
@@ -424,18 +421,42 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 None => Task::none(),
             }
         }
-        Message::Pool(msg) => match state.paths.clone() {
-            Some(paths) => pool::update(&mut state.pool, pool_ctx(&paths), msg).map(Message::Pool),
-            None => Task::none(),
-        },
-        Message::Shared(msg) => match state.paths.clone() {
-            Some(paths) => {
-                shared::update(&mut state.shared, shared_ctx(&paths), msg).map(Message::Shared)
+        Message::Pool(msg) => {
+            let task = match state.paths.clone() {
+                Some(paths) => {
+                    pool::update(&mut state.pool, pool_ctx(&paths), msg).map(Message::Pool)
+                }
+                None => Task::none(),
+            };
+            if let Some((text, error)) = state.pool.result.take() {
+                state.toast(text, error);
             }
-            None => Task::none(),
-        },
+            task
+        }
+        Message::Shared(msg) => {
+            let task = match state.paths.clone() {
+                Some(paths) => {
+                    shared::update(&mut state.shared, shared_ctx(&paths), msg).map(Message::Shared)
+                }
+                None => Task::none(),
+            };
+            if let Some((text, error)) = state.shared.result.take() {
+                state.toast(text, error);
+            }
+            task
+        }
         Message::Harnesses(msg) => {
-            harnesses::update(&mut state.harnesses, msg).map(Message::Harnesses)
+            let task = harnesses::update(&mut state.harnesses, msg).map(Message::Harnesses);
+            if let Some((text, error)) = state.harnesses.result.take() {
+                state.toast(text, error);
+            }
+            task
+        }
+        Message::PluginDetail(name) => {
+            if !state.plugin_open.remove(&name) {
+                state.plugin_open.insert(name);
+            }
+            Task::none()
         }
         Message::ProcToggle(pid, ticks) => {
             if !state.proc_ui.expanded.remove(&(pid, ticks)) {
@@ -470,12 +491,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Noop => Task::none(),
-        Message::Drift(inner) => match state.paths.clone() {
-            Some(paths) => {
-                drift::update(&mut state.drift, drift_ctx(&paths), inner).map(Message::Drift)
+        Message::Drift(inner) => {
+            let task = match state.paths.clone() {
+                Some(paths) => {
+                    drift::update(&mut state.drift, drift_ctx(&paths), inner).map(Message::Drift)
+                }
+                None => Task::none(),
+            };
+            for notice in std::mem::take(&mut state.drift.notices) {
+                let error = notice.starts_with("failed");
+                state.toast(notice, error);
             }
-            None => Task::none(),
-        },
+            task
+        }
         Message::EnablePlugin(name) => {
             preview_plugin(state, &name, true);
             Task::none()
@@ -502,8 +530,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             if let Some(paths) = state.paths.clone() {
                 state.data = data::load(&paths);
             }
-            if let Err(error) = result {
-                state.data.error = Some(error);
+            match result {
+                Ok(text) => state.toast(text, false),
+                Err(error) => state.toast(error, true),
             }
             Task::none()
         }
@@ -611,7 +640,7 @@ fn drift_count(state: &State) -> usize {
         .snapshot
         .groups
         .iter()
-        .map(|g| g.items.len())
+        .map(drift::open_items)
         .sum()
 }
 
@@ -682,7 +711,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
 fn page_header<'a>(
     title: String,
     purpose: String,
-    action: Element<'a, Message>,
+    action: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let look = st::look();
     container(
@@ -690,8 +719,8 @@ fn page_header<'a>(
             column![st::title(title), st::muted(purpose)]
                 .spacing(2)
                 .width(Length::Fill),
-            action,
         ]
+        .push(action)
         .spacing(st::SPACE_M)
         .align_y(Alignment::Center),
     )
@@ -699,42 +728,59 @@ fn page_header<'a>(
     .into()
 }
 
+fn header(state: &State) -> Element<'_, Message> {
+    let t = |key: &str| loader().get(key);
+    let (title, purpose, action): (String, String, Option<Element<'_, Message>>) = match state.page
+    {
+        Page::Instances => (
+            t("instances-title"),
+            t("instances-purpose"),
+            Some(
+                st::btn_icon(st::Btn::Primary, st::Icon::Plus, t("instances-add"))
+                    .on_press(Message::SelectPage(Page::AddInstance))
+                    .into(),
+            ),
+        ),
+        Page::AddInstance => (
+            t("add-title"),
+            t("add-purpose"),
+            Some(
+                st::btn_icon(st::Btn::Quiet, st::Icon::ArrowLeft, t("add-back"))
+                    .on_press(Message::SelectPage(Page::Instances))
+                    .into(),
+            ),
+        ),
+        Page::Drift => (t("drift-title"), t("drift-purpose"), None),
+        Page::Pool => (
+            t("pool-title"),
+            t("pool-purpose"),
+            Some(pool::header_actions(&state.pool).map(Message::Pool)),
+        ),
+        Page::Plugins => (t("plugins-title"), t("plugins-purpose"), None),
+        Page::Shared => (t("shared-title"), t("shared-purpose"), None),
+        Page::Harnesses => (t("harness-title"), t("harness-purpose"), None),
+        Page::Processes => (
+            t("processes-title"),
+            t("processes-purpose"),
+            Some(pages::processes::filter_input(&state.proc_ui)),
+        ),
+    };
+    page_header(title, purpose, action)
+}
+
 pub fn view(state: &State) -> Element<'_, Message> {
     let look = st::look();
-    let header = match state.page {
-        Page::Instances => Some(page_header(
-            fl!(loader(), "instances-title"),
-            fl!(loader(), "instances-purpose"),
-            st::btn_icon(
-                st::Btn::Primary,
-                st::Icon::Plus,
-                fl!(loader(), "instances-add"),
-            )
-            .on_press(Message::SelectPage(Page::AddInstance))
-            .into(),
-        )),
-        Page::Processes => Some(page_header(
-            fl!(loader(), "processes-title"),
-            fl!(loader(), "processes-purpose"),
-            pages::processes::filter_input(&state.proc_ui),
-        )),
-        // Part 2 moves the remaining pages' titles into this header.
-        _ => None,
-    };
     let content: Element<'_, Message> = match state.page {
         Page::Instances => pages::instances::view(&state.data),
         Page::AddInstance => add_instance::view(&state.add),
         Page::Drift => drift::view(&state.drift).map(Message::Drift),
-        Page::Plugins => pages::plugins::view(&state.data),
+        Page::Plugins => pages::plugins::view(&state.data, &state.plugin_open),
         Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),
     };
-    let mut main = column![];
-    if let Some(header) = header {
-        main = main.push(header).push(st::hairline());
-    }
+    let main = column![header(state), st::hairline()];
     let body = container(
         container(content)
             .max_width(look.content_max)
@@ -761,7 +807,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     )
 }
 
-/// Variant palette, following the system dark/light preference.
+/// Palette following the system dark/light preference.
 pub fn theme(state: &State) -> Option<Theme> {
     Some(st::theme(state.dark))
 }

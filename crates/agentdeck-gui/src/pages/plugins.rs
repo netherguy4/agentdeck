@@ -1,9 +1,11 @@
-//! Plugins page: one card per built-in plugin with enable/disable and a
-//! confirm step showing the [`Change`] preview before anything is applied.
+//! Plugins page: one card per built-in plugin with an on/off toggle, its
+//! technical status behind an expander, and a confirm step showing the [`Change`] preview before anything is applied.
+
+use std::collections::HashSet;
 
 use i18n_embed_fl::fl;
-use iced::Element;
-use iced::widget::{button, column};
+use iced::widget::{button, column, row, toggler};
+use iced::{Alignment, Element};
 
 use crate::app::Message;
 use crate::data::Data;
@@ -35,52 +37,78 @@ pub fn modal(p: &Pending) -> crate::overlay::Modal<'_, Message> {
     )
 }
 
-pub fn view(data: &Data) -> Element<'_, Message> {
-    let mut col = column![st::title(fl!(loader(), "plugins-title"))].spacing(st::SPACE_M);
+pub fn view<'a>(data: &'a Data, open: &'a HashSet<String>) -> Element<'a, Message> {
+    let look = st::look();
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &data.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
+        col = col.push(st::card(st::muted(fl!(
+            loader(),
+            "load-error",
+            what = error
+        ))));
     }
     if data.plugins.is_empty() {
-        col = col.push(st::muted(fl!(loader(), "plugins-empty")));
+        col = col.push(st::card(st::muted(fl!(loader(), "plugins-empty"))));
     }
-    for (i, plugin) in data.plugins.iter().enumerate() {
-        if i > 0 {
-            col = col.push(st::divider());
-        }
-        let state = if !plugin.available {
-            fl!(loader(), "plugins-unavailable")
+    for plugin in &data.plugins {
+        let (state, tone) = if !plugin.available {
+            (fl!(loader(), "plugins-unavailable"), st::Tone::Neutral)
         } else if plugin.enabled {
-            fl!(loader(), "plugins-enabled")
+            (fl!(loader(), "plugins-enabled"), st::Tone::Ok)
         } else {
-            fl!(loader(), "plugins-disabled")
+            (fl!(loader(), "plugins-disabled"), st::Tone::Neutral)
         };
-        let mut card = column![
-            iced::widget::row![st::heading(plugin.name.clone()), st::muted(state),]
-                .spacing(st::SPACE_S),
+        let name = plugin.name.clone();
+        let switch = toggler(plugin.enabled)
+            .size(16)
+            .on_toggle_maybe(plugin.available.then_some(move |on| {
+                if on {
+                    Message::EnablePlugin(name.clone())
+                } else {
+                    Message::DisablePlugin(name.clone())
+                }
+            }));
+        let expanded = open.contains(&plugin.name);
+        let head = row![
+            st::fit(plugin.name.as_str(), st::Role::Heading, st::Cut::End),
+            st::pill(state, tone),
+            switch,
         ]
-        .spacing(st::SPACE_XS);
-        if plugin.available {
-            for line in &plugin.detail {
-                card = card.push(st::muted(line.clone()));
+        .spacing(st::SPACE_M)
+        .align_y(Alignment::Center);
+        let expander = button(
+            row![
+                st::icon(
+                    if expanded {
+                        st::Icon::ChevronDown
+                    } else {
+                        st::Icon::ChevronRight
+                    },
+                    look.body
+                ),
+                st::nowrap(st::caption(fl!(loader(), "plugins-details"))),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 4])
+        .style(st::row_style)
+        .on_press(Message::PluginDetail(plugin.name.clone()));
+        let mut card = column![head, expander].spacing(look.row_gap);
+        if expanded {
+            let mut detail = column![].spacing(2).padding(iced::Padding {
+                left: 20.0,
+                ..iced::Padding::ZERO
+            });
+            if plugin.detail.is_empty() {
+                detail = detail.push(st::muted(fl!(loader(), "plugins-no-details")));
             }
-            let (label, msg) = if plugin.enabled {
-                (
-                    format!("{} {}", fl!(loader(), "plugins-disable"), plugin.name),
-                    Message::DisablePlugin(plugin.name.clone()),
-                )
-            } else {
-                (
-                    format!("{} {}", fl!(loader(), "plugins-enable"), plugin.name),
-                    Message::EnablePlugin(plugin.name.clone()),
-                )
-            };
-            card = card.push(
-                button(st::body(label))
-                    .style(button::secondary)
-                    .on_press(msg),
-            );
+            for line in &plugin.detail {
+                detail = detail.push(st::mono_muted(line.as_str()));
+            }
+            card = card.push(detail);
         }
-        col = col.push(card);
+        col = col.push(st::card(card));
     }
     col.into()
 }

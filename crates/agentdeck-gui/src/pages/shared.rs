@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use agentdeck_core::shared::{self, SkillState};
 use agentdeck_core::{Change, Paths};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column};
-use iced::{Element, Task};
+use iced::widget::{Space, button, column, row};
+use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
 use crate::style as st;
@@ -20,17 +20,26 @@ pub struct Ctx {
     pub home: PathBuf,
 }
 
+/// One target line: `~`-shortened path or name, then its status.
+#[derive(Debug, Clone, Default)]
+pub struct Target {
+    pub name: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    pub skills: Vec<String>,
-    pub instructions: Vec<String>,
+    /// Skill target dir with (in sync, need sync) counts.
+    pub skills: Vec<(String, usize, usize)>,
+    pub instructions: Vec<Target>,
     pub mcp_servers: Vec<String>,
-    pub mcp_targets: Vec<String>,
+    pub mcp_targets: Vec<Target>,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Kind {
+    #[default]
     Skills,
     Instructions,
     Mcp,
@@ -45,14 +54,17 @@ pub struct Pending {
 #[derive(Default)]
 pub struct State {
     pub snap: Snapshot,
+    pub tab: Kind,
     pub pending: Option<Pending>,
     pub busy: bool,
-    pub result: Option<String>,
+    /// Last action outcome (text, is error); the shell turns it into a toast.
+    pub result: Option<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Msg {
     Loaded(Snapshot),
+    Tab(Kind),
     Ask(Kind),
     Confirm,
     Cancel,
@@ -81,18 +93,16 @@ pub fn load(ctx: &Ctx) -> Msg {
             _ => entry.1 += 1,
         }
     }
-    for (dir, (ok, todo)) in per_dir {
-        snap.skills.push(fl!(
-            loader(),
-            "shared-skills-dir",
-            dir = dir,
-            ok = i64::try_from(ok).unwrap_or(0),
-            todo = i64::try_from(todo).unwrap_or(0)
-        ));
-    }
+    snap.skills = per_dir
+        .into_iter()
+        .map(|(dir, (ok, todo))| (dir, ok, todo))
+        .collect();
     snap.instructions = shared::instructions_status(&ctx.home)
         .iter()
-        .map(|s| format!("{}: {}", short(&s.path, &ctx.home), s.state.describe()))
+        .map(|s| Target {
+            name: short(&s.path, &ctx.home),
+            status: s.state.describe(),
+        })
         .collect();
     match shared::claude_secondaries(&ctx.paths, &ctx.home) {
         Ok(secondaries) => {
@@ -105,12 +115,9 @@ pub fn load(ctx: &Ctx) -> Msg {
             snap.mcp_servers = names;
             snap.mcp_targets = targets
                 .iter()
-                .map(|t| {
-                    format!(
-                        "{}: {}",
-                        t.name.replace(&ctx.home.display().to_string(), "~"),
-                        t.detail
-                    )
+                .map(|t| Target {
+                    name: t.name.replace(&ctx.home.display().to_string(), "~"),
+                    status: t.detail.clone(),
                 })
                 .collect();
         }
@@ -148,11 +155,15 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             state.snap = snap;
             Task::none()
         }
+        Msg::Tab(kind) => {
+            state.tab = kind;
+            Task::none()
+        }
         Msg::Ask(kind) => {
             state.result = None;
             state.pending = match plan(&ctx, kind) {
                 Ok(p) if p.changes.is_empty() && p.lines.is_empty() => {
-                    state.result = Some(fl!(loader(), "action-none"));
+                    state.result = Some((fl!(loader(), "action-none"), false));
                     None
                 }
                 Ok(p) => Some(p),
@@ -189,23 +200,13 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
         }
         Msg::Done(result) => {
             state.busy = false;
-            state.result = Some(result.unwrap_or_else(|e| e));
+            state.result = Some(match result {
+                Ok(text) => (text, false),
+                Err(e) => (e, true),
+            });
             Task::done(load(&ctx))
         }
     }
-}
-
-fn section<'a>(heading: String, lines: &'a [String], action: (String, Kind)) -> Element<'a, Msg> {
-    let mut col = column![st::heading(heading)].spacing(st::SPACE_XS);
-    for line in lines {
-        col = col.push(st::muted(line.clone()));
-    }
-    col.push(
-        button(st::body(action.0))
-            .style(button::secondary)
-            .on_press(Msg::Ask(action.1)),
-    )
-    .into()
 }
 
 pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
@@ -222,45 +223,174 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
     })
 }
 
-pub fn view(state: &State) -> Element<'_, Msg> {
-    let mut col = column![st::title(fl!(loader(), "shared-title"))].spacing(st::SPACE_M);
-    if let Some(error) = &state.snap.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
+fn count(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(0)
+}
+
+fn target_row(name: &str, status: Element<'static, Msg>) -> Element<'static, Msg> {
+    row![
+        st::fit(name.to_string(), st::Role::Mono, st::Cut::Middle),
+        status
+    ]
+    .spacing(st::SPACE_M)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Rows separated by hairlines, or one helpful line when there are none.
+fn rows_card<'a>(rows: Vec<Element<'a, Msg>>, empty: String) -> Element<'a, Msg> {
+    if rows.is_empty() {
+        return st::card(st::muted(empty));
     }
-    col = col.push(section(
-        fl!(loader(), "shared-skills"),
-        &state.snap.skills,
-        (fl!(loader(), "shared-skills-sync"), Kind::Skills),
-    ));
-    col = col.push(st::divider());
-    col = col.push(section(
-        fl!(loader(), "shared-instr"),
-        &state.snap.instructions,
-        (fl!(loader(), "shared-instr-link"), Kind::Instructions),
-    ));
-    col = col.push(st::divider());
-    let mut mcp = column![st::heading(fl!(loader(), "shared-mcp"))].spacing(st::SPACE_XS);
-    mcp = mcp.push(st::body(if state.snap.mcp_servers.is_empty() {
-        fl!(loader(), "shared-mcp-none")
-    } else {
-        state.snap.mcp_servers.join(", ")
-    }));
-    mcp = mcp.push(st::muted(fl!(loader(), "shared-mcp-hidden")));
-    for line in &state.snap.mcp_targets {
-        mcp = mcp.push(st::muted(line.clone()));
+    let mut col = column![].spacing(st::look().row_gap);
+    for (i, r) in rows.into_iter().enumerate() {
+        if i > 0 {
+            col = col.push(st::hairline());
+        }
+        col = col.push(r);
     }
-    col = col.push(
-        mcp.push(
-            button(st::body(fl!(loader(), "shared-mcp-sync")))
-                .style(button::secondary)
-                .on_press(Msg::Ask(Kind::Mcp)),
+    st::card(col)
+}
+
+/// Status text on the right: short, so it gets a bounded slot.
+fn status_text(text: &str) -> Element<'static, Msg> {
+    st::fit(text.to_string(), st::Role::Muted, st::Cut::End)
+        .width(Length::FillPortion(1))
+        .into()
+}
+
+fn tab_content(state: &State) -> Element<'_, Msg> {
+    let snap = &state.snap;
+    let (rows, empty, action, kind): (Vec<Element<'_, Msg>>, String, String, Kind) = match state.tab
+    {
+        Kind::Skills => (
+            snap.skills
+                .iter()
+                .map(|(dir, ok, todo)| {
+                    let mut pills = row![st::pill(
+                        fl!(loader(), "shared-ok-count", count = count(*ok)),
+                        st::Tone::Ok
+                    )]
+                    .spacing(st::SPACE_XS);
+                    if *todo > 0 {
+                        pills = pills.push(st::pill(
+                            fl!(loader(), "shared-todo-count", count = count(*todo)),
+                            st::Tone::Warn,
+                        ));
+                    }
+                    target_row(dir, pills.into())
+                })
+                .collect(),
+            fl!(loader(), "shared-skills-none"),
+            fl!(loader(), "shared-skills-sync"),
+            Kind::Skills,
         ),
+        Kind::Instructions => (
+            snap.instructions
+                .iter()
+                .map(|t| {
+                    row![
+                        st::fit(t.name.clone(), st::Role::Mono, st::Cut::Middle)
+                            .width(Length::FillPortion(2)),
+                        status_text(&t.status),
+                    ]
+                    .spacing(st::SPACE_M)
+                    .align_y(Alignment::Center)
+                    .into()
+                })
+                .collect(),
+            fl!(loader(), "shared-instr-none"),
+            fl!(loader(), "shared-instr-link"),
+            Kind::Instructions,
+        ),
+        Kind::Mcp => {
+            let servers: Element<'_, Msg> = if snap.mcp_servers.is_empty() {
+                st::muted(fl!(loader(), "shared-mcp-none")).into()
+            } else {
+                row(snap
+                    .mcp_servers
+                    .iter()
+                    .map(|n| st::pill(n.as_str(), st::Tone::Neutral)))
+                .spacing(st::SPACE_XS)
+                .wrap()
+                .into()
+            };
+            let mut rows: Vec<Element<'_, Msg>> = vec![
+                column![
+                    st::caption(fl!(loader(), "shared-mcp-servers")),
+                    servers,
+                    st::caption(fl!(loader(), "shared-mcp-hidden")),
+                ]
+                .spacing(6)
+                .into(),
+            ];
+            if !snap.mcp_targets.is_empty() {
+                rows.push(st::caption(fl!(loader(), "shared-mcp-targets")).into());
+            }
+            rows.extend(snap.mcp_targets.iter().map(|t| {
+                row![
+                    st::fit(t.name.clone(), st::Role::Mono, st::Cut::Middle)
+                        .width(Length::FillPortion(2)),
+                    status_text(&t.status),
+                ]
+                .spacing(st::SPACE_M)
+                .align_y(Alignment::Center)
+                .into()
+            }));
+            (
+                rows,
+                fl!(loader(), "shared-mcp-none"),
+                fl!(loader(), "shared-mcp-sync"),
+                Kind::Mcp,
+            )
+        }
+    };
+    column![
+        rows_card(rows, empty),
+        row![
+            Space::new().width(Length::Fill),
+            st::btn_icon(st::Btn::Quiet, st::Icon::RefreshCw, action)
+                .on_press_maybe((!state.busy).then_some(Msg::Ask(kind))),
+        ],
+    ]
+    .spacing(st::SPACE_S)
+    .into()
+}
+
+pub fn view(state: &State) -> Element<'_, Msg> {
+    let look = st::look();
+    let snap = &state.snap;
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
+    if let Some(error) = &snap.error {
+        col = col.push(st::card(st::muted(fl!(
+            loader(),
+            "load-error",
+            what = error
+        ))));
+    }
+    col = col.push(st::muted(fl!(
+        loader(),
+        "shared-summary",
+        skills = count(snap.skills.len()),
+        instr = count(snap.instructions.len()),
+        mcp = count(snap.mcp_servers.len())
+    )));
+    let tab = |kind: Kind, label: String| {
+        button(st::nowrap(st::body(label)))
+            .padding(look.button_pad)
+            .style(st::nav_style(state.tab == kind))
+            .on_press(Msg::Tab(kind))
+    };
+    col = col.push(
+        row![
+            tab(Kind::Skills, fl!(loader(), "shared-skills")),
+            tab(Kind::Instructions, fl!(loader(), "shared-instr")),
+            tab(Kind::Mcp, fl!(loader(), "shared-mcp")),
+        ]
+        .spacing(st::SPACE_XS),
     );
     if state.busy {
         col = col.push(st::muted(fl!(loader(), "action-working")));
     }
-    if let Some(r) = &state.result {
-        col = col.push(st::muted(r.clone()));
-    }
-    col.into()
+    col.push(tab_content(state)).into()
 }

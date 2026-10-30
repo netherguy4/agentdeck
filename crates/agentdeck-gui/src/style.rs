@@ -1,51 +1,14 @@
-//! Shared visual language: colour tokens (dark and light), a few layout
+//! Shared visual language: colour tokens (dark and light), layout
 //! parameters, text roles, buttons, pills, cards and lucide icons. Only
 //! presentation: no behaviour lives here.
-//!
-//! shortcut: three design variants (`AGENTDECK_UI_VARIANT=a|b|c`) live side
-//! by side until the owner picks one; then drop the losing `Look`/`Colors`
-//! constants and the `Variant` switch.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-
-use iced::widget::{Space, button, column, container, progress_bar, row, svg, text};
+use iced::widget::text::Wrapping;
+use iced::widget::{
+    Responsive, Space, button, column, container, progress_bar, responsive, row, svg, text,
+};
 use iced::{Background, Border, Color, Element, Font, Length, Shadow, Theme, Vector, color};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Variant {
-    /// a: near-black, hairline borders, flat, compact.
-    Minimal,
-    /// b: translucent surfaces, frosted sidebar and cards, more air.
-    Glass,
-    /// c: table-first, tight rows, monospace-heavy.
-    Console,
-}
-
-static VARIANT: AtomicU8 = AtomicU8::new(u8::MAX);
-
-pub fn variant() -> Variant {
-    match VARIANT.load(Ordering::Relaxed) {
-        0 => Variant::Minimal,
-        1 => Variant::Glass,
-        2 => Variant::Console,
-        _ => {
-            let v = match std::env::var("AGENTDECK_UI_VARIANT").as_deref() {
-                Ok("b") => Variant::Glass,
-                Ok("c") => Variant::Console,
-                _ => Variant::Minimal,
-            };
-            set_variant(v);
-            v
-        }
-    }
-}
-
-/// Test seam (and the env default above).
-pub fn set_variant(v: Variant) {
-    VARIANT.store(v as u8, Ordering::Relaxed);
-}
-
-/// Layout parameters that differ between variants.
+/// Layout parameters.
 pub struct Look {
     pub radius: f32,
     pub card_pad: f32,
@@ -62,15 +25,9 @@ pub struct Look {
     pub content_max: f32,
     pub bar: f32,
     pub button_pad: [f32; 2],
-    /// Window background alpha: below 1 lets compositor glass show through.
-    pub window_alpha: f32,
-    /// Console: lists render as one table instead of cards.
-    pub table: bool,
-    /// Console: data lines in monospace.
-    pub mono: bool,
 }
 
-const MINIMAL: Look = Look {
+const LOOK: Look = Look {
     radius: 8.0,
     card_pad: 12.0,
     gap: 8.0,
@@ -84,58 +41,13 @@ const MINIMAL: Look = Look {
     content_max: 980.0,
     bar: 4.0,
     button_pad: [4.0, 10.0],
-    window_alpha: 0.96,
-    table: false,
-    mono: false,
-};
-
-const GLASS: Look = Look {
-    radius: 14.0,
-    card_pad: 18.0,
-    gap: 14.0,
-    row_gap: 10.0,
-    title: 22.0,
-    heading: 15.0,
-    body: 13.0,
-    small: 12.0,
-    sidebar_width: 232.0,
-    page_pad: 28.0,
-    content_max: 940.0,
-    bar: 8.0,
-    button_pad: [7.0, 14.0],
-    window_alpha: 0.72,
-    table: false,
-    mono: false,
-};
-
-const CONSOLE: Look = Look {
-    radius: 3.0,
-    card_pad: 8.0,
-    gap: 0.0,
-    row_gap: 2.0,
-    title: 15.0,
-    heading: 12.0,
-    body: 12.0,
-    small: 11.0,
-    sidebar_width: 176.0,
-    page_pad: 14.0,
-    content_max: 1200.0,
-    bar: 3.0,
-    button_pad: [2.0, 8.0],
-    window_alpha: 0.97,
-    table: true,
-    mono: true,
 };
 
 pub fn look() -> &'static Look {
-    match variant() {
-        Variant::Minimal => &MINIMAL,
-        Variant::Glass => &GLASS,
-        Variant::Console => &CONSOLE,
-    }
+    &LOOK
 }
 
-/// Colour tokens; alpha in `sidebar`/`surface` is the glass.
+/// Colour tokens.
 pub struct Colors {
     pub bg: Color,
     pub sidebar: Color,
@@ -155,7 +67,7 @@ pub struct Colors {
     pub scrim: Color,
 }
 
-const MINIMAL_DARK: Colors = Colors {
+const DARK: Colors = Colors {
     bg: color!(0x0a0a0a),
     sidebar: color!(0x0a0a0a),
     surface: color!(0x121212),
@@ -174,7 +86,7 @@ const MINIMAL_DARK: Colors = Colors {
     scrim: color!(0x000000, 0.6),
 };
 
-const MINIMAL_LIGHT: Colors = Colors {
+const LIGHT: Colors = Colors {
     bg: color!(0xfcfcfd),
     sidebar: color!(0xf6f6f7),
     surface: color!(0xffffff),
@@ -193,107 +105,25 @@ const MINIMAL_LIGHT: Colors = Colors {
     scrim: color!(0x000000, 0.35),
 };
 
-const GLASS_DARK: Colors = Colors {
-    bg: color!(0x10131b),
-    sidebar: color!(0xffffff, 0.035),
-    surface: color!(0xffffff, 0.055),
-    raised: color!(0x1a1e29, 0.98),
-    hover: color!(0xffffff, 0.08),
-    border: color!(0xffffff, 0.11),
-    text: color!(0xeef1f8),
-    muted: color!(0xa9b1c3),
-    faint: color!(0x7a8296),
-    accent: color!(0x8fb4ff),
-    on_accent: color!(0x0b1020),
-    danger: color!(0xff6b6b),
-    ok: color!(0x5dd39e),
-    warn: color!(0xf2c14e),
-    track: color!(0xffffff, 0.1),
-    scrim: color!(0x05070c, 0.55),
-};
-
-const GLASS_LIGHT: Colors = Colors {
-    bg: color!(0xe9edf4),
-    sidebar: color!(0xffffff, 0.45),
-    surface: color!(0xffffff, 0.68),
-    raised: color!(0xffffff, 0.98),
-    hover: color!(0x0f172a, 0.06),
-    border: color!(0x0f172a, 0.1),
-    text: color!(0x0f172a),
-    muted: color!(0x4f5d74),
-    faint: color!(0x8590a6),
-    accent: color!(0x3866d6),
-    on_accent: color!(0xffffff),
-    danger: color!(0xd33a3a),
-    ok: color!(0x198754),
-    warn: color!(0xa16207),
-    track: color!(0x0f172a, 0.08),
-    scrim: color!(0x0f172a, 0.3),
-};
-
-const CONSOLE_DARK: Colors = Colors {
-    bg: color!(0x0d1013),
-    sidebar: color!(0x090b0e),
-    surface: color!(0x11151a),
-    raised: color!(0x151a20),
-    hover: color!(0xffffff, 0.04),
-    border: color!(0x262c34),
-    text: color!(0xd7dde5),
-    muted: color!(0x8b949e),
-    faint: color!(0x5c6570),
-    accent: color!(0x3ddc97),
-    on_accent: color!(0x06120c),
-    danger: color!(0xf85149),
-    ok: color!(0x3ddc97),
-    warn: color!(0xe3b341),
-    track: color!(0x20262e),
-    scrim: color!(0x000000, 0.6),
-};
-
-const CONSOLE_LIGHT: Colors = Colors {
-    bg: color!(0xf6f8fa),
-    sidebar: color!(0xeef1f4),
-    surface: color!(0xffffff),
-    raised: color!(0xffffff),
-    hover: color!(0x000000, 0.04),
-    border: color!(0xd0d7de),
-    text: color!(0x1f2328),
-    muted: color!(0x59636e),
-    faint: color!(0x8c959f),
-    accent: color!(0x1a7f37),
-    on_accent: color!(0xffffff),
-    danger: color!(0xcf222e),
-    ok: color!(0x1a7f37),
-    warn: color!(0x9a6700),
-    track: color!(0xe6eaef),
-    scrim: color!(0x000000, 0.3),
-};
-
 fn colors_for(dark: bool) -> &'static Colors {
-    match (variant(), dark) {
-        (Variant::Minimal, true) => &MINIMAL_DARK,
-        (Variant::Minimal, false) => &MINIMAL_LIGHT,
-        (Variant::Glass, true) => &GLASS_DARK,
-        (Variant::Glass, false) => &GLASS_LIGHT,
-        (Variant::Console, true) => &CONSOLE_DARK,
-        (Variant::Console, false) => &CONSOLE_LIGHT,
-    }
+    if dark { &DARK } else { &LIGHT }
 }
 
 pub fn colors(theme: &Theme) -> &'static Colors {
     colors_for(theme.extended_palette().is_dark)
 }
 
-/// The app theme for the current variant; built-in widgets (inputs,
+/// The app theme; built-in widgets (inputs,
 /// checkboxes, scrollbars) derive from this palette.
 pub fn theme(dark: bool) -> Theme {
     let c = colors_for(dark);
     Theme::custom(
-        format!(
-            "agentdeck-{:?}-{}",
-            variant(),
-            if dark { "dark" } else { "light" }
-        ),
+        if dark {
+            "agentdeck-dark"
+        } else {
+            "agentdeck-light"
+        }
+        .to_string(),
         iced::theme::Palette {
             background: c.bg,
             text: c.text,
@@ -305,15 +135,10 @@ pub fn theme(dark: bool) -> Theme {
     )
 }
 
-/// Window background: translucent so COSMIC glass/blur shows through; the
-/// opaque `bg` is the fallback headless snapshots and other desktops get.
 pub fn app_style(theme: &Theme) -> iced::theme::Style {
     let c = colors(theme);
     iced::theme::Style {
-        background_color: Color {
-            a: look().window_alpha,
-            ..c.bg
-        },
+        background_color: c.bg,
         text_color: c.text,
     }
 }
@@ -334,26 +159,32 @@ pub fn title<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
 }
 
 pub fn heading<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    text(label).size(look().heading).font(SEMIBOLD)
+    text(label)
+        .size(look().heading)
+        .font(SEMIBOLD)
+        .wrapping(Wrapping::WordOrGlyph)
 }
 
+// Free text breaks inside long tokens (paths, URLs) instead of leaving its
+// container; single-line slots use `fit` or `nowrap` instead.
 pub fn body<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    text(label).size(look().body)
+    text(label)
+        .size(look().body)
+        .wrapping(Wrapping::WordOrGlyph)
 }
 
 /// Secondary line in the muted token colour.
 pub fn muted<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    text(label)
-        .size(look().body)
-        .style(|t: &Theme| text::Style {
-            color: Some(colors(t).muted),
-        })
+    body(label).style(|t: &Theme| text::Style {
+        color: Some(colors(t).muted),
+    })
 }
 
 /// Small faint label: column headers, group captions, units.
 pub fn caption<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(label)
         .size(look().small)
+        .wrapping(Wrapping::WordOrGlyph)
         .style(|t: &Theme| text::Style {
             color: Some(colors(t).faint),
         })
@@ -361,7 +192,10 @@ pub fn caption<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
 
 /// Ids, paths, commands.
 pub fn mono<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    text(label).size(look().small).font(Font::MONOSPACE)
+    text(label)
+        .size(look().small)
+        .font(Font::MONOSPACE)
+        .wrapping(Wrapping::WordOrGlyph)
 }
 
 pub fn mono_muted<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
@@ -370,13 +204,90 @@ pub fn mono_muted<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
     })
 }
 
-/// Data text: monospace in the Console variant, body elsewhere.
-pub fn data<'a>(label: impl text::IntoFragment<'a>) -> text::Text<'a> {
-    if look().mono {
-        mono(label).size(look().body)
-    } else {
-        body(label)
+/// Which text role a [`fit`] line renders with.
+#[derive(Debug, Clone, Copy)]
+pub enum Role {
+    Heading,
+    Body,
+    Muted,
+    Caption,
+    Mono,
+    MonoMuted,
+}
+
+impl Role {
+    fn text<'a>(self, label: String) -> text::Text<'a> {
+        match self {
+            Role::Heading => heading(label),
+            Role::Body => body(label),
+            Role::Muted => muted(label),
+            Role::Caption => caption(label),
+            Role::Mono => mono(label),
+            Role::MonoMuted => mono_muted(label),
+        }
     }
+
+    /// Widest likely average glyph advance (px), Cyrillic and digits
+    /// included, so an estimate errs on cutting a little early.
+    fn char_width(self) -> f32 {
+        let l = look();
+        match self {
+            Role::Heading => l.heading * 0.6,
+            Role::Body | Role::Muted => l.body * 0.57,
+            Role::Caption => l.small * 0.57,
+            Role::Mono | Role::MonoMuted => l.small * 0.6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// Names and sentences: keep the start.
+    End,
+    /// Paths and ids: keep both ends.
+    Middle,
+}
+
+/// `s` in at most `max` chars, with `…` where text was cut.
+pub fn ellipsize(s: &str, max: usize, cut: Cut) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    match cut {
+        Cut::End => s.chars().take(keep).collect::<String>() + "…",
+        Cut::Middle => {
+            let tail = keep / 2;
+            let head: String = s.chars().take(keep - tail).collect();
+            let end: String = s.chars().skip(n - tail).collect();
+            format!("{head}…{end}")
+        }
+    }
+}
+
+/// One line that never leaves its slot: takes the width it is given (Fill
+/// by default) and cuts with an ellipsis by estimated glyph width, since
+/// iced text has no ellipsis of its own.
+pub fn fit<'a, M: 'a>(label: impl Into<String>, role: Role, cut: Cut) -> Responsive<'a, M> {
+    // Fluent wraps placeables in invisible bidi isolates; they must not count.
+    let label: String = label
+        .into()
+        .chars()
+        .filter(|c| !matches!(c, '\u{2068}' | '\u{2069}'))
+        .collect();
+    responsive(move |size| {
+        let max = (size.width / role.char_width()).floor() as usize;
+        role.text(ellipsize(&label, max, cut))
+            .wrapping(Wrapping::None)
+            .into()
+    })
+    .height(Length::Shrink)
+}
+
+/// Fixed-size label (counts, units, status): never wraps.
+pub fn nowrap<'a>(t: text::Text<'a>) -> text::Text<'a> {
+    t.wrapping(Wrapping::None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -400,20 +311,15 @@ fn tone_color(c: &Colors, tone: Tone) -> Color {
 
 /// Small status badge.
 pub fn pill<'a, M: 'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Element<'a, M> {
-    let console = look().table;
     container(
         text(label)
             .size(look().small)
-            .font(if console {
-                Font::MONOSPACE
-            } else {
-                Font::DEFAULT
-            })
+            .wrapping(Wrapping::None)
             .style(move |t: &Theme| text::Style {
                 color: Some(tone_color(colors(t), tone)),
             }),
     )
-    .padding([1.0, if console { 5.0 } else { 8.0 }])
+    .padding([1.0, 8.0])
     .style(move |t: &Theme| {
         let c = colors(t);
         let fg = tone_color(c, tone);
@@ -422,7 +328,7 @@ pub fn pill<'a, M: 'a>(label: impl text::IntoFragment<'a>, tone: Tone) -> Elemen
             border: Border {
                 color: Color { a: 0.28, ..fg },
                 width: 1.0,
-                radius: if console { 2.0 } else { 999.0 }.into(),
+                radius: 999.0.into(),
             },
             ..container::Style::default()
         }
@@ -584,7 +490,7 @@ fn btn_style(kind: Btn) -> impl Fn(&Theme, button::Status) -> button::Style {
 }
 
 pub fn btn<'a, M: 'a>(kind: Btn, label: impl text::IntoFragment<'a>) -> button::Button<'a, M> {
-    button(text(label).size(look().body))
+    button(text(label).size(look().body).wrapping(Wrapping::None))
         .padding(look().button_pad)
         .style(btn_style(kind))
 }
@@ -603,13 +509,23 @@ pub fn btn_icon<'a, M: 'a>(
                 Btn::Danger => Color::WHITE,
                 _ => c.text,
             }),
-            text(label).size(size)
+            text(label).size(size).wrapping(Wrapping::None)
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center),
     )
     .padding(look().button_pad)
     .style(btn_style(kind))
+}
+
+/// Estimated width of a [`btn_icon`] with `label`, for fixed action slots.
+pub fn icon_btn_width(label: &str) -> f32 {
+    let l = look();
+    label.chars().count() as f32 * Role::Body.char_width()
+        + l.body
+        + 6.0
+        + 2.0 * l.button_pad[1]
+        + 4.0
 }
 
 /// Square icon-only button.
@@ -657,7 +573,8 @@ pub fn row_style(t: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Lucide icons (ISC licence, see the crate README), inner markup only.
+/// Lucide icons (ISC licence, see the crate README), inner markup copied
+/// from the lucide 1.8.0 package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
     Users,
@@ -674,39 +591,53 @@ pub enum Icon {
     ChevronDown,
     X,
     Square,
+    RefreshCw,
+    Download,
+    ArrowLeft,
+    CircleCheck,
 }
 
 impl Icon {
     fn markup(self) -> &'static str {
         match self {
             Icon::Users => {
-                r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>"#
+                r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>"#
             }
             Icon::Compare => {
                 r#"<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M11 18H8a2 2 0 0 1-2-2V9"/>"#
             }
             Icon::Plug => {
-                r#"<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>"#
+                r#"<path d="M12 22v-5"/><path d="M15 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/><path d="M9 8V2"/>"#
             }
             Icon::Layers => {
-                r#"<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>"#
+                r#"<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/>"#
             }
             Icon::Share => {
                 r#"<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>"#
             }
             Icon::Wrench => {
-                r#"<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>"#
+                r#"<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.22.983.218a6 6 0 0 1-8.259 7.057l-7.91 7.91a1 1 0 0 1-2.999-3l7.91-7.91a6 6 0 0 1 7.057-8.259c.438.12.54.662.219.984z"/>"#
             }
-            Icon::Activity => r#"<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>"#,
+            Icon::Activity => {
+                r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#
+            }
             Icon::Plus => r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#,
             Icon::Trash => {
-                r#"<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>"#
+                r#"<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>"#
             }
-            Icon::Search => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
+            Icon::Search => r#"<path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>"#,
             Icon::ChevronRight => r#"<path d="m9 18 6-6-6-6"/>"#,
             Icon::ChevronDown => r#"<path d="m6 9 6 6 6-6"/>"#,
             Icon::X => r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#,
-            Icon::Square => r#"<rect width="14" height="14" x="5" y="5" rx="2"/>"#,
+            Icon::Square => r#"<rect width="18" height="18" x="3" y="3" rx="2"/>"#,
+            Icon::RefreshCw => {
+                r#"<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>"#
+            }
+            Icon::Download => {
+                r#"<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>"#
+            }
+            Icon::ArrowLeft => r#"<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>"#,
+            Icon::CircleCheck => r#"<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>"#,
         }
     }
 

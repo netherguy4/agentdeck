@@ -1,8 +1,8 @@
-//! Instances: one card per registry instance (identity, T3 pill, threads,
-//! aligned quota bars) or, in the Console variant, one dense table.
+//! Instances: one card per registry instance (identity, status pills,
+//! threads, aligned quota bars) and standalone usage sources below.
 
 use i18n_embed_fl::fl;
-use iced::widget::{Space, column, row};
+use iced::widget::{column, row};
 use iced::{Alignment, Element, Length};
 
 use crate::app::{Message, RemoveAsk};
@@ -55,32 +55,44 @@ fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
     // Fixed side columns keep every bar the same length across cards.
     let reset = bar.resets_in_mins.map(reset_label).unwrap_or_default();
     row![
-        st::muted(label).width(150),
+        st::fit(label, st::Role::Muted, st::Cut::End).width(150),
         st::quota_bar(bar.used_percent as f32).length(Length::Fill),
-        st::data(format!("{:.0}%", bar.used_percent))
+        st::nowrap(st::body(format!("{:.0}%", bar.used_percent)))
             .width(44)
             .align_x(Alignment::End),
-        st::caption(reset).width(150),
+        st::fit(reset, st::Role::Caption, st::Cut::End).width(170),
     ]
     .spacing(st::SPACE_M)
     .align_y(Alignment::Center)
     .into()
 }
 
-fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {
+fn status_pill(u: &UsageQuotas) -> Option<Element<'_, Message>> {
+    (!u.status.is_empty()).then(|| st::pill(account_status(&u.status), account_tone(&u.status)))
+}
+
+/// `head`: a source line with its status; an instance card with a single
+/// source shows the status in the card header instead.
+fn quotas_view(u: &UsageQuotas, head: bool) -> Element<'_, Message> {
     let look = st::look();
-    let mut head = row![st::body(u.display.as_str())]
-        .spacing(st::SPACE_S)
-        .align_y(Alignment::Center);
-    if !u.status.is_empty() {
-        head = head.push(st::pill(account_status(&u.status), account_tone(&u.status)));
+    let mut col = column![].spacing(look.row_gap);
+    if head {
+        col = col.push(
+            row![st::fit(u.display.as_str(), st::Role::Body, st::Cut::End)]
+                .push(status_pill(u))
+                .spacing(st::SPACE_S)
+                .align_y(Alignment::Center),
+        );
     }
-    let mut col = column![head].spacing(look.row_gap);
     if u.bars.is_empty() {
-        col = col.push(st::muted(match &u.error {
-            Some(error) => error.clone(),
-            None => fl!(loader(), "quotas-no-data"),
-        }));
+        col = col.push(st::fit(
+            match &u.error {
+                Some(error) => error.clone(),
+                None => fl!(loader(), "quotas-no-data"),
+            },
+            st::Role::Muted,
+            st::Cut::End,
+        ));
     }
     for bar in &u.bars {
         col = col.push(quota_row(bar));
@@ -119,9 +131,14 @@ fn remove_btn(inst: &InstanceRow) -> Element<'_, Message> {
 
 fn instance_card(inst: &InstanceRow) -> Element<'_, Message> {
     let look = st::look();
+    let single = inst.quotas.len() == 1;
     let mut head = row![
-        st::heading(inst.display_name.as_str()),
-        st::mono_muted(inst.id.as_str()),
+        column![
+            st::fit(inst.display_name.as_str(), st::Role::Heading, st::Cut::End),
+            st::fit(inst.id.as_str(), st::Role::MonoMuted, st::Cut::Middle),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
         st::pill(inst.harness.as_str(), st::Tone::Accent),
     ]
     .spacing(st::SPACE_S)
@@ -129,49 +146,16 @@ fn instance_card(inst: &InstanceRow) -> Element<'_, Message> {
     if !inst.enabled {
         head = head.push(st::pill(fl!(loader(), "status-disabled"), st::Tone::Warn));
     }
-    let head = head
-        .push(Space::new().width(Length::Fill))
-        .push(st::caption(threads(inst)))
-        .push(t3_pill(inst))
-        .push(remove_btn(inst));
+    let mut head = head
+        .push(st::nowrap(st::caption(threads(inst))))
+        .push(t3_pill(inst));
+    if single {
+        head = head.push(status_pill(&inst.quotas[0]));
+    }
+    let head = head.push(remove_btn(inst));
     let mut col = column![head].spacing(look.row_gap + 4.0);
     for u in &inst.quotas {
-        col = col.push(quotas_view(u));
-    }
-    st::card(col)
-}
-
-/// Console: one table, a line per instance with its quota lines below.
-fn instance_table(instances: &[InstanceRow]) -> Element<'_, Message> {
-    let header = row![
-        st::caption(fl!(loader(), "col-name").to_uppercase()).width(Length::FillPortion(3)),
-        st::caption(fl!(loader(), "col-id").to_uppercase()).width(Length::FillPortion(3)),
-        st::caption(fl!(loader(), "col-harness").to_uppercase()).width(Length::FillPortion(2)),
-        st::caption(fl!(loader(), "t3-label").to_uppercase()).width(Length::FillPortion(3)),
-        st::caption(fl!(loader(), "col-threads").to_uppercase()).width(Length::FillPortion(2)),
-        Space::new().width(28),
-    ]
-    .spacing(st::SPACE_S);
-    let mut col = column![header, st::hairline()].spacing(4);
-    for (i, inst) in instances.iter().enumerate() {
-        if i > 0 {
-            col = col.push(st::hairline());
-        }
-        col = col.push(
-            row![
-                st::data(inst.display_name.as_str()).width(Length::FillPortion(3)),
-                st::mono_muted(inst.id.as_str()).width(Length::FillPortion(3)),
-                st::mono(inst.harness.as_str()).width(Length::FillPortion(2)),
-                iced::widget::container(t3_pill(inst)).width(Length::FillPortion(3)),
-                st::mono_muted(threads(inst)).width(Length::FillPortion(2)),
-                remove_btn(inst),
-            ]
-            .spacing(st::SPACE_S)
-            .align_y(Alignment::Center),
-        );
-        for u in &inst.quotas {
-            col = col.push(iced::widget::container(quotas_view(u)).padding([2, 16]));
-        }
+        col = col.push(quotas_view(u, !single));
     }
     st::card(col)
 }
@@ -186,8 +170,6 @@ pub fn view(data: &Data) -> Element<'_, Message> {
         col = col.push(st::muted(fl!(loader(), "instances-loading")));
     } else if data.instances.is_empty() {
         col = col.push(st::card(st::muted(fl!(loader(), "instances-empty"))));
-    } else if look.table {
-        col = col.push(instance_table(&data.instances));
     } else {
         for inst in &data.instances {
             col = col.push(instance_card(inst));
@@ -196,7 +178,7 @@ pub fn view(data: &Data) -> Element<'_, Message> {
     if !data.standalone.is_empty() {
         let mut list = column![].spacing(look.row_gap + 4.0);
         for u in &data.standalone {
-            list = list.push(quotas_view(u));
+            list = list.push(quotas_view(u, true));
         }
         col = col.push(
             column![

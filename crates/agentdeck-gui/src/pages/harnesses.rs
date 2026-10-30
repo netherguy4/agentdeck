@@ -5,8 +5,8 @@
 
 use agentdeck_core::harness::{self, HarnessName, Status};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, row};
-use iced::{Element, Task};
+use iced::widget::{column, container, row};
+use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
 use crate::style as st;
@@ -24,7 +24,8 @@ pub struct State {
     pub rows: Vec<Status>,
     pub pending: Option<Pending>,
     pub busy: bool,
-    pub result: Option<String>,
+    /// Last outcome (text, is error); the shell turns it into a toast.
+    pub result: Option<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +34,7 @@ pub enum Msg {
     Ask { name: String, install: bool },
     Confirm,
     Cancel,
-    Done(String),
+    Done(String, bool),
 }
 
 /// Runs `<bin> --version` per harness: call off the UI thread.
@@ -87,14 +88,17 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Msg> {
                             harness::real_runner(&p.argv[0], &p.argv[1..])
                         })
                         .await;
-                        let what = match out {
-                            Ok(Ok(text)) => last_lines(&text),
-                            Ok(Err(e)) => format!("{e:#}"),
-                            Err(e) => e.to_string(),
+                        let (what, error) = match out {
+                            Ok(Ok(text)) => (last_lines(&text), false),
+                            Ok(Err(e)) => (format!("{e:#}"), true),
+                            Err(e) => (e.to_string(), true),
                         };
-                        fl!(loader(), "harness-result", name = name, what = what)
+                        Msg::Done(
+                            fl!(loader(), "harness-result", name = name, what = what),
+                            error,
+                        )
                     },
-                    Msg::Done,
+                    |m| m,
                 )
             }
             None => Task::none(),
@@ -103,9 +107,9 @@ pub fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             state.pending = None;
             Task::none()
         }
-        Msg::Done(text) => {
+        Msg::Done(text, error) => {
             state.busy = false;
-            state.result = Some(text);
+            state.result = Some((text, error));
             Task::perform(load(), |m| m)
         }
     }
@@ -119,57 +123,58 @@ fn last_lines(text: &str) -> String {
 
 pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
     state.pending.as_ref().map(|p| {
-        let mut m = crate::overlay::confirm(
+        crate::overlay::confirm(
             fl!(loader(), "harness-run-title"),
             &p.lines,
             (fl!(loader(), "action-apply"), Some(Msg::Confirm)),
             (fl!(loader(), "action-cancel"), Msg::Cancel),
-        );
-        m.body.push(st::muted(fl!(loader(), "harness-note")).into());
-        m
+        )
     })
 }
 
 pub fn view(state: &State) -> Element<'_, Msg> {
-    let mut col = column![st::title(fl!(loader(), "harness-title"))].spacing(st::SPACE_M);
-    for (i, r) in state.rows.iter().enumerate() {
-        if i > 0 {
-            col = col.push(st::divider());
-        }
-        let installed = r.binary.is_some();
-        let (label, install) = if installed {
-            (fl!(loader(), "harness-update"), false)
-        } else {
-            (fl!(loader(), "harness-install"), true)
-        };
-        let version = match (&r.version, installed) {
-            (Some(v), _) => v.clone(),
-            (None, true) => "—".to_string(),
-            (None, false) => fl!(loader(), "harness-not-installed"),
-        };
-        col = col.push(
-            row![
-                column![
-                    row![st::heading(r.name.clone()), st::muted(version)].spacing(st::SPACE_S),
-                    st::muted(r.install_method.clone()),
-                ]
-                .spacing(st::SPACE_XS)
-                .width(iced::Length::Fill),
-                button(st::body(label))
-                    .style(button::secondary)
-                    .on_press_maybe((!state.busy).then(|| Msg::Ask {
-                        name: r.name.clone(),
-                        install,
-                    })),
-            ]
-            .align_y(iced::Alignment::Center),
-        );
-    }
+    let look = st::look();
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if state.busy {
         col = col.push(st::muted(fl!(loader(), "action-working")));
     }
-    if let Some(r) = &state.result {
-        col = col.push(st::muted(r.clone()));
+    if state.rows.is_empty() {
+        return col
+            .push(st::card(st::muted(fl!(loader(), "loading"))))
+            .into();
     }
-    col.into()
+    let mut list = column![].spacing(look.row_gap);
+    for (i, r) in state.rows.iter().enumerate() {
+        if i > 0 {
+            list = list.push(st::hairline());
+        }
+        let installed = r.binary.is_some();
+        let (label, icon, install) = if installed {
+            (fl!(loader(), "harness-update"), st::Icon::RefreshCw, false)
+        } else {
+            (fl!(loader(), "harness-install"), st::Icon::Download, true)
+        };
+        let version: Element<'_, Msg> = match (&r.version, installed) {
+            (Some(v), _) => st::fit(v.as_str(), st::Role::Mono, st::Cut::End).into(),
+            (None, true) => st::mono_muted("—").into(),
+            (None, false) => st::pill(fl!(loader(), "harness-not-installed"), st::Tone::Neutral),
+        };
+        list = list.push(
+            row![
+                st::fit(r.name.as_str(), st::Role::Heading, st::Cut::End).width(90),
+                container(version).width(Length::FillPortion(2)),
+                st::fit(r.install_method.as_str(), st::Role::Muted, st::Cut::End)
+                    .width(Length::FillPortion(3)),
+                st::btn_icon(st::Btn::Quiet, icon, label).on_press_maybe((!state.busy).then(
+                    || Msg::Ask {
+                        name: r.name.clone(),
+                        install,
+                    }
+                )),
+            ]
+            .spacing(st::SPACE_M)
+            .align_y(Alignment::Center),
+        );
+    }
+    col.push(st::card(list)).into()
 }

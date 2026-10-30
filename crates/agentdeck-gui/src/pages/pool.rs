@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use agentdeck_core::{Paths, PoolEntry, Registry, pool};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, pick_list, row, text_input};
-use iced::{Element, Task};
+use iced::widget::{Space, column, container, pick_list, row, text_input, toggler};
+use iced::{Alignment, Element, Length, Task};
 
 use crate::i18n::loader;
 use crate::style as st;
@@ -49,9 +49,12 @@ pub struct State {
     pub instance: Option<String>,
     pub model: String,
     pub options: String,
+    /// The Add form modal is open.
+    pub adding: bool,
     pub pending: Option<Pending>,
     pub busy: bool,
-    pub result: Option<String>,
+    /// Last action outcome (text, is error); the shell turns it into a toast.
+    pub result: Option<(String, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,8 @@ pub enum Msg {
     Instance(String),
     Model(String),
     Options(String),
+    OpenAdd,
+    CloseAdd,
     AskAdd,
     AskRemove(usize),
     AskToggle(usize),
@@ -216,7 +221,16 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
             state.options = o;
             Task::none()
         }
+        Msg::OpenAdd => {
+            state.adding = true;
+            Task::none()
+        }
+        Msg::CloseAdd => {
+            state.adding = false;
+            Task::none()
+        }
         Msg::AskAdd => {
+            state.adding = false;
             ask(state, &ctx, form_entry(state).map(Op::Add));
             Task::none()
         }
@@ -265,7 +279,10 @@ pub fn update(state: &mut State, ctx: Ctx, msg: Msg) -> Task<Msg> {
         }
         Msg::Done(result) => {
             state.busy = false;
-            state.result = Some(result.unwrap_or_else(|e| e));
+            state.result = Some(match result {
+                Ok(text) => (text, false),
+                Err(e) => (e, true),
+            });
             Task::done(load(&ctx))
         }
     }
@@ -286,7 +303,75 @@ fn ask(state: &mut State, ctx: &Ctx, op: anyhow::Result<Op>) {
     });
 }
 
+fn add_form(state: &State) -> crate::overlay::Modal<'_, Msg> {
+    let size = st::look().body;
+    let model: Element<'_, Msg> = if state.models.is_empty() {
+        column![
+            text_input(&fl!(loader(), "pool-model"), &state.model)
+                .on_input(Msg::Model)
+                .size(size),
+            st::muted(fl!(loader(), "pool-no-models")),
+        ]
+        .spacing(st::SPACE_XS)
+        .into()
+    } else {
+        pick_list(
+            state.models.clone(),
+            Some(state.model.clone()).filter(|m| !m.is_empty()),
+            Msg::Model,
+        )
+        .placeholder(fl!(loader(), "pool-model"))
+        .text_size(size)
+        .width(Length::Fill)
+        .into()
+    };
+    let field = |label: String, input: Element<'static, Msg>| -> Element<'static, Msg> {
+        column![st::caption(label), input].spacing(4).into()
+    };
+    crate::overlay::Modal {
+        title: fl!(loader(), "pool-add-title"),
+        body: vec![
+            field(
+                fl!(loader(), "pool-instance"),
+                pick_list(
+                    state.data.instances.clone(),
+                    state.instance.clone(),
+                    Msg::Instance,
+                )
+                .placeholder(fl!(loader(), "pool-instance"))
+                .text_size(size)
+                .width(Length::Fill)
+                .into(),
+            ),
+            column![st::caption(fl!(loader(), "pool-model")), model]
+                .spacing(4)
+                .into(),
+            column![
+                st::caption(fl!(loader(), "pool-options")),
+                text_input("effort=high", &state.options)
+                    .on_input(Msg::Options)
+                    .size(size),
+            ]
+            .spacing(4)
+            .into(),
+        ],
+        actions: vec![
+            st::btn(st::Btn::Quiet, fl!(loader(), "action-cancel"))
+                .on_press(Msg::CloseAdd)
+                .into(),
+            st::btn(st::Btn::Primary, fl!(loader(), "pool-preview-add"))
+                .on_press(Msg::AskAdd)
+                .into(),
+        ],
+        on_cancel: Msg::CloseAdd,
+        on_submit: Some(Msg::AskAdd),
+    }
+}
+
 pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
+    if state.adding {
+        return Some(add_form(state));
+    }
     state.pending.as_ref().map(|p| {
         crate::overlay::confirm(
             fl!(loader(), "pool-preview-title"),
@@ -300,83 +385,80 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
     })
 }
 
+/// Header actions: Import favorites and Add, both opening modals.
+pub fn header_actions(state: &State) -> Element<'_, Msg> {
+    let idle = !state.busy;
+    row![
+        st::btn_icon(
+            st::Btn::Quiet,
+            st::Icon::Download,
+            fl!(loader(), "pool-import")
+        )
+        .on_press_maybe(idle.then_some(Msg::AskImport)),
+        st::btn_icon(st::Btn::Primary, st::Icon::Plus, fl!(loader(), "pool-add"))
+            .on_press_maybe(idle.then_some(Msg::OpenAdd)),
+    ]
+    .spacing(st::SPACE_S)
+    .into()
+}
+
+const TOGGLE_W: f32 = 48.0;
+const REMOVE_W: f32 = 28.0;
+
 pub fn view(state: &State) -> Element<'_, Msg> {
-    let mut col = column![st::title(fl!(loader(), "pool-title"))].spacing(st::SPACE_M);
+    let look = st::look();
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &state.data.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
+        col = col.push(st::card(st::muted(fl!(
+            loader(),
+            "load-error",
+            what = error
+        ))));
     }
-    if state.data.entries.is_empty() {
-        col = col.push(st::muted(fl!(loader(), "pool-empty")));
-    }
-    for (i, e) in state.data.entries.iter().enumerate() {
-        let mut label = format!("{}  {}", e.instance, e.model);
-        for (k, v) in &e.options {
-            label.push_str(&format!("  {k}={v}"));
-        }
-        let (toggle, on) = if e.enabled {
-            ("pool-disable", "pool-enabled")
-        } else {
-            ("pool-enable", "pool-disabled")
-        };
-        col = col.push(
-            row![
-                st::body(label),
-                st::muted(loader().get(on)),
-                button(st::body(loader().get(toggle)))
-                    .style(button::secondary)
-                    .on_press(Msg::AskToggle(i)),
-                button(st::body(fl!(loader(), "pool-remove")))
-                    .style(button::secondary)
-                    .on_press(Msg::AskRemove(i)),
-            ]
-            .spacing(st::SPACE_S)
-            .align_y(iced::Alignment::Center),
-        );
-    }
-    col = col.push(st::divider());
-    col = col.push(st::heading(fl!(loader(), "pool-add-title")));
-    let model: Element<'_, Msg> = if state.models.is_empty() {
-        column![
-            text_input(&fl!(loader(), "pool-model"), &state.model).on_input(Msg::Model),
-            st::muted(fl!(loader(), "pool-no-models")),
-        ]
-        .spacing(st::SPACE_XS)
-        .into()
-    } else {
-        pick_list(
-            state.models.clone(),
-            Some(state.model.clone()).filter(|m| !m.is_empty()),
-            Msg::Model,
-        )
-        .placeholder(fl!(loader(), "pool-model"))
-        .into()
-    };
-    col = col.push(
-        pick_list(
-            state.data.instances.clone(),
-            state.instance.clone(),
-            Msg::Instance,
-        )
-        .placeholder(fl!(loader(), "pool-instance")),
-    );
-    col = col.push(model);
-    col =
-        col.push(text_input(&fl!(loader(), "pool-options"), &state.options).on_input(Msg::Options));
-    col = col.push(st::actions(vec![
-        button(st::body(fl!(loader(), "pool-preview-add")))
-            .style(button::secondary)
-            .on_press(Msg::AskAdd)
-            .into(),
-        button(st::body(fl!(loader(), "pool-import")))
-            .style(button::secondary)
-            .on_press(Msg::AskImport)
-            .into(),
-    ]));
     if state.busy {
         col = col.push(st::muted(fl!(loader(), "action-working")));
     }
-    if let Some(r) = &state.result {
-        col = col.push(st::muted(r.clone()));
+    if state.data.entries.is_empty() {
+        if state.data.error.is_none() {
+            col = col.push(st::card(st::muted(fl!(loader(), "pool-empty"))));
+        }
+        return col.into();
     }
-    col.into()
+    let header = row![
+        st::nowrap(st::caption(fl!(loader(), "pool-instance"))).width(Length::FillPortion(2)),
+        st::nowrap(st::caption(fl!(loader(), "pool-model"))).width(Length::FillPortion(3)),
+        st::nowrap(st::caption(fl!(loader(), "pool-col-options"))).width(Length::FillPortion(2)),
+        st::nowrap(st::caption(fl!(loader(), "pool-col-on"))).width(TOGGLE_W),
+        Space::new().width(REMOVE_W),
+    ]
+    .spacing(st::SPACE_M);
+    let mut table = column![header].spacing(look.row_gap);
+    for (i, e) in state.data.entries.iter().enumerate() {
+        let options = e
+            .options
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        table = table.push(st::hairline()).push(
+            row![
+                st::fit(e.instance.as_str(), st::Role::Body, st::Cut::Middle)
+                    .width(Length::FillPortion(2)),
+                st::fit(e.model.as_str(), st::Role::Mono, st::Cut::Middle)
+                    .width(Length::FillPortion(3)),
+                st::fit(options, st::Role::MonoMuted, st::Cut::End).width(Length::FillPortion(2)),
+                container(
+                    toggler(e.enabled)
+                        .size(16)
+                        .on_toggle_maybe((!state.busy).then_some(move |_| Msg::AskToggle(i))),
+                )
+                .width(TOGGLE_W),
+                st::icon_btn(st::Icon::Trash)
+                    .on_press_maybe((!state.busy).then_some(Msg::AskRemove(i))),
+            ]
+            .spacing(st::SPACE_M)
+            .align_y(Alignment::Center),
+        );
+    }
+    col.push(st::card(table)).into()
 }

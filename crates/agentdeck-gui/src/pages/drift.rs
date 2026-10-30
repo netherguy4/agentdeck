@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use agentdeck_core::{Harness, Paths, Registry, claude, codex, t3};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column};
+use iced::widget::column;
 use iced::{Element, Task};
 
 use crate::i18n::loader;
@@ -820,18 +820,28 @@ fn action_label(action: &Action) -> String {
 }
 
 fn action_buttons<'a>(group: &str, item: &'a Item) -> Vec<Element<'a, Message>> {
+    use crate::style as st;
     item.actions
         .iter()
         .map(|a| {
-            button(crate::style::body(action_label(a)))
-                .on_press(Message::Act {
-                    group: group.to_string(),
-                    key: a.key.clone(),
-                    kind: a.kind,
-                })
-                .into()
+            // Server names can be long; the label stays a button-sized line.
+            st::btn(
+                st::Btn::Quiet,
+                st::ellipsize(&action_label(a), 40, st::Cut::Middle),
+            )
+            .on_press(Message::Act {
+                group: group.to_string(),
+                key: a.key.clone(),
+                kind: a.kind,
+            })
+            .into()
         })
         .collect()
+}
+
+/// Items with something to do (not the "no drift" / "T3 unavailable" lines).
+pub fn open_items(group: &Group) -> usize {
+    group.items.iter().filter(|i| i.text_key.is_none()).count()
 }
 
 /// Item body: keyed lines and notes resolve here so snapshots stay
@@ -885,56 +895,75 @@ pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
 
 pub fn view(state: &State) -> Element<'_, Message> {
     use crate::style as st;
-    let mut col = column![st::title(fl!(loader(), "drift-title"))].spacing(st::SPACE_M);
+    use iced::widget::row;
+    use iced::{Alignment, Length};
+    let look = st::look();
+    let mut col = column![].spacing(look.gap.max(st::SPACE_S));
     if let Some(error) = &state.snapshot.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
+        col = col.push(st::card(st::muted(fl!(
+            loader(),
+            "load-error",
+            what = error
+        ))));
     }
-    for notice in &state.notices {
-        col = col.push(st::muted(notice.clone()));
+    if state.busy.is_some() {
+        col = col.push(st::muted(fl!(loader(), "drift-working")));
     }
-    if let Some(busy) = &state.busy {
-        col = col.push(st::muted(format!(
-            "{} {busy}",
-            fl!(loader(), "drift-working")
-        )));
-    }
-    if state.snapshot.groups.is_empty() && state.snapshot.error.is_none() {
-        // Groups exist once the check ran, even with nothing to report.
-        col = col.push(st::muted(fl!(loader(), "instances-loading")));
-    }
-    let mut first = true;
-    for group in &state.snapshot.groups {
-        if !first {
-            col = col.push(st::divider());
+    if state.snapshot.groups.is_empty() {
+        if state.snapshot.error.is_none() {
+            // Groups exist once the check ran, even with nothing to report.
+            col = col.push(st::card(st::muted(fl!(loader(), "drift-loading"))));
         }
-        first = false;
+        return col.into();
+    }
+    let mut any = false;
+    for group in &state.snapshot.groups {
+        // Re-enable is offered only after a Codex fix on a T3 instance.
+        let reenable = group.harness == "codex" && state.reenable.contains(&group.id);
+        if open_items(group) == 0 && !reenable {
+            continue;
+        }
+        any = true;
         let title = group
             .title
             .clone()
             .unwrap_or_else(|| fl!(loader(), "drift-group-t3"));
-        let mut card = column![st::heading(title)].spacing(st::SPACE_XS);
-        // Re-enable is offered only after a Codex fix on a T3 instance.
-        if group.harness == "codex" && state.reenable.contains(&group.id) {
-            card = card.push(button(st::body(fl!(loader(), "drift-reenable"))).on_press(
-                Message::Act {
+        let mut head = row![st::fit(title, st::Role::Heading, st::Cut::End)]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center);
+        if !group.harness.is_empty() {
+            head = head.push(st::pill(group.harness.as_str(), st::Tone::Accent));
+        }
+        if reenable {
+            head = head.push(
+                st::btn(st::Btn::Quiet, fl!(loader(), "drift-reenable")).on_press(Message::Act {
                     group: group.id.clone(),
                     key: String::new(),
                     kind: Kind::Reenable,
-                },
-            ));
+                }),
+            );
         }
-        for item in &group.items {
-            card = card.push(st::body(item_text(item)));
+        let mut card = column![head].spacing(look.row_gap);
+        for item in group.items.iter().filter(|i| i.text_key.is_none()) {
+            card = card.push(st::hairline());
             let buttons = action_buttons(&group.id, item);
+            let mut line = column![st::body(item_text(item)).width(Length::Fill)].spacing(4);
             if !buttons.is_empty() {
-                card = card.push(
-                    buttons
-                        .into_iter()
-                        .fold(iced::widget::row![].spacing(st::SPACE_S), |r, b| r.push(b)),
-                );
+                line = line.push(row(buttons).spacing(st::SPACE_S).wrap());
             }
+            card = card.push(line);
         }
-        col = col.push(card);
+        col = col.push(st::card(card));
+    }
+    if !any {
+        col = col.push(st::card(
+            row![
+                st::icon_colored(st::Icon::CircleCheck, look.body + 3.0, |c| c.ok),
+                st::body(fl!(loader(), "drift-all-clear")),
+            ]
+            .spacing(st::SPACE_S)
+            .align_y(Alignment::Center),
+        ));
     }
     col.into()
 }

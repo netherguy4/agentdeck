@@ -163,6 +163,7 @@ fn pool_page_add_preview_import_and_apply() {
         Message::Pool(pool::Msg::Instance("claude-main".into())),
     );
     update(&mut state, Message::Pool(pool::Msg::Model("opus-5".into())));
+    update(&mut state, Message::Pool(pool::Msg::OpenAdd));
     snapshot_both(&state, "pool_form");
 
     // Add: the preview lists the registry change; nothing is written yet.
@@ -232,18 +233,22 @@ fn shared_page_status_preview_and_apply() {
     let mut state = app::State::for_tests(fx.paths.clone(), Default::default());
     update(&mut state, Message::SelectPage(Page::Shared));
     update(&mut state, Message::Shared(shared::load(&ctx)));
+    snapshot_sized(&state, "shared", 360.0);
+    update(
+        &mut state,
+        Message::Shared(shared::Msg::Tab(shared::Kind::Mcp)),
+    );
     {
         let mut ui = iced_test::simulator(app::view(&state));
         ui.find("context7").expect("canonical server name");
     }
-    snapshot_sized(&state, "shared", 360.0);
 
     // Skills preview (deterministic; MCP backup paths carry timestamps).
     update(
         &mut state,
         Message::Shared(shared::Msg::Ask(shared::Kind::Skills)),
     );
-    snapshot_sized(&state, "shared_skills_preview", 330.0);
+    snapshot_sized(&state, "shared_skills_preview", 290.0);
     update(&mut state, Message::Shared(shared::Msg::Cancel));
 
     // Skills: preview, then apply exactly the previewed changes.

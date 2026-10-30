@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use agentdeck_core::processes::{ProcInfo, SessionGroup, StopOutcome};
 use i18n_embed_fl::fl;
-use iced::widget::{Space, button, checkbox, column, container, row, text_input};
+use iced::widget::{button, checkbox, column, container, row, text_input};
 use iced::{Alignment, Element, Length};
 
 use crate::app::Message;
@@ -131,8 +131,18 @@ pub fn visible(data: &Data, filter: &str) -> Vec<usize> {
 const CPU_W: f32 = 64.0;
 const RSS_W: f32 = 64.0;
 const PID_W: f32 = 64.0;
-/// Fixed Stop column so member numbers line up with the group totals.
-const STOP_W: f32 = 84.0;
+
+/// Stop column wide enough for its label in the current language, so member
+/// numbers line up with the group totals.
+fn stop_w() -> f32 {
+    st::icon_btn_width(&fl!(loader(), "processes-stop"))
+}
+
+/// Group titles carry a run id in parentheses; the row shows the name and
+/// the expanded view the whole title.
+fn short_title(title: &str) -> &str {
+    title.split(" (").next().unwrap_or(title)
+}
 
 fn group_row<'a>(i: usize, g: &'a SessionGroup, open: bool) -> Element<'a, Message> {
     let look = st::look();
@@ -147,18 +157,13 @@ fn group_row<'a>(i: usize, g: &'a SessionGroup, open: bool) -> Element<'a, Messa
                 },
                 look.body + 1.0
             ),
-            if look.table {
-                st::data(g.title.as_str())
-            } else {
-                st::heading(g.title.as_str())
-            },
+            st::fit(short_title(&g.title), st::Role::Heading, st::Cut::End),
             st::pill(kind_label(g), st::Tone::Neutral),
-            st::caption(count),
-            Space::new().width(Length::Fill),
-            st::data(format!("{:.1}%", g.cpu_percent))
+            st::nowrap(st::caption(count)),
+            st::nowrap(st::body(format!("{:.1}%", g.cpu_percent)))
                 .width(CPU_W)
                 .align_x(Alignment::End),
-            st::data(mega(g.rss_bytes))
+            st::nowrap(st::body(mega(g.rss_bytes)))
                 .width(RSS_W)
                 .align_x(Alignment::End),
         ]
@@ -179,8 +184,8 @@ fn group_row<'a>(i: usize, g: &'a SessionGroup, open: bool) -> Element<'a, Messa
             )
             .on_press(Message::ProcStop(i))
         )
-        .width(STOP_W)
-        .align_right(STOP_W),
+        .width(stop_w())
+        .align_right(stop_w()),
     ]
     .spacing(st::SPACE_S)
     .align_y(Alignment::Center)
@@ -189,15 +194,26 @@ fn group_row<'a>(i: usize, g: &'a SessionGroup, open: bool) -> Element<'a, Messa
 
 fn members(g: &SessionGroup) -> Element<'_, Message> {
     let mut col = column![].spacing(2);
+    if short_title(&g.title) != g.title {
+        col = col.push(st::fit(
+            g.title.as_str(),
+            st::Role::MonoMuted,
+            st::Cut::Middle,
+        ));
+    }
     for line in member_lines(&g.processes) {
         col = col.push(
             row![
-                st::mono_muted(line.pid.map(|p| p.to_string()).unwrap_or_default()).width(PID_W),
-                st::mono(line.cmd).width(Length::Fill),
-                st::mono_muted(format!("{:.1}%", line.cpu))
+                st::nowrap(st::mono_muted(
+                    line.pid.map(|p| p.to_string()).unwrap_or_default()
+                ))
+                .width(PID_W),
+                // Middle keeps a folded line's ×N count visible.
+                st::fit(line.cmd, st::Role::Mono, st::Cut::Middle),
+                st::nowrap(st::mono_muted(format!("{:.1}%", line.cpu)))
                     .width(CPU_W)
                     .align_x(Alignment::End),
-                st::mono_muted(mega(line.rss))
+                st::nowrap(st::mono_muted(mega(line.rss)))
                     .width(RSS_W)
                     .align_x(Alignment::End),
             ]
@@ -210,7 +226,7 @@ fn members(g: &SessionGroup) -> Element<'_, Message> {
             top: 2.0,
             bottom: 4.0,
             left: 28.0,
-            right: STOP_W + st::SPACE_S + 4.0,
+            right: stop_w() + st::SPACE_S + 4.0,
         })
         .into()
 }
@@ -242,28 +258,9 @@ pub fn view<'a>(data: &'a Data, ui: &'a ProcUi) -> Element<'a, Message> {
         }
         block
     });
-    if look.table {
-        let header = row![
-            st::caption(fl!(loader(), "col-group").to_uppercase()).width(Length::Fill),
-            st::caption("CPU").width(CPU_W).align_x(Alignment::End),
-            st::caption("RSS").width(RSS_W).align_x(Alignment::End),
-            Space::new().width(STOP_W + st::SPACE_S),
-        ]
-        .spacing(st::SPACE_S)
-        .padding([0, 4]);
-        let mut col = column![header, st::hairline()].spacing(2);
-        for (n, block) in blocks.enumerate() {
-            if n > 0 {
-                col = col.push(st::hairline());
-            }
-            col = col.push(block);
-        }
-        st::card(col)
-    } else {
-        column(blocks.map(st::card))
-            .spacing(look.gap.max(st::SPACE_S))
-            .into()
-    }
+    column(blocks.map(st::card))
+        .spacing(look.gap.max(st::SPACE_S))
+        .into()
 }
 
 pub fn stop_modal(pending: &PendingStop, force: bool) -> Modal<'_, Message> {
