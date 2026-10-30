@@ -27,6 +27,16 @@ pub enum Change {
         path: PathBuf,
         backup: PathBuf,
     },
+    /// Remove a file agentdeck generated (verified by marker before planning).
+    Remove {
+        path: PathBuf,
+    },
+    /// Like `WriteFile` but the result is executable (wrapper scripts, 0755).
+    WriteScript {
+        path: PathBuf,
+        contents: Vec<u8>,
+        old: Option<Vec<u8>>,
+    },
 }
 
 impl Change {
@@ -65,6 +75,22 @@ impl Change {
                     backup.display()
                 )
             }
+            Change::Remove { path } => format!("remove {}", path.display()),
+            Change::WriteScript {
+                path,
+                contents,
+                old,
+            } => match old {
+                None => format!(
+                    "write {} (new executable, {} bytes)",
+                    path.display(),
+                    contents.len()
+                ),
+                Some(prev) if prev == contents => {
+                    format!("write {} (unchanged)", path.display())
+                }
+                Some(prev) => describe_diff(path, prev, contents),
+            },
         }
     }
 
@@ -133,6 +159,22 @@ impl Change {
                 }
                 Ok(())
             }
+            Change::Remove { path } => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            },
+            Change::WriteScript { path, contents, .. } => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                // Same-dir tmp + rename so a crash never leaves a half file.
+                let tmp = path.with_extension("tmp");
+                fs::write(&tmp, contents)?;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+                fs::rename(&tmp, path)?;
+                Ok(())
+            }
         }
     }
 }
@@ -185,6 +227,18 @@ pub fn plan_write_file(path: PathBuf, old: Option<&[u8]>, new: &[u8]) -> Option<
         contents: new.to_vec(),
         old: old.map(|b| b.to_vec()),
         backup: None,
+    })
+}
+
+/// Build a `WriteScript` change, or `None` when old and new bytes are identical.
+pub fn plan_write_script(path: PathBuf, old: Option<&[u8]>, new: &[u8]) -> Option<Change> {
+    if old == Some(new) {
+        return None;
+    }
+    Some(Change::WriteScript {
+        path,
+        contents: new.to_vec(),
+        old: old.map(|b| b.to_vec()),
     })
 }
 
