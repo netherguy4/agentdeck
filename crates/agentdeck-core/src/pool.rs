@@ -276,6 +276,214 @@ pub fn set_pool_enabled(
     Ok(changes)
 }
 
+/// One favorite from T3 `settings.json`: provider id, exact model, options.
+#[derive(Debug, Clone)]
+pub struct Favorite {
+    pub provider: String,
+    pub model: String,
+    pub options: BTreeMap<String, PoolValue>,
+    pub enabled: bool,
+}
+
+fn favorite_enabled(
+    instances: Option<&serde_json::Map<String, serde_json::Value>>,
+    legacy: Option<&serde_json::Map<String, serde_json::Value>>,
+    provider: &str,
+) -> bool {
+    instances
+        .and_then(|m| m.get(provider))
+        .and_then(|p| p.get("enabled"))
+        .and_then(|e| e.as_bool())
+        .or_else(|| {
+            legacy
+                .and_then(|m| m.get(provider))
+                .and_then(|p| p.get("enabled"))
+                .and_then(|e| e.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// Read T3 favorites (read-only; never edited). `t3_root` is injectable so
+/// tests use a temp dir; production passes `t3::t3_root()?`.
+pub fn read_favorites(t3_root: &Path) -> anyhow::Result<Vec<Favorite>> {
+    let file = t3_root.join("userdata/settings.json");
+    let raw =
+        std::fs::read(&file).map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
+    let favs = v
+        .get("favorites")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
+    let instances = v.get("providerInstances").and_then(|p| p.as_object());
+    let legacy = v.get("providers").and_then(|p| p.as_object());
+    let mut out = Vec::new();
+    for fav in favs {
+        let (Some(provider), Some(model)) = (
+            fav.get("provider").and_then(|p| p.as_str()),
+            fav.get("model").and_then(|m| m.as_str()),
+        ) else {
+            continue;
+        };
+        if provider.is_empty() || model.is_empty() {
+            continue;
+        }
+        let mut options = BTreeMap::new();
+        if let Some(map) = fav.get("options").and_then(|o| o.as_object()) {
+            for (k, val) in map {
+                match val {
+                    serde_json::Value::Bool(b) => {
+                        options.insert(k.clone(), PoolValue::Bool(*b));
+                    }
+                    serde_json::Value::String(s) => {
+                        options.insert(k.clone(), PoolValue::String(s.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(Favorite {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            options,
+            enabled: favorite_enabled(instances, legacy, provider),
+        });
+    }
+    Ok(out)
+}
+
+/// Read-only T3 favorites import into `[[pool]]`: exact instance ids, models
+/// and options (`enabled` follows `providerInstances`); the T3 favorites are
+/// never edited. Idempotent: a second run adds nothing. Returns the registry
+/// change plus the added count and skip notes.
+pub fn import_favorites(
+    paths: &Paths,
+    t3_root: &Path,
+    dry_run: bool,
+) -> anyhow::Result<(Vec<Change>, usize, Vec<String>)> {
+    let settings = t3_root.join("userdata/settings.json");
+    let raw = std::fs::read(&settings)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", settings.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
+    let favs = v
+        .get("favorites")
+        .and_then(|f| f.as_array())
+        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
+    let instances = v
+        .get("providerInstances")
+        .and_then(|p| p.as_object())
+        .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no providerInstances object"))?;
+    let legacy = v.get("providers").and_then(|p| p.as_object());
+    let mut reg = Registry::load(paths)?;
+    let mut added = 0;
+    let mut skipped = Vec::new();
+    for fav in favs {
+        let (Some(provider), Some(model)) = (
+            fav.get("provider").and_then(|p| p.as_str()),
+            fav.get("model").and_then(|m| m.as_str()),
+        ) else {
+            skipped.push("favorite without provider/model".to_string());
+            continue;
+        };
+        if provider.is_empty() || model.is_empty() {
+            skipped.push(format!("{provider}/{model}: empty provider or model"));
+            continue;
+        }
+        let enabled = instances
+            .get(provider)
+            .and_then(|p| p.get("enabled"))
+            .and_then(|e| e.as_bool())
+            .or_else(|| {
+                legacy
+                    .and_then(|l| l.get(provider))
+                    .and_then(|p| p.get("enabled"))
+                    .and_then(|e| e.as_bool())
+            })
+            .unwrap_or(true);
+        let mut options = BTreeMap::new();
+        if let Some(map) = fav.get("options").and_then(|o| o.as_object()) {
+            for (k, val) in map {
+                match val {
+                    serde_json::Value::Bool(b) => {
+                        options.insert(k.clone(), PoolValue::Bool(*b));
+                    }
+                    serde_json::Value::String(s) => {
+                        options.insert(k.clone(), PoolValue::String(s.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let entry = PoolEntry {
+            instance: provider.to_string(),
+            model: model.to_string(),
+            options,
+            enabled,
+        };
+        if reg.pool.iter().any(|e| e.key_eq(&entry)) {
+            continue;
+        }
+        if reg.get(&entry.instance).is_none() {
+            skipped.push(format!(
+                "{} {}: unknown instance (add it with `agentdeck t3 import` first)",
+                entry.instance, entry.model
+            ));
+            continue;
+        }
+        reg.pool.push(entry);
+        added += 1;
+    }
+    reg.validate()?;
+    let new_text = reg.render()?;
+    let old = std::fs::read(paths.registry_file()).ok();
+    let changes = plan_write_file(paths.registry_file(), old.as_deref(), new_text.as_bytes())
+        .map(|c| vec![c])
+        .unwrap_or_default();
+    if !dry_run {
+        Registry::update(paths, |reg| {
+            let raw = std::fs::read(&settings)
+                .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", settings.display()))?;
+            let v: serde_json::Value = serde_json::from_slice(&raw)
+                .map_err(|e| anyhow::anyhow!("T3 settings.json is not valid JSON: {e}"))?;
+            let favs = v
+                .get("favorites")
+                .and_then(|f| f.as_array())
+                .ok_or_else(|| anyhow::anyhow!("T3 settings.json has no favorites array"))?;
+            for fav in favs {
+                let (Some(provider), Some(model)) = (
+                    fav.get("provider").and_then(|p| p.as_str()),
+                    fav.get("model").and_then(|m| m.as_str()),
+                ) else {
+                    continue;
+                };
+                let enabled = v
+                    .get("providerInstances")
+                    .and_then(|p| p.get(provider))
+                    .and_then(|p| p.get("enabled"))
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(true);
+                let entry = PoolEntry {
+                    instance: provider.to_string(),
+                    model: model.to_string(),
+                    options: BTreeMap::new(),
+                    enabled,
+                };
+                if reg.pool.iter().any(|e| e.key_eq(&entry)) {
+                    continue;
+                }
+                if reg.get(&entry.instance).is_none() || entry.model.is_empty() {
+                    continue;
+                }
+                reg.pool.push(entry);
+            }
+            reg.validate()?;
+            Ok(())
+        })?;
+    }
+    Ok((changes, added, skipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +652,39 @@ mod tests {
                 .iter()
                 .any(|e| e.model == "m")
         );
+    }
+
+    #[test]
+    fn import_favorites_adds_once_and_skips_unknown() {
+        let (paths, _g) = test_paths("import");
+        let t3 = _g.0.join("t3");
+        std::fs::create_dir_all(t3.join("userdata")).unwrap();
+        std::fs::write(
+            t3.join("userdata/settings.json"),
+            serde_json::json!({
+                "favorites": [
+                    {"provider": "codex", "model": "gpt-x"},
+                    {"provider": "ghost", "model": "m"},
+                ],
+                "providerInstances": {"codex": {"enabled": true}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        Registry::update(&paths, |r| r.add(spec("codex"))).unwrap();
+        let (changes, added, skipped) = import_favorites(&paths, &t3, true).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(skipped.len(), 1);
+        // Dry run writes nothing.
+        assert!(Registry::load(&paths).unwrap().pool.is_empty());
+        let (_, added, _) = import_favorites(&paths, &t3, false).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(Registry::load(&paths).unwrap().pool.len(), 1);
+        // A second run adds nothing and plans no changes.
+        let (changes2, added2, _) = import_favorites(&paths, &t3, false).unwrap();
+        assert_eq!(added2, 0);
+        assert!(changes2.is_empty());
     }
 
     #[test]

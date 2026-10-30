@@ -11,6 +11,7 @@ mod cmd_opencode;
 mod cmd_plugin;
 mod cmd_pool;
 mod cmd_ps;
+mod cmd_router;
 mod cmd_service;
 mod cmd_shared;
 mod cmd_sync;
@@ -90,7 +91,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_service::ServiceCmd,
     },
-    /// Enable or disable built-in plugins (agent-process, ai-usage).
+    /// Refresh the embedded router copy and its generated router.json.
+    Router {
+        #[command(subcommand)]
+        cmd: cmd_router::RouterCmd,
+    },
+    /// Enable or disable built-in plugins (agent-process, ai-usage, router).
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
@@ -251,6 +257,7 @@ fn run_gui() -> anyhow::Result<()> {
 async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
+        Cmd::Router { cmd } => cmd_router::run(paths, cmd)?,
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,

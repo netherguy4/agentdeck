@@ -1,0 +1,825 @@
+//! Agentdeck copy of the model-route Node router: embedded assets, the
+//! `router.json` generator (pool + account maps), hook registration and the
+//! instruction marker block.
+//!
+//! Everything lands in `<state_dir>/router/` (`router.json` next to the
+//! extracted files). The old standalone copy in
+//! `~/.general/scripts/model-route` is never touched.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+
+use crate::changes::{Change, backup_dest, plan_write_file};
+use crate::paths::Paths;
+use crate::plugins::apply_marker_block;
+use crate::pool::PoolValue;
+use crate::registry::Registry;
+use crate::usage::UsageKind;
+
+pub const ROUTER_VERSION_MAJOR: u32 = 1;
+/// The daemon dual-writes the old ai-usage state path, so the router keeps
+/// reading it by default.
+pub const USAGE_STATE_PATH: &str = "~/.local/state/ai-usage/state.json";
+/// Marker name for the instruction block; the plugin name stays `router`.
+pub const ROUTER_MARKER: &str = "model-route";
+
+/// Runtime files extracted next to `router.json` (tests stay in the repo).
+const FILES: &[(&str, &[u8])] = &[
+    ("route.mjs", include_bytes!("../assets/router/route.mjs")),
+    ("policy.mjs", include_bytes!("../assets/router/policy.mjs")),
+    ("hook.mjs", include_bytes!("../assets/router/hook.mjs")),
+    (
+        "reasoning.mjs",
+        include_bytes!("../assets/router/reasoning.mjs"),
+    ),
+    ("load.mjs", include_bytes!("../assets/router/load.mjs")),
+    (
+        "workflow.mjs",
+        include_bytes!("../assets/router/workflow.mjs"),
+    ),
+    (
+        "t3-mcp-call.mjs",
+        include_bytes!("../assets/router/t3-mcp-call.mjs"),
+    ),
+    (
+        "claude-shell-mcp.mjs",
+        include_bytes!("../assets/router/claude-shell-mcp.mjs"),
+    ),
+    (
+        "roster.json",
+        include_bytes!("../assets/router/roster.json"),
+    ),
+];
+
+const ROSTER_JSON: &str = include_str!("../assets/router/roster.json");
+
+pub const CLAUDE_MATCHER: &str = "^(?:Agent|Workflow)$|.*delegate_task$";
+pub const CODEX_MATCHER: &str = "^(?:collaboration\\.?)?spawn_agent$|^Agent$|.*delegate_task$";
+pub const AGY_MATCHER: &str = "^invoke_subagent$|^start_subagent$|^call_mcp_tool$|.*delegate_task$";
+
+pub fn router_dir(paths: &Paths) -> PathBuf {
+    paths.state_dir.join("router")
+}
+
+pub fn router_json_path(paths: &Paths) -> PathBuf {
+    router_dir(paths).join("router.json")
+}
+
+pub fn hook_path(paths: &Paths) -> PathBuf {
+    router_dir(paths).join("hook.mjs")
+}
+
+/// Command string registered in harness hooks (hooks fail closed on error).
+pub fn hook_command(paths: &Paths, harness: &str) -> String {
+    format!("{} --harness {harness}", hook_path(paths).display())
+}
+
+pub fn claude_settings(home: &Path) -> PathBuf {
+    home.join(".claude/settings.json")
+}
+
+pub fn codex_hooks(home: &Path) -> PathBuf {
+    home.join(".codex/hooks.json")
+}
+
+pub fn agy_hooks(home: &Path) -> PathBuf {
+    home.join(".gemini/config/plugins/model-route/hooks.json")
+}
+
+pub fn agy_config(home: &Path) -> PathBuf {
+    home.join(".gemini/config/config.json")
+}
+
+pub fn opencode_plugin(home: &Path) -> PathBuf {
+    home.join(".config/opencode/plugin/model-route.ts")
+}
+
+/// Account key from a usage id: `claude-main` -> `claude`,
+/// `codex-second` -> `codex_second`.
+fn account_key(id: &str) -> String {
+    id.strip_suffix("-main").unwrap_or(id).replace('-', "_")
+}
+
+/// Build the router JSON from `[[pool]]` + `[[usage]]`.
+///
+/// Pool entries map 1:1. Each usage entry with a linked instance becomes one
+/// account (`usageId` for the per-login claude/codex kinds). Instance-less
+/// entries take the still-unclaimed pool instances (unambiguous with a single
+/// such entry); the shared opencode-go account only matches models under
+/// `opencode-go/` on the already-mapped `opencode` instance.
+pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
+    let pool: Vec<Value> = reg
+        .pool
+        .iter()
+        .map(|e| {
+            let mut o = Map::new();
+            o.insert(
+                "providerInstanceId".into(),
+                Value::String(e.instance.clone()),
+            );
+            o.insert("model".into(), Value::String(e.model.clone()));
+            o.insert("enabled".into(), Value::Bool(e.enabled));
+            if !e.options.is_empty() {
+                o.insert(
+                    "options".into(),
+                    Value::Object(
+                        e.options
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    match v {
+                                        PoolValue::Bool(b) => Value::Bool(*b),
+                                        PoolValue::String(s) => Value::String(s.clone()),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            Value::Object(o)
+        })
+        .collect();
+    let mut mapped: BTreeSet<String> = BTreeSet::new();
+    let mut accounts: BTreeMap<String, Value> = BTreeMap::new();
+    for u in &reg.usage {
+        if let Some(inst) = &u.instance {
+            let mut o = Map::new();
+            o.insert(
+                "instances".into(),
+                Value::Array(vec![Value::String(inst.clone())]),
+            );
+            o.insert(
+                "usageProvider".into(),
+                Value::String(u.kind.as_str().to_string()),
+            );
+            if matches!(u.kind, UsageKind::Claude | UsageKind::Codex) {
+                o.insert("usageId".into(), Value::String(u.id.clone()));
+            }
+            if matches!(u.kind, UsageKind::OpencodeGo) {
+                o.insert("modelPrefix".into(), Value::from("opencode-go/"));
+            }
+            if mapped.contains(inst) {
+                anyhow::bail!(
+                    "usage {:?} shares instance {inst:?} with another account",
+                    u.id
+                );
+            }
+            mapped.insert(inst.clone());
+            accounts.insert(account_key(&u.id), Value::Object(o));
+        }
+    }
+    let mut uncovered: Vec<String> = reg
+        .pool
+        .iter()
+        .map(|e| e.instance.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|i| !mapped.contains(i))
+        .collect();
+    // shortcut: standalone keys share every unclaimed instance; with several
+    // such keys the map would double-claim, so bail and ask for instance links.
+    for u in reg
+        .usage
+        .iter()
+        .filter(|u| u.instance.is_none() && u.kind != UsageKind::OpencodeGo)
+    {
+        let take: Vec<String> = if matches!(u.kind, UsageKind::Antigravity) {
+            uncovered
+                .iter()
+                .filter(|i| i.as_str() == "antigravity")
+                .cloned()
+                .collect()
+        } else {
+            uncovered.clone()
+        };
+        if take.is_empty() {
+            continue;
+        }
+        let mut o = Map::new();
+        o.insert(
+            "instances".into(),
+            Value::Array(take.iter().map(|s| Value::String(s.clone())).collect()),
+        );
+        o.insert(
+            "usageProvider".into(),
+            Value::String(u.kind.as_str().to_string()),
+        );
+        uncovered.retain(|i| !take.contains(i));
+        for i in &take {
+            mapped.insert(i.clone());
+        }
+        accounts.insert(account_key(&u.id), Value::Object(o));
+    }
+    if mapped.contains("opencode")
+        && reg
+            .usage
+            .iter()
+            .any(|u| u.instance.is_none() && u.kind == UsageKind::OpencodeGo)
+    {
+        let mut o = Map::new();
+        o.insert(
+            "instances".into(),
+            Value::Array(vec![Value::String("opencode".to_string())]),
+        );
+        o.insert("usageProvider".into(), Value::from("opencode-go"));
+        o.insert("modelPrefix".into(), Value::from("opencode-go/"));
+        accounts.insert("opencode-go".into(), Value::Object(o));
+    }
+    let version = content_version(&pool, &accounts);
+    let mut root = Map::new();
+    root.insert("version".into(), Value::from(version));
+    root.insert("pool".into(), Value::Array(pool));
+    root.insert(
+        "accounts".into(),
+        Value::Object(accounts.into_iter().collect()),
+    );
+    root.insert(
+        "usageStatePath".into(),
+        Value::String(USAGE_STATE_PATH.to_string()),
+    );
+    Ok(Value::Object(root))
+}
+
+/// Stable version that busts the Jev cache whenever pool/accounts change.
+fn content_version(pool: &[Value], accounts: &BTreeMap<String, Value>) -> u64 {
+    let text = serde_json::to_string(&serde_json::json!({"pool": pool, "accounts": accounts}))
+        .unwrap_or_default();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Plan extracting the embedded files plus a fresh `router.json`. Pure plan:
+/// callers skip apply on `--dry-run`.
+pub fn plan_router_files(paths: &Paths, reg: &Registry) -> anyhow::Result<Vec<Change>> {
+    let dir = router_dir(paths);
+    let mut changes = Vec::new();
+    for (name, bytes) in FILES {
+        let path = dir.join(name);
+        let old = std::fs::read(&path).ok();
+        changes.extend(plan_write_file(path, old.as_deref(), bytes));
+    }
+    let text = serde_json::to_string_pretty(&router_json_value(reg)?)? + "\n";
+    let path = router_json_path(paths);
+    let old = std::fs::read(&path).ok();
+    changes.extend(plan_write_file(path, old.as_deref(), text.as_bytes()));
+    Ok(changes)
+}
+
+/// Plan removing the extracted files (only ones matching the embedded
+/// bytes). `router.json` is data and is kept.
+pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
+    let dir = router_dir(paths);
+    let mut changes = Vec::new();
+    for (name, bytes) in FILES {
+        let path = dir.join(name);
+        if let Ok(old) = std::fs::read(&path)
+            && old.as_slice() == *bytes
+        {
+            changes.push(Change::Remove { path });
+        }
+    }
+    changes
+}
+
+/// Instruction body: the Delegation routing section (route path points at the
+/// extracted copy) plus the roster `briefHint` verbatim.
+pub fn router_block(paths: &Paths) -> String {
+    let route = router_dir(paths).join("route.mjs").display().to_string();
+    let hint: String = serde_json::from_str::<Value>(ROSTER_JSON)
+        .ok()
+        .and_then(|v| v.get("briefHint")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    format!(
+        "## Delegation routing (agentdeck router)\n\n\
+        - Route every `delegate_task`/subagent target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
+        (add `--source <provider instance>` when the source is unknown). Only exact active pool entries are candidates; \
+        never restore removed entries under another id.\n\
+        - Before routing, call T3 `orchestrator_capabilities` and pipe its `structuredContent` JSON to `{route} --catalog`; \
+        refresh after provider/model changes. Pass the complete returned `target` (including `options`) as the `delegate_task` \
+        target; append a returned `briefHint` verbatim. Never set `runtimeMode` unless asked.\n\
+        - `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
+        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\n{hint}\n"
+    )
+}
+
+/// Plan the `<!-- model-route:begin -->` block across `files` (same dedupe
+/// and backup rules as other marker blocks, but under the router's own
+/// marker name).
+pub fn plan_router_marker(
+    files: &[PathBuf],
+    body: Option<&str>,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut changes: Vec<Change> = Vec::new();
+    for file in files {
+        let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let old = match std::fs::read(file) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let old_text = old
+            .as_deref()
+            .map(|b| {
+                std::str::from_utf8(b)
+                    .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", file.display()))
+            })
+            .transpose()?
+            .unwrap_or("");
+        let Some(new_text) = apply_marker_block(old_text, ROUTER_MARKER, body)? else {
+            continue;
+        };
+        let backup = old.is_some().then(|| {
+            backup_dest(
+                state_dir,
+                file.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("instructions"),
+            )
+        });
+        changes.push(Change::WriteFile {
+            path: file.clone(),
+            contents: new_text.into_bytes(),
+            old,
+            backup,
+        });
+    }
+    Ok(changes)
+}
+
+fn read_json(path: &Path) -> anyhow::Result<(Option<Vec<u8>>, Value)> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((None, Value::Object(Map::new()))),
+        Err(e) => Err(e.into()),
+        Ok(bytes) => {
+            let v: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
+            Ok((Some(bytes), v))
+        }
+    }
+}
+
+fn write_json_change(
+    path: PathBuf,
+    old: Option<Vec<u8>>,
+    v: &Value,
+    state_dir: &Path,
+) -> Option<Change> {
+    let text = serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
+    let new = text.into_bytes();
+    if old.as_deref() == Some(new.as_slice()) {
+        return None;
+    }
+    let backup = old.is_some().then(|| {
+        backup_dest(
+            state_dir,
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("config"),
+        )
+    });
+    Some(Change::WriteFile {
+        path,
+        contents: new,
+        old,
+        backup,
+    })
+}
+
+fn as_obj(v: &mut Value) -> Option<&mut Map<String, Value>> {
+    v.as_object_mut()
+}
+
+fn object(v: &mut Value) -> anyhow::Result<&mut Map<String, Value>> {
+    as_obj(v).ok_or_else(|| anyhow::anyhow!("expected a JSON object"))
+}
+
+fn pretool_array(parent: &mut Map<String, Value>) -> anyhow::Result<&mut Vec<Value>> {
+    if !parent.contains_key("PreToolUse") {
+        parent.insert("PreToolUse".into(), Value::Array(Vec::new()));
+    }
+    match parent.get_mut("PreToolUse") {
+        Some(Value::Array(a)) => Ok(a),
+        _ => anyhow::bail!("PreToolUse is not an array"),
+    }
+}
+
+/// Insert our hook entry under `matcher`; returns true when changed.
+fn insert_hook(arr: &mut Vec<Value>, matcher: &str, command: &str) -> bool {
+    if !arr
+        .iter()
+        .any(|e| e.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+    {
+        arr.push(serde_json::json!({"matcher": matcher, "hooks": []}));
+    }
+    let entry = arr
+        .iter_mut()
+        .find(|e| e.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+        .unwrap();
+    let hooks = entry.get_mut("hooks").and_then(|h| h.as_array_mut());
+    let Some(hooks) = hooks else { return false };
+    if hooks
+        .iter()
+        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+    {
+        return false;
+    }
+    hooks.push(serde_json::json!({"type": "command", "command": command, "timeout": 60}));
+    true
+}
+
+/// Remove our hook entry (exact command match, so standalone-copy hooks are
+/// left alone); returns true when changed.
+fn remove_hook(arr: &mut Vec<Value>, matcher: &str, command: &str) -> bool {
+    let Some(pos) = arr
+        .iter()
+        .position(|e| e.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+    else {
+        return false;
+    };
+    let changed = arr[pos]
+        .get_mut("hooks")
+        .and_then(|h| h.as_array_mut())
+        .map(|hooks| {
+            let before = hooks.len();
+            hooks.retain(|h| h.get("command").and_then(|c| c.as_str()) != Some(command));
+            hooks.len() != before
+        })
+        .unwrap_or(false);
+    if arr[pos]
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|h| h.is_empty())
+    {
+        arr.remove(pos);
+    }
+    changed
+}
+
+const OPENCODE_PLUGIN_TEMPLATE: &str = r#"import { Plugin } from "@opencode/plugin"
+import { Error as ToolError } from "@opencode/plugin/promise/tool"
+import { spawn } from "node:child_process"
+
+// Same routing as the Claude/Codex/agy pre-tool hooks: each subagent call goes through
+// the agentdeck router copy, which may deny it with a ready delegate_task target.
+const HOOK = "{HOOK}"
+// T3 starts the shared `opencode serve --service` from its AppImage; servers started elsewhere are not routed.
+const inT3 = /t3_code/i.test(process.env.APPIMAGE ?? "")
+
+// Async on purpose: a sync child would stall the whole shared server while the router answers.
+function runHook(payload: unknown): Promise<{ decision: string; reason?: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(HOOK, ["--harness", "opencode"], { timeout: 58_000 })
+    let out = ""
+    child.stdout.on("data", (d) => (out += d))
+    const failed = { decision: "deny", reason: "model-route failed or timed out; delegation was blocked." }
+    child.on("error", () => resolve(failed))
+    child.stdin.on("error", () => resolve(failed))
+    child.on("close", (code) => {
+      if (code !== 0) return resolve(failed)
+      try {
+        const result = JSON.parse(out)
+        resolve(result.decision === "allow" || result.decision === "deny" ? result : failed)
+      } catch {
+        resolve(failed)
+      }
+    })
+    child.stdin.end(JSON.stringify(payload))
+  })
+}
+
+export default Plugin.define({
+  id: "model-route",
+  setup: async (ctx) => {
+    if (!inT3) return
+    await ctx.tool.hook("execute.before", async (call) => {
+      if (call.tool !== "subagent" && !/delegate_task$/.test(call.tool)) return
+      const out = await runHook({ tool_name: call.tool === "subagent" ? "subagent" : "delegate_task", tool_input: call.input,
+        session_id: call.sessionID, inT3: true })
+      if (out.decision === "deny") throw new ToolError({ message: out.reason ?? "Denied by model-route" })
+    })
+  },
+})
+"#;
+
+fn opencode_plugin_text(hook: &Path) -> String {
+    OPENCODE_PLUGIN_TEMPLATE.replace("{HOOK}", &hook.display().to_string())
+}
+
+/// Plan hook registration (files only; the old standalone copy stays
+/// untouched). Fails closed: any malformed harness file aborts the plan.
+pub fn plan_hooks_enable(
+    home: &Path,
+    paths: &Paths,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let mut changes = Vec::new();
+    // Claude.
+    {
+        let path = claude_settings(home);
+        let (old, mut v) = read_json(&path)?;
+        let changed = {
+            let root = object(&mut v)?;
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let list = pretool_array(object(hooks)?)?;
+            insert_hook(list, CLAUDE_MATCHER, &hook_command(paths, "claude"))
+        };
+        if changed {
+            changes.extend(write_json_change(path, old, &v, state_dir));
+        }
+    }
+    // Codex.
+    {
+        let path = codex_hooks(home);
+        let (old, mut v) = read_json(&path)?;
+        let changed = {
+            let root = object(&mut v)?;
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let list = pretool_array(object(hooks)?)?;
+            insert_hook(list, CODEX_MATCHER, &hook_command(paths, "codex"))
+        };
+        if changed {
+            changes.extend(write_json_change(path, old, &v, state_dir));
+        }
+    }
+    // agy.
+    {
+        let path = agy_hooks(home);
+        let (old, mut v) = read_json(&path)?;
+        let changed = {
+            let root = object(&mut v)?;
+            let plugin = root
+                .entry("model-route")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let list = pretool_array(object(plugin)?)?;
+            insert_hook(list, AGY_MATCHER, &hook_command(paths, "agy"))
+        };
+        if changed {
+            changes.extend(write_json_change(path, old, &v, state_dir));
+        }
+        let path = agy_config(home);
+        let (old, mut v) = read_json(&path)?;
+        let changed = {
+            let root = object(&mut v)?;
+            let plugins = root
+                .entry("plugins")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let entry = object(plugins)?
+                .entry("model-route")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let already = entry.get("enabled") == Some(&Value::Bool(true));
+            if !already {
+                object(entry)?.insert("enabled".into(), Value::Bool(true));
+            }
+            !already
+        };
+        if changed {
+            changes.extend(write_json_change(path, old, &v, state_dir));
+        }
+    }
+    // OpenCode plugin file.
+    {
+        let path = opencode_plugin(home);
+        let text = opencode_plugin_text(&hook_path(paths));
+        let old = std::fs::read(&path).ok();
+        if old.as_deref() != Some(text.as_bytes()) {
+            if old.is_some() {
+                anyhow::bail!(
+                    "{} exists and was not written by agentdeck; remove it by hand",
+                    path.display()
+                );
+            }
+            changes.extend(plan_write_file(path, old.as_deref(), text.as_bytes()));
+        }
+    }
+    Ok(changes)
+}
+
+/// Plan hook removal, in the disable order (hooks first: they fail closed).
+pub fn plan_hooks_disable(
+    home: &Path,
+    paths: &Paths,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let mut changes = Vec::new();
+    for (path, matcher, harness) in [
+        (claude_settings(home), CLAUDE_MATCHER, "claude"),
+        (codex_hooks(home), CODEX_MATCHER, "codex"),
+    ] {
+        let Ok((old, mut v)) = read_json(&path) else {
+            continue;
+        };
+        let Some(old) = old else { continue };
+        let changed = as_obj(&mut v)
+            .and_then(|root| root.get_mut("hooks"))
+            .and_then(as_obj)
+            .and_then(|hooks| pretool_array(hooks).ok())
+            .is_some_and(|list| remove_hook(list, matcher, &hook_command(paths, harness)));
+        if changed {
+            changes.extend(write_json_change(path, Some(old), &v, state_dir));
+        }
+    }
+    {
+        let path = agy_hooks(home);
+        if let Ok((Some(old), mut v)) = read_json(&path) {
+            let changed = as_obj(&mut v)
+                .and_then(|root| root.get_mut("model-route"))
+                .and_then(as_obj)
+                .and_then(|plugin| pretool_array(plugin).ok())
+                .is_some_and(|list| remove_hook(list, AGY_MATCHER, &hook_command(paths, "agy")));
+            if changed {
+                changes.extend(write_json_change(path, Some(old), &v, state_dir));
+            }
+        }
+        let path = agy_config(home);
+        if let Ok((Some(old), mut v)) = read_json(&path) {
+            let changed = as_obj(&mut v)
+                .and_then(|root| root.get_mut("plugins"))
+                .and_then(as_obj)
+                .is_some_and(|plugins| plugins.shift_remove("model-route").is_some());
+            if changed {
+                changes.extend(write_json_change(path, Some(old), &v, state_dir));
+            }
+        }
+    }
+    {
+        let path = opencode_plugin(home);
+        if let Ok(old) = std::fs::read(&path)
+            && old == opencode_plugin_text(&hook_path(paths)).as_bytes()
+        {
+            changes.push(Change::Remove { path });
+        }
+    }
+    Ok(changes)
+}
+
+/// Read-only hook presence for status output.
+pub fn hooks_present(home: &Path, paths: &Paths) -> [bool; 4] {
+    fn has(path: &Path, pointer: &str, matcher: &str, command: &str) -> bool {
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        v.pointer(pointer)
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| {
+                a.iter().any(|e| {
+                    e.get("matcher").and_then(|m| m.as_str()) == Some(matcher)
+                        && e.get("hooks").and_then(|h| h.as_array()).is_some_and(|h| {
+                            h.iter()
+                                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command))
+                        })
+                })
+            })
+    }
+    [
+        has(
+            &claude_settings(home),
+            "/hooks/PreToolUse",
+            CLAUDE_MATCHER,
+            &hook_command(paths, "claude"),
+        ),
+        has(
+            &codex_hooks(home),
+            "/hooks/PreToolUse",
+            CODEX_MATCHER,
+            &hook_command(paths, "codex"),
+        ),
+        has(
+            &agy_hooks(home),
+            "/model-route/PreToolUse",
+            AGY_MATCHER,
+            &hook_command(paths, "agy"),
+        ),
+        std::fs::read_to_string(opencode_plugin(home))
+            .is_ok_and(|t| t == opencode_plugin_text(&hook_path(paths))),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{AddSpec, Harness};
+    use crate::usage::{UsageEntry, UsageKind};
+
+    pub(crate) fn test_paths(tag: &str) -> (Paths, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-router-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Paths::new(dir.join("config"), dir.join("state")), dir)
+    }
+
+    fn spec(id: &str) -> AddSpec {
+        AddSpec {
+            id: id.to_string(),
+            harness: Harness::Claude,
+            display_name: None,
+            home: format!("/fake/{id}"),
+            binary: None,
+            no_t3: false,
+        }
+    }
+
+    fn usage(id: &str, kind: UsageKind, instance: Option<&str>) -> UsageEntry {
+        let mut e = UsageEntry {
+            id: id.to_string(),
+            kind,
+            instance: instance.map(str::to_string),
+            display: String::new(),
+            config_dir: None,
+            codex_home: None,
+            token_file: None,
+            api_key_env: None,
+            db_file: None,
+            extra: Default::default(),
+        };
+        match kind {
+            UsageKind::Claude => e.config_dir = Some("~/.claude".into()),
+            UsageKind::Codex => e.codex_home = Some("~/.codex".into()),
+            UsageKind::Deepseek | UsageKind::Openrouter => {
+                e.api_key_env = Some("AGENTDECK_TEST_KEY".into());
+            }
+            UsageKind::Antigravity | UsageKind::OpencodeGo => {}
+        }
+        e
+    }
+
+    #[test]
+    fn refresh_writes_files_and_valid_json() {
+        let (paths, _g) = test_paths("refresh");
+        Registry::update(&paths, |r| {
+            r.add(spec("codex"))?;
+            r.add(spec("opencode"))?;
+            r.add_pool(crate::pool::PoolEntry {
+                instance: "codex".into(),
+                model: "gpt-6.1-sol".into(),
+                options: Default::default(),
+                enabled: true,
+            })?;
+            r.add_pool(crate::pool::PoolEntry {
+                instance: "opencode".into(),
+                model: "opencode-go/gpt-5".into(),
+                options: Default::default(),
+                enabled: true,
+            })?;
+            r.add_usage(usage("codex-main", UsageKind::Codex, Some("codex")))?;
+            r.add_usage(usage("openrouter-main", UsageKind::Openrouter, None))?;
+            r.add_usage(usage("opencode-go", UsageKind::OpencodeGo, None))?;
+            Ok(())
+        })
+        .unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let changes = plan_router_files(&paths, &reg).unwrap();
+        // 9 files + router.json.
+        assert_eq!(changes.len(), 10);
+        crate::changes::apply_changes(&changes).unwrap();
+        let text = std::fs::read_to_string(router_json_path(&paths)).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert!(v["version"].is_number());
+        assert_eq!(v["pool"].as_array().unwrap().len(), 2);
+        assert_eq!(v["pool"][0]["providerInstanceId"], "codex");
+        let acc = &v["accounts"];
+        assert_eq!(acc["codex"]["usageId"], "codex-main");
+        assert_eq!(acc["codex"]["instances"][0], "codex");
+        assert_eq!(acc["openrouter"]["usageProvider"], "openrouter");
+        assert_eq!(acc["opencode-go"]["modelPrefix"], "opencode-go/");
+        // Refresh is idempotent.
+        let reg = Registry::load(&paths).unwrap();
+        assert!(plan_router_files(&paths, &reg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_writes_nothing_by_itself() {
+        let (paths, _g) = test_paths("dry");
+        Registry::update(&paths, |r| r.add(spec("a"))).unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        let changes = plan_router_files(&paths, &reg).unwrap();
+        assert!(!changes.is_empty());
+        assert!(!router_json_path(&paths).exists());
+    }
+}

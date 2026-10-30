@@ -1,5 +1,5 @@
 //! `agentdeck plugin list|enable|disable`: built-in plugins (agent-process,
-//! ai-usage; router is listed but unavailable until M6). Every write goes
+//! ai-usage, router). The router needs T3 present. Every write goes
 //! through injectable paths and supports --dry-run; previews print first.
 
 use std::path::PathBuf;
