@@ -4,9 +4,12 @@
 
 pub mod hook;
 pub mod load;
+pub mod mcp_call;
 pub mod policy;
 pub mod reasoning;
 pub mod route;
+pub mod shell;
+pub mod workflow;
 
 use serde_json::Value;
 

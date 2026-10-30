@@ -32,7 +32,7 @@ const CAPABILITY: [&str; 4] = [
     "Specific relevant strengths should produce a substantially better result on THIS task. A merely stronger model with no practical advantage does not qualify.",
 ];
 
-const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin)";
+const USAGE: &str = "usage: agentdeck route [--source <provider instance>] [--validate-target <provider instance> <model>] \"<task brief>\" | - (brief on stdin) | --check | --catalog (orchestrator_capabilities structuredContent on stdin) | hook --harness <name> | claude-shell [args...] | t3-mcp-call TOOL FILE | workflow CMD ...";
 
 pub struct Env {
     pub home: std::path::PathBuf,
@@ -996,8 +996,12 @@ pub async fn run(argv: Vec<String>) -> i32 {
 }
 
 async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
-    if argv.first().is_some_and(|a| a == "hook") {
-        return Ok(crate::hook::run(&argv[1..]));
+    match argv.first().map(String::as_str) {
+        Some("hook") => return Ok(crate::hook::run(&argv[1..])),
+        Some("claude-shell") => return Ok(crate::shell::run(&argv[1..])),
+        Some("t3-mcp-call") => return Ok(crate::mcp_call::run(&argv[1..]).await),
+        Some("workflow") => return Ok(crate::workflow::run(&argv[1..])),
+        _ => {}
     }
     let env = Env::from_env()?;
     if argv.len() == 1 && argv[0] == "--catalog" {

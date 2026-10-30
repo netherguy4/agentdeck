@@ -799,6 +799,58 @@ pub fn hooks_present(home: &Path, exe: &Path) -> [bool; 4] {
     ]
 }
 
+/// The T3 Claude provider binary path: a symlink named `claude-t3-shell`
+/// pointing at this binary dispatches to `route claude-shell` by argv[0].
+/// `AGENTDECK_BIN_DIR` overrides the directory in tests, like the
+/// agent-process launcher.
+pub fn claude_t3_shell_link(home: &Path) -> PathBuf {
+    crate::plugins::bin_dir(home).join("claude-t3-shell")
+}
+
+/// Plan the `claude-t3-shell` symlink. A foreign file/link at the path
+/// refuses unless `replace` backs it up first (same rule as agent-process).
+pub fn plan_shell_link(
+    home: &Path,
+    exe: &Path,
+    replace: bool,
+    state_dir: &Path,
+) -> anyhow::Result<Vec<Change>> {
+    let link = claude_t3_shell_link(home);
+    match std::fs::symlink_metadata(&link) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![Change::Symlink {
+            link,
+            target: exe.to_path_buf(),
+        }]),
+        Err(e) => Err(e.into()),
+        Ok(_) if std::fs::read_link(&link).is_ok_and(|t| t == exe) => Ok(vec![]),
+        Ok(_) if replace => Ok(vec![
+            Change::BackupRemove {
+                path: link.clone(),
+                backup: backup_dest(state_dir, "claude-t3-shell"),
+            },
+            Change::Symlink {
+                link,
+                target: exe.to_path_buf(),
+            },
+        ]),
+        Ok(_) => anyhow::bail!(
+            "{} exists and is not ours; remove it by hand or retry with --replace",
+            link.display()
+        ),
+    }
+}
+
+/// Plan `claude-t3-shell` removal: only our own symlink goes; a foreign
+/// file is left alone.
+pub fn plan_remove_shell_link(home: &Path, exe: &Path) -> Vec<Change> {
+    let link = claude_t3_shell_link(home);
+    if std::fs::read_link(&link).is_ok_and(|t| t == exe) {
+        vec![Change::Remove { path: link }]
+    } else {
+        vec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

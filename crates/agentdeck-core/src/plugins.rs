@@ -413,6 +413,13 @@ fn router_detail(paths: &Paths, home: &Path, exe: &Path) -> Vec<String> {
         "files: missing"
     }
     .to_string();
+    let shell_line = match fs::symlink_metadata(r::claude_t3_shell_link(home)) {
+        Err(_) => "shell: missing".to_string(),
+        Ok(_) if link_is_ours(&r::claude_t3_shell_link(home), exe) => {
+            "shell: installed".to_string()
+        }
+        Ok(_) => "shell: foreign file".to_string(),
+    };
     let present = r::hooks_present(home, exe);
     let hooks = format!(
         "hooks: {}/4 targets",
@@ -439,6 +446,7 @@ fn router_detail(paths: &Paths, home: &Path, exe: &Path) -> Vec<String> {
     }
     vec![
         installed,
+        shell_line,
         hooks,
         format!("block: {with_block}/{present_files} files"),
     ]
@@ -451,6 +459,7 @@ fn plan_enable_router(
     home: &Path,
     files: &[PathBuf],
     exe: &Path,
+    replace: bool,
 ) -> anyhow::Result<Vec<Change>> {
     if !router_available() {
         anyhow::bail!("router needs T3 present (no T3 root found)");
@@ -461,6 +470,12 @@ fn plan_enable_router(
         home,
         paths,
         exe,
+        &paths.state_dir,
+    )?);
+    changes.extend(crate::router::plan_shell_link(
+        home,
+        exe,
+        replace,
         &paths.state_dir,
     )?);
     changes.extend(crate::router::plan_router_marker(
@@ -483,6 +498,7 @@ fn plan_disable_router(
         anyhow::bail!("router needs T3 present (no T3 root found)");
     }
     let mut changes = crate::router::plan_hooks_disable(home, paths, exe, &paths.state_dir)?;
+    changes.extend(crate::router::plan_remove_shell_link(home, exe));
     changes.extend(crate::router::plan_remove_router_files(paths));
     changes.extend(crate::router::plan_router_marker(
         files,
@@ -539,7 +555,7 @@ pub fn plan_enable(
             plan_enable_agent_process(home, files, exe, replace, &paths.state_dir)?
         }
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
-        PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe)?,
+        PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe, replace)?,
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -914,6 +930,57 @@ mod tests {
         assert!(!home.join(".config/opencode/plugin/model-route.ts").exists());
         assert!(dir.join("router.json").exists(), "data is kept");
         assert_eq!(fs::read(&files[0]).unwrap(), b"handwritten\n");
+        unsafe {
+            env::remove_var("AGENTDECK_T3_DIR");
+        }
+    }
+
+    #[test]
+    fn router_shell_link_round_trip() {
+        let _env = test_env_lock();
+        let (_g, home, paths, files, exe) = setup("shelllink");
+        let t3 = _g.0.join("t3");
+        std::fs::create_dir_all(&t3).unwrap();
+        unsafe {
+            env::set_var("AGENTDECK_T3_DIR", &t3);
+        }
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&files[0], "handwritten\n").unwrap();
+        let link = crate::router::claude_t3_shell_link(&home);
+        // Foreign file refuses without --replace.
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&link, "not ours").unwrap();
+        assert!(plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, false).is_err());
+        // --replace backs the foreign file up, then links.
+        let changes = plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, true).unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|c| matches!(c, Change::BackupRemove { .. }))
+        );
+        apply_all(&paths, PLUGIN_ROUTER, true, &changes).unwrap();
+        assert!(fs::read_link(&link).unwrap() == exe);
+        assert!(fs::read_dir(paths.backup_dir()).unwrap().count() >= 1);
+        let detail = status(&paths, &home, &exe);
+        assert!(
+            detail
+                .iter()
+                .find(|s| s.name == PLUGIN_ROUTER)
+                .unwrap()
+                .detail
+                .iter()
+                .any(|l| l == "shell: installed")
+        );
+        // Disable removes our symlink (data kept); a foreign file is left alone.
+        let changes = plan_disable(&paths, &home, &files, &exe, PLUGIN_ROUTER).unwrap();
+        assert!(changes.iter().any(|c| matches!(c, Change::Remove { .. })));
+        apply_all(&paths, PLUGIN_ROUTER, false, &changes).unwrap();
+        assert!(!link.exists());
+        fs::write(&link, "foreign again").unwrap();
+        let other = _g.0.join("bin/other");
+        let changes = plan_disable(&paths, &home, &files, &other, PLUGIN_ROUTER).unwrap();
+        assert!(changes.iter().all(|c| !matches!(c, Change::Remove { .. })));
+        assert!(fs::read(&link).unwrap() == b"foreign again");
         unsafe {
             env::remove_var("AGENTDECK_T3_DIR");
         }
