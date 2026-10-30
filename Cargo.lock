@@ -17,6 +17,7 @@ dependencies = [
  "agentdeck-core",
  "anyhow",
  "clap",
+ "serde_json",
 ]
 
 [[package]]

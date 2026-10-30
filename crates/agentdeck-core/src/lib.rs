@@ -1,6 +1,7 @@
 //! Registry and harness adapters shared by the agentdeck CLI, GUI and daemon.
 
 pub mod changes;
+pub mod claude;
 pub mod paths;
 pub mod pool;
 pub mod registry;

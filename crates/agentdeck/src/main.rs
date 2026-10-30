@@ -1,6 +1,7 @@
 use agentdeck_core::{AddSpec, Harness, Paths};
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod cmd_claude;
 mod cmd_pool;
 
 #[derive(Parser)]
@@ -21,6 +22,11 @@ enum Cmd {
     Pool {
         #[command(subcommand)]
         cmd: cmd_pool::PoolCmd,
+    },
+    /// Sync and drift-check secondary Claude accounts.
+    Claude {
+        #[command(subcommand)]
+        cmd: cmd_claude::ClaudeCmd,
     },
 }
 
@@ -94,6 +100,7 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
+        Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::Instance { cmd } => match cmd {
             InstanceCmd::List { json } => {
                 if json {
