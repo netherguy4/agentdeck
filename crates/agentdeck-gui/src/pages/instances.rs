@@ -21,7 +21,11 @@ fn account_status(status: &str) -> String {
 
 /// "resets in 2h 15m" / "resets in 40m"; the countdown math lives in data.
 fn reset_label(mins: i64) -> String {
-    if mins >= 60 {
+    if mins >= 24 * 60 {
+        let d: i64 = mins / (24 * 60);
+        let h: i64 = mins % (24 * 60) / 60;
+        fl!(loader(), "quota-in-days", d = d, h = h)
+    } else if mins >= 60 {
         let h: i64 = mins / 60;
         let m: i64 = mins % 60;
         fl!(loader(), "quota-in-hours", h = h, m = m)
@@ -43,7 +47,7 @@ fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
         st::muted(label).width(150),
         st::quota_bar(bar.used_percent as f32).length(Length::Fill),
         st::body(format!("{:.0}%", bar.used_percent)).width(44),
-        st::muted(reset).width(160),
+        st::muted(reset).width(170),
     ]
     .spacing(st::SPACE_S)
     .into()

@@ -32,6 +32,7 @@ account-ok = ок
 account-stale = устаревшие
 account-error = ошибка
 account-waiting = ожидание
+quota-in-days = сброс через { $d } д { $h } ч
 quota-in-hours = сброс через { $h } ч { $m } мин
 quota-in-mins = сброс через { $m } мин
 

@@ -30,6 +30,7 @@ account-ok = ok
 account-stale = stale
 account-error = error
 account-waiting = waiting
+quota-in-days = resets in { $d }d { $h }h
 quota-in-hours = resets in { $h }h { $m }m
 quota-in-mins = resets in { $m }m
 
