@@ -8,6 +8,7 @@ pub mod app;
 pub mod data;
 pub mod i18n;
 pub mod pages;
+pub mod style;
 
 pub use app::{Message, Page, State};
 
@@ -17,6 +18,10 @@ pub fn run() -> iced::Result {
         .title(app::title)
         .theme(app::theme)
         .subscription(app::subscription)
-        .window_size(iced::Size::new(1100.0, 700.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(1100.0, 700.0),
+            min_size: Some(iced::Size::new(900.0, 560.0)),
+            ..iced::window::Settings::default()
+        })
         .run()
 }

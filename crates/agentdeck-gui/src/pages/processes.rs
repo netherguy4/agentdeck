@@ -3,12 +3,13 @@
 
 use agentdeck_core::processes::{ProcInfo, SessionGroup, StopOutcome};
 use i18n_embed_fl::fl;
-use iced::widget::{button, checkbox, column, text};
-use iced::{Element, Length};
+use iced::Element;
+use iced::widget::{button, checkbox, column};
 
 use crate::app::Message;
 use crate::data::Data;
 use crate::i18n::loader;
+use crate::style as st;
 
 #[derive(Debug, Clone, Default)]
 pub struct PendingStop {
@@ -72,14 +73,17 @@ fn member_line(p: &ProcInfo) -> String {
 }
 
 pub fn view<'a>(data: &'a Data, ui: &'a ProcUi) -> Element<'a, Message> {
-    let mut col = column![text(fl!(loader(), "processes-title")).size(22)].spacing(12);
+    let mut col = column![st::title(fl!(loader(), "processes-title"))].spacing(st::SPACE_M);
     if let Some(result) = &ui.result {
-        col = col.push(text(result).size(13));
+        col = col.push(st::body(result.clone()));
     }
     if data.processes.is_empty() {
-        col = col.push(text(fl!(loader(), "processes-empty")).size(13));
+        col = col.push(st::muted(fl!(loader(), "processes-empty")));
     }
     for (i, g) in data.processes.iter().enumerate() {
+        if i > 0 {
+            col = col.push(st::divider());
+        }
         let mut totals = format!(
             "CPU {:.1}% · {} · {}/{}",
             g.cpu_percent,
@@ -91,59 +95,56 @@ pub fn view<'a>(data: &'a Data, ui: &'a ProcUi) -> Element<'a, Message> {
             totals.push_str(&format!(" · scope {}", mega(mem)));
         }
         let mut card = column![
-            iced::widget::row![
-                text(&g.title).size(16),
-                text(kind_label(g)).size(12),
-                text(totals).size(12).width(Length::Fill),
-            ]
-            .spacing(8)
+            iced::widget::row![st::heading(g.title.clone()), st::muted(kind_label(g)),]
+                .spacing(st::SPACE_S),
+            st::muted(totals),
         ]
-        .spacing(4);
+        .spacing(st::SPACE_XS);
         for p in &g.processes {
-            card = card.push(text(member_line(p)).size(12));
+            card = card.push(st::muted(member_line(p)));
         }
         if g.can_stop {
+            // Destructive: the only danger button on this page.
             card = card.push(
-                button(text(fl!(loader(), "processes-stop")).size(13))
+                button(st::body(fl!(loader(), "processes-stop")))
                     .style(button::danger)
                     .on_press(Message::ProcStop(i)),
             );
         } else if !g.can_stop {
-            card = card.push(text(fl!(loader(), "processes-t3-note")).size(12));
+            card = card.push(st::muted(fl!(loader(), "processes-t3-note")));
         }
         col = col.push(card);
     }
     if let Some(pending) = &ui.pending {
-        let mut dlg = column![
-            text(fl!(
+        let mut lines: Vec<Element<'_, Message>> =
+            vec![st::body(fl!(loader(), "processes-confirm-will")).into()];
+        for p in &pending.members {
+            lines.push(st::muted(format!("{}  {}", p.pid, p.display_cmd())).into());
+        }
+        lines.push(
+            checkbox(ui.force)
+                .label(fl!(loader(), "processes-force"))
+                .on_toggle(Message::ProcForce)
+                .into(),
+        );
+        col = col.push(st::panel(
+            fl!(
                 loader(),
                 "processes-confirm-title",
                 title = pending.title.as_str()
-            ))
-            .size(16),
-            text(fl!(loader(), "processes-confirm-will")).size(13),
-        ]
-        .spacing(6);
-        for p in &pending.members {
-            dlg = dlg.push(text(format!("{}  {}", p.pid, p.display_cmd())).size(12));
-        }
-        dlg = dlg.push(
-            checkbox(ui.force)
-                .label(fl!(loader(), "processes-force"))
-                .on_toggle(Message::ProcForce),
-        );
-        dlg = dlg.push(
-            iced::widget::row![
-                button(text(fl!(loader(), "processes-confirm-ok")).size(13))
+            ),
+            lines,
+            vec![
+                button(st::body(fl!(loader(), "processes-confirm-ok")))
                     .style(button::danger)
-                    .on_press(Message::ProcConfirm),
-                button(text(fl!(loader(), "processes-cancel")).size(13))
+                    .on_press(Message::ProcConfirm)
+                    .into(),
+                button(st::body(fl!(loader(), "processes-cancel")))
                     .style(button::secondary)
-                    .on_press(Message::ProcCancel),
-            ]
-            .spacing(8),
-        );
-        col = col.push(dlg);
+                    .on_press(Message::ProcCancel)
+                    .into(),
+            ],
+        ));
     }
     col.into()
 }

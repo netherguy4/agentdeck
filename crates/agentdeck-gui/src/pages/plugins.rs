@@ -2,12 +2,13 @@
 //! confirm step showing the [`Change`] preview before anything is applied.
 
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, text};
-use iced::{Element, Length};
+use iced::Element;
+use iced::widget::{button, column};
 
 use crate::app::Message;
 use crate::data::Data;
 use crate::i18n::loader;
+use crate::style as st;
 
 /// A confirmed-but-not-yet-applied enable/disable with its change preview.
 #[derive(Debug, Clone)]
@@ -18,14 +19,17 @@ pub struct Pending {
 }
 
 pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Message> {
-    let mut col = column![text(fl!(loader(), "plugins-title")).size(22)].spacing(12);
+    let mut col = column![st::title(fl!(loader(), "plugins-title"))].spacing(st::SPACE_M);
     if let Some(error) = &data.error {
-        col = col.push(text(fl!(loader(), "load-error", what = error)).size(13));
+        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
     if data.plugins.is_empty() {
-        col = col.push(text(fl!(loader(), "plugins-empty")).size(13));
+        col = col.push(st::muted(fl!(loader(), "plugins-empty")));
     }
-    for plugin in &data.plugins {
+    for (i, plugin) in data.plugins.iter().enumerate() {
+        if i > 0 {
+            col = col.push(st::divider());
+        }
         let state = if !plugin.available {
             fl!(loader(), "plugins-unavailable")
         } else if plugin.enabled {
@@ -34,12 +38,13 @@ pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Mes
             fl!(loader(), "plugins-disabled")
         };
         let mut card = column![
-            iced::widget::row![text(&plugin.name).size(16), text(state).size(12),].spacing(8),
+            iced::widget::row![st::heading(plugin.name.clone()), st::muted(state),]
+                .spacing(st::SPACE_S),
         ]
-        .spacing(4);
+        .spacing(st::SPACE_XS);
         if plugin.available {
             for line in &plugin.detail {
-                card = card.push(text(line).size(12));
+                card = card.push(st::muted(line.clone()));
             }
             let (label, msg) = if plugin.enabled {
                 (
@@ -53,7 +58,7 @@ pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Mes
                 )
             };
             card = card.push(
-                button(text(label).size(13))
+                button(st::body(label))
                     .style(button::secondary)
                     .on_press(msg),
             );
@@ -66,22 +71,25 @@ pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Mes
         } else {
             fl!(loader(), "plugins-preview-disable", name = p.name.clone())
         };
-        let mut confirm = column![text(title).size(16)].spacing(4);
-        for line in &p.preview {
-            confirm = confirm.push(text(line).size(12));
-        }
-        confirm = confirm.push(
-            iced::widget::row![
-                button(text(fl!(loader(), "plugins-confirm")).size(13))
+        let lines: Vec<Element<'_, Message>> = p
+            .preview
+            .iter()
+            .map(|l| st::body(l.clone()).into())
+            .collect();
+        col = col.push(st::panel(
+            title,
+            lines,
+            vec![
+                button(st::body(fl!(loader(), "plugins-confirm")))
                     .style(button::primary)
-                    .on_press(Message::ConfirmPlugin),
-                button(text(fl!(loader(), "plugins-cancel")).size(13))
+                    .on_press(Message::ConfirmPlugin)
+                    .into(),
+                button(st::body(fl!(loader(), "plugins-cancel")))
                     .style(button::secondary)
-                    .on_press(Message::CancelPlugin),
-            ]
-            .spacing(8),
-        );
-        col = col.push(confirm.width(Length::Fill));
+                    .on_press(Message::CancelPlugin)
+                    .into(),
+            ],
+        ));
     }
     col.into()
 }

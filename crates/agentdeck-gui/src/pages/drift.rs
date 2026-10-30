@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use agentdeck_core::{Harness, Paths, Registry, claude, codex, t3};
 use i18n_embed_fl::fl;
-use iced::widget::{Space, button, column, text};
-use iced::{Element, Length, Task};
+use iced::widget::{button, column};
+use iced::{Element, Task};
 
 use crate::i18n::loader;
 
@@ -819,7 +819,7 @@ fn action_buttons<'a>(group: &str, item: &'a Item) -> Vec<Element<'a, Message>> 
     item.actions
         .iter()
         .map(|a| {
-            button(text(action_label(a)).size(12))
+            button(crate::style::body(action_label(a)))
                 .on_press(Message::Act {
                     group: group.to_string(),
                     key: a.key.clone(),
@@ -856,67 +856,78 @@ fn confirm_label(pending: &Pending) -> String {
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
-    let mut col = column![text(fl!(loader(), "drift-title")).size(22)].spacing(12);
+    use crate::style as st;
+    let mut col = column![st::title(fl!(loader(), "drift-title"))].spacing(st::SPACE_M);
     if let Some(error) = &state.snapshot.error {
-        col = col.push(text(fl!(loader(), "load-error", what = error)).size(13));
+        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
     for notice in &state.notices {
-        col = col.push(text(notice).size(12));
+        col = col.push(st::muted(notice.clone()));
     }
     if let Some(busy) = &state.busy {
-        col = col.push(text(format!("{} {busy}", fl!(loader(), "drift-working"))).size(12));
+        col = col.push(st::muted(format!(
+            "{} {busy}",
+            fl!(loader(), "drift-working")
+        )));
     }
+    let mut first = true;
     if let Some(pending) = &state.pending {
-        let mut preview = column![text(fl!(loader(), "drift-preview")).size(14)].spacing(4);
-        let mut lines = pending.preview.clone();
-        if lines.is_empty() {
-            lines.push(fl!(loader(), "drift-no-drift"));
+        let mut lines: Vec<Element<'_, Message>> = Vec::new();
+        let mut preview = pending.preview.clone();
+        if preview.is_empty() {
+            preview.push(fl!(loader(), "drift-no-drift"));
         }
-        lines.truncate(30);
-        for line in lines {
-            preview = preview.push(text(line).size(12));
+        preview.truncate(30);
+        for line in preview {
+            lines.push(st::body(line).into());
         }
-        preview = preview.push(
-            iced::widget::row![
-                button(text(confirm_label(pending)).size(12)).on_press(Message::Confirm),
-                button(text(fl!(loader(), "drift-cancel")).size(12))
+        col = col.push(st::panel(
+            fl!(loader(), "drift-preview"),
+            lines,
+            vec![
+                button(st::body(confirm_label(pending)))
+                    .on_press(Message::Confirm)
+                    .into(),
+                button(st::body(fl!(loader(), "drift-cancel")))
                     .style(button::secondary)
-                    .on_press(Message::Cancel),
-            ]
-            .spacing(8),
-        );
-        col = col.push(preview);
-        col = col.push(Space::new().height(Length::Fixed(8.0)));
+                    .on_press(Message::Cancel)
+                    .into(),
+            ],
+        ));
+        first = false;
     }
     for group in &state.snapshot.groups {
+        if !first {
+            col = col.push(st::divider());
+        }
+        first = false;
         let title = group
             .title
             .clone()
             .unwrap_or_else(|| fl!(loader(), "drift-group-t3"));
-        let mut card = column![text(title).size(16)].spacing(4);
+        let mut card = column![st::heading(title)].spacing(st::SPACE_XS);
         // Re-enable is offered only after a Codex fix on a T3 instance.
         if group.harness == "codex" && state.reenable.contains(&group.id) {
-            card = card.push(
-                button(text(fl!(loader(), "drift-reenable")).size(12)).on_press(Message::Act {
+            card = card.push(button(st::body(fl!(loader(), "drift-reenable"))).on_press(
+                Message::Act {
                     group: group.id.clone(),
                     key: String::new(),
                     kind: Kind::Reenable,
-                }),
-            );
+                },
+            ));
         }
         for item in &group.items {
-            card = card.push(text(item_text(item)).size(12));
+            card = card.push(st::body(item_text(item)));
             let buttons = action_buttons(&group.id, item);
             if !buttons.is_empty() {
                 card = card.push(
                     buttons
                         .into_iter()
-                        .fold(iced::widget::row![].spacing(8), |r, b| r.push(b)),
+                        .fold(iced::widget::row![].spacing(st::SPACE_S), |r, b| r.push(b)),
                 );
             }
         }
         col = col.push(card);
-        col = col.push(Space::new().height(Length::Fixed(8.0)));
     }
     col.into()
 }

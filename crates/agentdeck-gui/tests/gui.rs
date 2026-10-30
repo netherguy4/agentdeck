@@ -228,11 +228,16 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     let (data, paths, _guard) = load_with_fixtures("shots", &_env);
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
 
-    for (lang, stem) in [("en", "instances_en"), ("ru", "instances_ru")] {
+    for (lang, theme, stem) in [
+        ("en", iced::Theme::Dark, "instances_en"),
+        ("en", iced::Theme::Light, "instances_en_light"),
+        ("ru", iced::Theme::Dark, "instances_ru"),
+        ("ru", iced::Theme::Light, "instances_ru_light"),
+    ] {
         agentdeck_gui::i18n::set_language(lang);
         let state = app::State::for_tests(paths.clone(), data.clone());
         let mut ui = iced_test::simulator(app::view(&state));
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        let snapshot = ui.snapshot(&theme).expect("headless snapshot");
         // Golden path gains a `-{renderer}` suffix inside matches_image;
         // exactly one file per stem must exist afterwards.
         assert_snapshot(&snapshot, stem);
@@ -241,15 +246,18 @@ fn snapshots_en_ru_and_sidebar_navigation() {
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with(stem))
+                p.file_stem().and_then(|s| s.to_str()) == Some(format!("{stem}-wgpu").as_str())
                     && p.extension().and_then(|e| e.to_str()) == Some("png")
             })
             .collect();
         assert_eq!(goldens.len(), 1, "one golden per stem: {goldens:?}");
         let bytes = std::fs::metadata(&goldens[0]).expect("golden png").len();
         assert!(bytes > 1_024, "golden {} looks empty", goldens[0].display());
+        assert!(
+            bytes < 100 * 1024,
+            "golden {} over 100 KB",
+            goldens[0].display()
+        );
     }
 
     // Sidebar navigation: every page reachable by clicking.
@@ -275,8 +283,24 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         let _ = app::update(&mut state, message);
     }
     assert!(matches!(state.page(), agentdeck_gui::Page::AddInstance));
-    let mut ui = iced_test::simulator(app::view(&state));
-    ui.find("Add instance").expect("add page title");
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.find("Add instance").expect("add page title");
+    }
+
+    // The shared confirm panel (remove dialog) must lay out in both themes.
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Instances),
+    );
+    let _ = app::update(&mut state, app::Message::RemoveAsk("claude-main".into()));
+    for theme in [&iced::Theme::Dark, &iced::Theme::Light] {
+        agentdeck_gui::i18n::set_language("en");
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.snapshot(theme).expect("panel renders");
+        ui.find("The login dir is kept.").expect("remove panel");
+    }
+    agentdeck_gui::i18n::set_language("en");
 }
 
 /// Drift fixture: fake HOME + registry + T3 dir with real drift in every

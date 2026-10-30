@@ -12,11 +12,12 @@ use agentdeck_core::login::{self, LoginEvent, LoginSession, LoginTarget};
 use agentdeck_core::registry::{AddSpec, Harness};
 use agentdeck_core::{Paths, Registry};
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, radio, row, scrollable, text, text_input};
+use iced::widget::{button, column, radio, row, scrollable, text_input};
 use iced::{Element, Subscription, Task};
 
 use crate::app::Message;
 use crate::i18n::loader;
+use crate::style as st;
 
 const OUTPUT_TAIL: usize = 30;
 const PORT_BUSY_HINT: &str = "1455";
@@ -645,53 +646,49 @@ pub fn subscription(wiz: &Wizard) -> Subscription<Message> {
     }
 }
 
-fn preview_block(preview: &Preview) -> Element<'_, Message> {
+fn preview_lines(preview: &Preview) -> Vec<Element<'_, Message>> {
     match preview {
-        Preview::Idle => text("").size(12).into(),
-        Preview::Working => text(fl!(loader(), "add-working")).size(12).into(),
-        Preview::Ready(lines) | Preview::Done(lines) => {
-            let mut col = column![].spacing(2);
-            for line in lines {
-                col = col.push(text(line).size(12));
-            }
-            col.into()
-        }
-        Preview::Error(e) => text(fl!(loader(), "load-error", what = e)).size(12).into(),
+        Preview::Idle => vec![],
+        Preview::Working => vec![st::muted(fl!(loader(), "add-working")).into()],
+        Preview::Ready(lines) | Preview::Done(lines) => lines
+            .iter()
+            .map(|line| st::body(line.clone()).into())
+            .collect(),
+        Preview::Error(e) => vec![st::body(fl!(loader(), "load-error", what = e)).into()],
     }
 }
 
-fn optional_section<'a>(
+fn optional_section(
     title: String,
-    preview: &'a Preview,
+    preview: &Preview,
     on_preview: AddMsg,
     on_apply: AddMsg,
-) -> Element<'a, Message> {
+) -> Element<'_, Message> {
     let ready = matches!(preview, Preview::Ready(_));
-    column![
-        text(title).size(16),
-        preview_block(preview),
-        row![
-            button(text(fl!(loader(), "add-preview")).size(13))
+    st::panel(
+        title,
+        preview_lines(preview),
+        vec![
+            button(st::body(fl!(loader(), "add-preview")))
                 .style(button::secondary)
-                .on_press(Message::Add(on_preview)),
-            button(text(fl!(loader(), "add-apply")).size(13))
+                .on_press(Message::Add(on_preview))
+                .into(),
+            button(st::body(fl!(loader(), "add-apply")))
                 .style(button::secondary)
-                .on_press_maybe(ready.then_some(Message::Add(on_apply))),
-        ]
-        .spacing(8),
-    ]
-    .spacing(6)
-    .into()
+                .on_press_maybe(ready.then_some(Message::Add(on_apply)))
+                .into(),
+        ],
+    )
 }
 
 fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
     let login = &wiz.login;
-    let mut col = column![text(fl!(loader(), "add-login-title")).size(16)].spacing(6);
+    let mut col = column![st::heading(fl!(loader(), "add-login-title"))].spacing(st::SPACE_S);
     match &login.status {
         LoginStatus::Idle | LoginStatus::Cancelled => {
             let is_codex = wiz.harness == HarnessChoice::Codex;
             col = col.push(
-                button(text(fl!(loader(), "add-login-start")).size(13))
+                button(st::body(fl!(loader(), "add-login-start")))
                     .style(button::secondary)
                     .on_press(Message::Add(AddMsg::LoginStart)),
             );
@@ -703,20 +700,20 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
                 );
             }
             if login.status == LoginStatus::Cancelled {
-                col = col.push(text(fl!(loader(), "add-login-cancelled")).size(12));
+                col = col.push(st::muted(fl!(loader(), "add-login-cancelled")));
             }
         }
         LoginStatus::SpawnError(e) => {
-            col = col.push(text(fl!(loader(), "load-error", what = e)).size(12));
+            col = col.push(st::body(fl!(loader(), "load-error", what = e)));
             if e.contains(PORT_BUSY_HINT) {
                 col = col.push(
-                    button(text(fl!(loader(), "add-login-retry-device")).size(13))
+                    button(st::body(fl!(loader(), "add-login-retry-device")))
                         .style(button::secondary)
                         .on_press(Message::Add(AddMsg::RetryDeviceAuth)),
                 );
             } else {
                 col = col.push(
-                    button(text(fl!(loader(), "add-login-start")).size(13))
+                    button(st::body(fl!(loader(), "add-login-start")))
                         .style(button::secondary)
                         .on_press(Message::Add(AddMsg::LoginStart)),
                 );
@@ -724,55 +721,59 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
         }
         LoginStatus::Active => {
             if let Some(url) = &login.url {
-                col = col.push(text(url).size(12));
+                col = col.push(st::body(url.clone()));
                 col = col.push(
                     row![
-                        button(text(fl!(loader(), "add-login-copy")).size(13))
+                        button(st::body(fl!(loader(), "add-login-copy")))
                             .style(button::secondary)
                             .on_press(Message::Add(AddMsg::LoginCopy)),
-                        button(text(fl!(loader(), "add-login-open")).size(13))
+                        button(st::body(fl!(loader(), "add-login-open")))
                             .style(button::secondary)
                             .on_press(Message::Add(AddMsg::LoginOpen)),
                     ]
-                    .spacing(8),
+                    .spacing(st::SPACE_S),
                 );
                 if let Some(warning) = &login.open_warning {
-                    col = col.push(text(warning).size(12));
+                    col = col.push(st::body(warning.clone()));
                 }
             }
             if let Some(code) = &login.device_code {
-                col = col.push(text(fl!(loader(), "add-login-device-code", code = code)).size(13));
+                col = col.push(st::body(fl!(
+                    loader(),
+                    "add-login-device-code",
+                    code = code
+                )));
             }
             if login.prompt {
                 col = col.push(
                     row![
                         text_input(&fl!(loader(), "add-login-code"), &login.code)
                             .on_input(|c| Message::Add(AddMsg::LoginCodeInput(c))),
-                        button(text(fl!(loader(), "add-login-send")).size(13))
+                        button(st::body(fl!(loader(), "add-login-send")))
                             .style(button::secondary)
                             .on_press(Message::Add(AddMsg::LoginSend)),
                     ]
-                    .spacing(8),
+                    .spacing(st::SPACE_S),
                 );
             }
-            let mut tail = column![].spacing(2);
+            let mut tail = column![].spacing(st::SPACE_XS);
             for line in &login.tail {
-                tail = tail.push(text(line).size(12));
+                tail = tail.push(st::muted(line.clone()));
             }
             col = col.push(tail);
             col = col.push(
-                button(text(fl!(loader(), "add-login-cancel")).size(13))
+                button(st::body(fl!(loader(), "add-login-cancel")))
                     .style(button::secondary)
                     .on_press(Message::Add(AddMsg::LoginCancel)),
             );
         }
         LoginStatus::Done => {
-            col = col.push(text(fl!(loader(), "add-login-done")).size(12));
+            col = col.push(st::muted(fl!(loader(), "add-login-done")));
         }
         LoginStatus::Failed(reason) => {
-            col = col.push(text(fl!(loader(), "add-login-failed", reason = reason)).size(12));
+            col = col.push(st::body(fl!(loader(), "add-login-failed", reason = reason)));
             col = col.push(
-                button(text(fl!(loader(), "add-login-start")).size(13))
+                button(st::body(fl!(loader(), "add-login-start")))
                     .style(button::secondary)
                     .on_press(Message::Add(AddMsg::LoginStart)),
             );
@@ -782,9 +783,9 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
 }
 
 pub fn view(wiz: &Wizard) -> Element<'_, Message> {
-    let form = column![
-        text(fl!(loader(), "add-title")).size(22),
-        text(fl!(loader(), "add-harness")).size(14),
+    let mut form = column![
+        st::title(fl!(loader(), "add-title")),
+        st::body(fl!(loader(), "add-harness")),
         row![
             radio("Claude", HarnessChoice::Claude, Some(wiz.harness), |h| {
                 Message::Add(AddMsg::Harness(h))
@@ -792,45 +793,47 @@ pub fn view(wiz: &Wizard) -> Element<'_, Message> {
             radio("Codex", HarnessChoice::Codex, Some(wiz.harness), |h| {
                 Message::Add(AddMsg::Harness(h))
             },),
-            text(fl!(loader(), "add-harness-note")).size(12),
+            st::muted(fl!(loader(), "add-harness-note")),
         ]
-        .spacing(12),
-        text(fl!(loader(), "add-id")).size(14),
+        .spacing(st::SPACE_M),
+        st::body(fl!(loader(), "add-id")),
         text_input("claude-second", &wiz.id).on_input(|s| Message::Add(AddMsg::Id(s))),
-        text(fl!(loader(), "add-id-note")).size(12),
-        text(fl!(loader(), "add-display-name")).size(14),
+        st::muted(fl!(loader(), "add-id-note")),
+        st::body(fl!(loader(), "add-display-name")),
         text_input("", &wiz.display_name).on_input(|s| Message::Add(AddMsg::DisplayName(s))),
-        text(fl!(loader(), "add-home")).size(14),
+        st::body(fl!(loader(), "add-home")),
         row![
             text_input(&suggest_home(wiz.harness, &wiz.id), &wiz.home)
                 .on_input(|s| Message::Add(AddMsg::Home(s)))
                 .width(400),
-            button(text(fl!(loader(), "add-home-use-suggestion")).size(13))
+            button(st::body(fl!(loader(), "add-home-use-suggestion")))
                 .style(button::secondary)
                 .on_press(Message::Add(AddMsg::UseSuggestion)),
         ]
-        .spacing(8),
+        .spacing(st::SPACE_S),
         row![
-            button(text(fl!(loader(), "add-preview")).size(13))
+            button(st::body(fl!(loader(), "add-preview")))
                 .style(button::secondary)
                 .on_press(Message::Add(AddMsg::Preview)),
-            button(text(fl!(loader(), "add-apply")).size(13))
+            button(st::body(fl!(loader(), "add-apply")))
                 .style(button::primary)
                 .on_press_maybe(
                     matches!(wiz.preview, Preview::Ready(_)).then(|| Message::Add(AddMsg::Apply))
                 ),
         ]
-        .spacing(8),
-        preview_block(&wiz.preview),
+        .spacing(st::SPACE_S),
     ]
-    .spacing(8);
+    .spacing(st::SPACE_S);
+    for line in preview_lines(&wiz.preview) {
+        form = form.push(line);
+    }
     let mut col = column![
-        button(text(fl!(loader(), "add-back")).size(13))
+        button(st::body(fl!(loader(), "add-back")))
             .style(button::secondary)
             .on_press(Message::SelectPage(crate::app::Page::Instances)),
         form,
     ]
-    .spacing(12);
+    .spacing(st::SPACE_M);
     if wiz.added_id.is_some() {
         col = col.push(login_panel(wiz));
         col = col.push(optional_section(
