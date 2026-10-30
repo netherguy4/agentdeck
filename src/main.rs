@@ -1,9 +1,4 @@
-mod config;
-mod history;
-mod model;
-mod providers;
 mod setup;
-mod util;
 
 use std::fs;
 use std::io::Read;
@@ -11,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
+use agentdeck_usage::config::AccountConfig;
+use agentdeck_usage::model::AppState;
+use agentdeck_usage::PROVIDER_DEADLINE;
+use agentdeck_usage::{config, history, model, providers, util};
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use config::AccountConfig;
-use model::AppState;
 use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
@@ -542,10 +539,7 @@ async fn once() -> Result<()> {
     Ok(())
 }
 
-/// Верхняя граница на один provider fetch. Провайдер, вышедший за неё,
-/// становится обычным error state и не задерживает остальные аккаунты.
-const PROVIDER_DEADLINE: Duration = Duration::from_secs(30);
-
+/// Верхняя граница на один provider fetch (см. agentdeck_usage::PROVIDER_DEADLINE).
 async fn refresh(config: &config::Config) -> AppState {
     let mut tasks = JoinSet::new();
     for (index, account) in config.accounts.iter().cloned().enumerate() {

@@ -114,9 +114,11 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"used_percent\":10.0"));
         assert!(lines[1].contains("\"used_percent\":30.0"));
-        assert!(lines
-            .iter()
-            .all(|l| l.contains("\"plan\":\"Max 5x\"") && !l.contains("secret@")));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("\"plan\":\"Max 5x\"") && !l.contains("secret@"))
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

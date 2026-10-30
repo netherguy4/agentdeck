@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::task::JoinHandle;
@@ -428,10 +428,10 @@ pub fn parse_account_state(
 
     let mut windows = Vec::new();
     for key in ["primary", "secondary"] {
-        if let Some(window) = bucket.get(key).filter(|value| !value.is_null()) {
-            if let Some(parsed) = parse_window(key, window) {
-                windows.push(parsed);
-            }
+        if let Some(window) = bucket.get(key).filter(|value| !value.is_null())
+            && let Some(parsed) = parse_window(key, window)
+        {
+            windows.push(parsed);
         }
     }
 
@@ -743,10 +743,12 @@ exec /usr/bin/cat "$CODEX_HOME/responses.jsonl"
         assert_eq!(recovered_attempts.lines().count(), 2);
         assert_eq!(failed_attempts.lines().count(), 2);
         let error = failed.expect("provider deadline must not erase the timeout error");
-        assert!(error
-            .unwrap_err()
-            .to_string()
-            .contains("не ответил за 8 секунд"));
+        assert!(
+            error
+                .unwrap_err()
+                .to_string()
+                .contains("не ответил за 8 секунд")
+        );
     }
 
     #[test]

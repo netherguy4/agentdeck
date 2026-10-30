@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::model::{label_for_duration, AccountState, QuotaWindow, FIVE_HOUR_MINS, WEEKLY_MINS};
+use crate::model::{AccountState, FIVE_HOUR_MINS, QuotaWindow, WEEKLY_MINS, label_for_duration};
 
 /// Пока порог не задан в конфиге, данные Claude считаются устаревшими через
 /// четверть часа. Это 5% пятичасового окна: более старым цифрам верить нельзя,
@@ -651,7 +651,7 @@ fn backoff_seconds(failures: u32) -> i64 {
     (BACKOFF_BASE_SECONDS.saturating_mul(1 << shift)).min(BACKOFF_MAX_SECONDS)
 }
 
-pub(crate) fn humanize_age(seconds: i64) -> String {
+pub fn humanize_age(seconds: i64) -> String {
     let minutes = seconds / 60;
     match minutes {
         ..=0 => "меньше минуты".to_owned(),

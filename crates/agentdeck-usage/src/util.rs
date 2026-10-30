@@ -5,7 +5,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub fn unix_now() -> i64 {
     SystemTime::now()
@@ -19,10 +19,10 @@ pub fn expand_home(path: &Path) -> PathBuf {
     if raw == "~" {
         return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     path.to_path_buf()
 }
@@ -205,10 +205,12 @@ pub fn load_secrets_env() -> Result<()> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            if env::var_os(key.trim()).is_none() {
-                env::set_var(key.trim(), value.trim());
-            }
+        if let Some((key, value)) = line.split_once('=')
+            && env::var_os(key.trim()).is_none()
+        {
+            // Edition 2024 marks set_var unsafe (thread-safety); single-threaded
+            // load path, same as before the move.
+            unsafe { env::set_var(key.trim(), value.trim()) };
         }
     }
     Ok(())
@@ -377,11 +379,11 @@ mod tests {
 
         // PATH, с которым сервис реально стартует после reboot.
         let saved = env::var_os("PATH");
-        env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin");
+        unsafe { env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin") };
         let resolved = resolve_command(&name);
         match saved {
-            Some(value) => env::set_var("PATH", value),
-            None => env::remove_var("PATH"),
+            Some(value) => unsafe { env::set_var("PATH", value) },
+            None => unsafe { env::remove_var("PATH") },
         }
         let _ = fs::remove_file(&probe);
 

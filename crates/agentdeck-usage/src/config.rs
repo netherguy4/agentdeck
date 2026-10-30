@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Ниже этого значения refresh становится бессмысленно частым: каждый Codex
@@ -332,7 +332,7 @@ mod tests {
     fn example_config_is_valid() {
         // Пример из репозитория должен и разбираться, и проходить валидацию,
         // иначе документация ведёт пользователя в нерабочую конфигурацию.
-        let raw = include_str!("../config/config.example.toml");
+        let raw = include_str!("../../../config/config.example.toml");
         let config: Config = toml::from_str(raw).unwrap();
         validate(&config).unwrap();
         assert_eq!(config.accounts.len(), 6);

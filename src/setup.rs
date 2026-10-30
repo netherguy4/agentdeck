@@ -7,7 +7,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::config::{self, AccountConfig, Config};
+use agentdeck_usage::config::{self, AccountConfig, Config};
 
 pub fn run() -> Result<()> {
     let mut config = config::load()?;
@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
 fn add_claude(config: &mut Config) -> Result<()> {
     println!("\nClaude Code");
     let id = prompt("ID аккаунта", Some("claude-main"))?;
-    crate::util::validate_id(&id)?;
+    agentdeck_usage::util::validate_id(&id)?;
     let name = prompt("Название в виджете", Some("Claude"))?;
     let plan = prompt("Тариф (можно оставить пустым)", Some("Pro"))?;
     let default_dir = if id == "claude-main" {
@@ -99,7 +99,7 @@ fn add_claude(config: &mut Config) -> Result<()> {
 fn add_codex(config: &mut Config) -> Result<()> {
     println!("\nCodex");
     let id = prompt("ID аккаунта", Some("codex-main"))?;
-    crate::util::validate_id(&id)?;
+    agentdeck_usage::util::validate_id(&id)?;
     let name = prompt("Название в виджете", Some("Codex"))?;
     let default_home = if id == "codex-main" {
         "~/.codex".to_owned()
@@ -124,7 +124,7 @@ fn add_codex(config: &mut Config) -> Result<()> {
     );
     config::save(config)?;
 
-    let expanded_home = crate::util::expand_home(&codex_home);
+    let expanded_home = agentdeck_usage::util::expand_home(&codex_home);
     fs::create_dir_all(&expanded_home)?;
     if yes_no("Запустить вход в этот Codex-аккаунт сейчас?", true)? {
         let status = Command::new(&command)
@@ -148,7 +148,7 @@ fn add_codex(config: &mut Config) -> Result<()> {
 fn add_deepseek(config: &mut Config) -> Result<()> {
     println!("\nDeepSeek API");
     let id = prompt("ID аккаунта", Some("deepseek-main"))?;
-    crate::util::validate_id(&id)?;
+    agentdeck_usage::util::validate_id(&id)?;
     let name = prompt("Название в виджете", Some("DeepSeek"))?;
     let key = rpassword::prompt_password("API key (ввод скрыт): ")?;
     if key.is_empty() {
@@ -158,7 +158,7 @@ fn add_deepseek(config: &mut Config) -> Result<()> {
         bail!("API key содержит перевод строки");
     }
 
-    let env_name = crate::util::env_name_for_id(&id);
+    let env_name = agentdeck_usage::util::env_name_for_id(&id);
     save_secret(&env_name, &key)?;
     config::upsert_account(
         config,
@@ -177,14 +177,14 @@ fn add_deepseek(config: &mut Config) -> Result<()> {
 fn add_openrouter(config: &mut Config) -> Result<()> {
     println!("\nOpenRouter API");
     let id = prompt("ID аккаунта", Some("openrouter-main"))?;
-    crate::util::validate_id(&id)?;
+    agentdeck_usage::util::validate_id(&id)?;
     let name = prompt("Название в виджете", Some("OpenRouter"))?;
     let key = rpassword::prompt_password("API key (ввод скрыт): ")?;
     if key.is_empty() {
         bail!("API key не может быть пустым");
     }
 
-    let env_name = crate::util::env_name_for_provider_and_id("openrouter", &id);
+    let env_name = agentdeck_usage::util::env_name_for_provider_and_id("openrouter", &id);
     save_secret(&env_name, &key)?;
 
     config::upsert_account(
@@ -204,7 +204,7 @@ fn add_openrouter(config: &mut Config) -> Result<()> {
 fn add_antigravity(config: &mut Config) -> Result<()> {
     println!("\nGoogle Antigravity (agy)");
     let id = prompt("ID аккаунта", Some("agy-main"))?;
-    crate::util::validate_id(&id)?;
+    agentdeck_usage::util::validate_id(&id)?;
     let name = prompt("Название в виджете", Some("Antigravity"))?;
 
     config::upsert_account(
@@ -219,7 +219,7 @@ fn add_antigravity(config: &mut Config) -> Result<()> {
 
     // Данные приходят не по сети, а из самого agy, поэтому без подключённого
     // status line аккаунт так и останется в состоянии «ожидание».
-    let path = crate::providers::antigravity::install_hook_script(&id)?;
+    let path = agentdeck_usage::providers::antigravity::install_hook_script(&id)?;
     println!("\nHook создан: {}", path.display());
     println!("Осталось выполнить внутри agy:");
     println!("  /statusline {}", path.display());
@@ -228,7 +228,7 @@ fn add_antigravity(config: &mut Config) -> Result<()> {
 }
 
 pub fn install_claude_status_line(account_id: &str, config_dir: &Path) -> Result<()> {
-    let dir = crate::util::expand_home(config_dir);
+    let dir = agentdeck_usage::util::expand_home(config_dir);
     fs::create_dir_all(&dir)?;
     let settings_path = dir.join("settings.json");
     let backup_path = dir.join("settings.json.ai-usage.bak");
@@ -256,7 +256,7 @@ pub fn install_claude_status_line(account_id: &str, config_dir: &Path) -> Result
     let executable = std::env::current_exe()?;
     let command = format!(
         "{} {}",
-        crate::util::shell_single_quote(&executable.to_string_lossy()),
+        agentdeck_usage::util::shell_single_quote(&executable.to_string_lossy()),
         hook_marker(account_id)
     );
     object.insert(
@@ -268,7 +268,7 @@ pub fn install_claude_status_line(account_id: &str, config_dir: &Path) -> Result
         }),
     );
 
-    crate::util::atomic_write(
+    agentdeck_usage::util::atomic_write(
         &settings_path,
         serde_json::to_string_pretty(&settings)?.as_bytes(),
     )?;
@@ -282,7 +282,7 @@ pub fn restore_claude_hooks() -> Result<()> {
             let outcome = restore_claude_account(id, config_dir)?;
             println!(
                 "{}",
-                outcome.describe(&crate::util::expand_home(config_dir))
+                outcome.describe(&agentdeck_usage::util::expand_home(config_dir))
             );
         }
     }
@@ -328,7 +328,7 @@ impl RestoreOutcome {
 /// Главный инвариант: если пользователь поменял `statusLine` уже после нашей
 /// установки, его значение важнее backup и перезаписывать его нельзя.
 pub fn restore_claude_account(account_id: &str, config_dir: &Path) -> Result<RestoreOutcome> {
-    let dir = crate::util::expand_home(config_dir);
+    let dir = agentdeck_usage::util::expand_home(config_dir);
     let settings_path = dir.join("settings.json");
     let backup_path = dir.join("settings.json.ai-usage.bak");
 
@@ -354,7 +354,7 @@ pub fn restore_claude_account(account_id: &str, config_dir: &Path) -> Result<Res
                     }
                 }
             }
-            crate::util::atomic_write(
+            agentdeck_usage::util::atomic_write(
                 &settings_path,
                 serde_json::to_string_pretty(&current)?.as_bytes(),
             )?;
@@ -383,7 +383,7 @@ pub fn restore_claude_account(account_id: &str, config_dir: &Path) -> Result<Res
     if let Some(object) = settings.as_object_mut() {
         object.remove("statusLine");
     }
-    crate::util::atomic_write(
+    agentdeck_usage::util::atomic_write(
         &settings_path,
         serde_json::to_string_pretty(&settings)?.as_bytes(),
     )?;
@@ -398,7 +398,7 @@ pub fn restore_claude_account(account_id: &str, config_dir: &Path) -> Result<Res
 fn hook_marker(account_id: &str) -> String {
     format!(
         "claude-hook --account {}",
-        crate::util::shell_single_quote(account_id)
+        agentdeck_usage::util::shell_single_quote(account_id)
     )
 }
 
@@ -411,7 +411,7 @@ fn is_our_hook(settings: &Value, account_id: &str) -> bool {
 }
 
 pub fn save_secret(key: &str, value: &str) -> Result<()> {
-    let path = crate::util::secrets_file()?;
+    let path = agentdeck_usage::util::secrets_file()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -427,7 +427,11 @@ pub fn save_secret(key: &str, value: &str) -> Result<()> {
         }
     }
     values.insert(key.to_owned(), value.to_owned());
-    crate::util::atomic_write_mode(&path, render_secrets(&values).as_bytes(), Some(0o600))?;
+    agentdeck_usage::util::atomic_write_mode(
+        &path,
+        render_secrets(&values).as_bytes(),
+        Some(0o600),
+    )?;
     Ok(())
 }
 
@@ -475,7 +479,7 @@ fn non_empty(value: String) -> Option<String> {
 }
 
 fn resolve_command(command: &str) -> Option<String> {
-    crate::util::resolve_command(command)
+    agentdeck_usage::util::resolve_command(command)
 }
 
 fn restart_service() {

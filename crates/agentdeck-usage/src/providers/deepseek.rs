@@ -2,7 +2,7 @@ use std::env;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 
@@ -294,9 +294,11 @@ mod tests {
     #[tokio::test]
     async fn missing_required_field_is_an_error() {
         let server = MockServer::start("200 OK", r#"{"balance_infos":[]}"#).await;
-        assert!(fetch_with_key("ds", "DeepSeek", "k", &server.base_url)
-            .await
-            .is_err());
+        assert!(
+            fetch_with_key("ds", "DeepSeek", "k", &server.base_url)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

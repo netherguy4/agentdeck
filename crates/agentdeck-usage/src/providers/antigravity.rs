@@ -3,10 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AccountState, QuotaWindow, FIVE_HOUR_MINS, WEEKLY_MINS};
+use crate::model::{AccountState, FIVE_HOUR_MINS, QuotaWindow, WEEKLY_MINS};
 
 /// Минимальный интервал между прямыми сетевыми запросами к Google API квоты (2 минуты),
 /// чтобы не создавать лишней нагрузки при быстром тике демона или частых `ai-usage once`.
@@ -446,14 +446,12 @@ fn detect_model(prev: Option<&Snapshot>) -> Option<String> {
     }
     if let Some(home) = dirs::home_dir() {
         let settings_path = home.join(".gemini/antigravity-cli/settings.json");
-        if let Ok(raw) = fs::read_to_string(settings_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(m) = val.get("model").and_then(|m| m.as_str()) {
-                    if !m.trim().is_empty() {
-                        return Some(m.to_owned());
-                    }
-                }
-            }
+        if let Ok(raw) = fs::read_to_string(&settings_path)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(m) = val.get("model").and_then(|m| m.as_str())
+            && !m.trim().is_empty()
+        {
+            return Some(m.to_owned());
         }
     }
     Some("Gemini 3.8 Flash (High)".to_owned())
@@ -1006,11 +1004,13 @@ mod tests {
             assert_eq!(state.windows[0].key, "gemini-5h");
             assert_eq!(state.windows[0].scope, None);
             assert_eq!(state.windows[0].remaining_percent, 42.0);
-            assert!(state
-                .windows
-                .iter()
-                .filter(|w| w.key.starts_with("3p-"))
-                .all(|w| w.scope.as_deref() == Some("Сторонние модели")));
+            assert!(
+                state
+                    .windows
+                    .iter()
+                    .filter(|w| w.key.starts_with("3p-"))
+                    .all(|w| w.scope.as_deref() == Some("Сторонние модели"))
+            );
             assert_eq!(state.updated_at, snapshot.updated_at);
         }
     }

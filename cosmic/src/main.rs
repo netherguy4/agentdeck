@@ -11,7 +11,7 @@ use std::{
 
 // Reuse the backend's schema so provider changes remain compatible with both desktops.
 #[allow(dead_code)]
-#[path = "../../src/model.rs"]
+#[path = "../../crates/agentdeck-usage/src/model.rs"]
 mod model;
 mod util {
     pub fn unix_now() -> i64 {

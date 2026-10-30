@@ -34,15 +34,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-usage"
+name = "agentdeck-usage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
  "dirs",
  "reqwest",
- "rpassword",
  "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "ai-usage"
+version = "0.1.0"
+dependencies = [
+ "agentdeck-usage",
+ "anyhow",
+ "clap",
+ "rpassword",
  "serde_json",
  "tokio",
  "toml",

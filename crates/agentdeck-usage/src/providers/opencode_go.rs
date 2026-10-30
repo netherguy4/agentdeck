@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 
-use crate::model::{AccountState, QuotaWindow, FIVE_HOUR_MINS, WEEKLY_MINS};
+use crate::model::{AccountState, FIVE_HOUR_MINS, QuotaWindow, WEEKLY_MINS};
 use crate::providers::antigravity::parse_rfc3339;
 
 const MAX_ERROR_BODY: usize = 200;

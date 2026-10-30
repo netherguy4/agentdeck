@@ -2,7 +2,7 @@ use std::env;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 
@@ -155,17 +155,17 @@ pub async fn fetch_with_key(
             topped_up: data.limit.map(|l| format!("{:.2}", l)),
         }];
 
-        if let Some(lim) = data.limit {
-            if lim > 0.0 {
-                let used_percent = ((lim - rem) / lim * 100.0).clamp(0.0, 100.0);
-                windows.push(QuotaWindow::new(
-                    "key_limit",
-                    "Лимит ключа",
-                    used_percent,
-                    None,
-                    None,
-                ));
-            }
+        if let Some(lim) = data.limit
+            && lim > 0.0
+        {
+            let used_percent = ((lim - rem) / lim * 100.0).clamp(0.0, 100.0);
+            windows.push(QuotaWindow::new(
+                "key_limit",
+                "Лимит ключа",
+                used_percent,
+                None,
+                None,
+            ));
         }
     } else {
         // Лимит на ключе не установлен (unlimited) — отображаем накопленный расход ключа
