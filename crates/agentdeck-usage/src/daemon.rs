@@ -71,12 +71,14 @@ pub struct DaemonPaths {
 impl DaemonPaths {
     /// Production paths for the new daemon. Compat copies point at the old
     /// ai-usage state files the router and the current applet still read.
+    /// They use the legacy (never overridden) paths even when the process
+    /// override redirects providers into the new tree.
     pub fn for_agentdeck(state_dir: &Path, runtime_dir: &Path) -> Self {
         let dir = state_dir.join("usage");
         Self {
             canonical: dir.join("state.json"),
             runtime: runtime_dir.join("state.json"),
-            compat_canonical: vec![util::persistent_state_dir().join("state.json")],
+            compat_canonical: vec![util::legacy_persistent_state_dir().join("state.json")],
             compat_runtime: vec![util::state_file()],
             history: dir.join("history.jsonl"),
             cooldown_dir: dir.clone(),
@@ -87,13 +89,13 @@ impl DaemonPaths {
     /// Paths the old `ai-usage` binary has always used. No compat copies.
     pub fn legacy() -> Self {
         Self {
-            canonical: util::persistent_state_dir().join("state.json"),
+            canonical: util::legacy_persistent_state_dir().join("state.json"),
             runtime: util::state_file(),
             compat_canonical: Vec::new(),
             compat_runtime: Vec::new(),
             history: history::history_file(),
-            cooldown_dir: util::persistent_state_dir(),
-            lock: util::persistent_state_dir().join(LOCK_FILE_NAME),
+            cooldown_dir: util::legacy_persistent_state_dir(),
+            lock: util::legacy_persistent_state_dir().join(LOCK_FILE_NAME),
         }
     }
 

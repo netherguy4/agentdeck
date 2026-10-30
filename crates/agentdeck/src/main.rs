@@ -5,6 +5,7 @@ mod cmd_claude;
 mod cmd_codex;
 mod cmd_daemon;
 mod cmd_login;
+mod cmd_migrate;
 mod cmd_pool;
 mod cmd_t3;
 mod cmd_usage;
@@ -50,6 +51,11 @@ enum Cmd {
     T3 {
         #[command(subcommand)]
         cmd: cmd_t3::T3Cmd,
+    },
+    /// Copy-only migration from the old ai-usage tree (never moves or deletes).
+    Migrate {
+        #[command(subcommand)]
+        cmd: cmd_migrate::MigrateCmd,
     },
     /// Per-instance terminal wrappers (claude@second) and .desktop launchers.
     Wrapper {
@@ -137,6 +143,10 @@ fn main() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     let paths = Paths::from_env()?;
+    // Providers write cooldowns/snapshots via util::persistent_state_dir();
+    // point it at the new tree before anything runs. Unset, everything keeps
+    // the old ai-usage paths (old binary, compat copies, migrator sources).
+    agentdeck_usage::util::set_state_dir_override(paths.state_dir.join("usage"));
     agentdeck_usage::daemon::load_agentdeck_secrets(&paths.config_dir)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -178,6 +188,7 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(paths, cmd)?,
+        Cmd::Migrate { cmd } => cmd_migrate::run(paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
             InstanceCmd::List { json } => {
                 if json {
