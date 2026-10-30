@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 description = "Registry and harness adapters for agentdeck"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/netherguy4/agentdeck"
+repository = "https://github.com/netherg-io/agentdeck"
 rust-version = "1.93"
 
 [dependencies]
