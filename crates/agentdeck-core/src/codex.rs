@@ -766,10 +766,9 @@ mod tests {
             "{drift:?}"
         );
         assert!(
-            drift.iter().all(|d| matches!(
-                d,
-                Drift::PrivateLink { .. } | Drift::MissingLink { .. }
-            )),
+            drift
+                .iter()
+                .all(|d| matches!(d, Drift::PrivateLink { .. } | Drift::MissingLink { .. })),
             "{drift:?}"
         );
         // fix backs up each link and leaves the entry absent (log in again);
