@@ -67,6 +67,14 @@ pub enum Drift {
     ExtraEntry {
         path: PathBuf,
     },
+    /// Shadow private file (`auth.json`, `auth.lock`, `models_cache.json`)
+    /// that is a symlink: it would share the account's credentials/cache with
+    /// another home. Never repaired by copying; the link is removed and the
+    /// user logs in again for that account.
+    PrivateLink {
+        path: PathBuf,
+        actual: Option<PathBuf>,
+    },
     SameHome {
         main: PathBuf,
         shadow: PathBuf,
@@ -111,6 +119,17 @@ impl Drift {
             Drift::ExtraEntry { path } => {
                 format!("shadow-only {} (left alone)", path.display())
             }
+            Drift::PrivateLink { path, actual } => match actual {
+                Some(a) => format!(
+                    "private {} is a symlink to {}, sharing another home's credentials; remove it and log in again for this account",
+                    path.display(),
+                    a.display()
+                ),
+                None => format!(
+                    "private {} is an unreadable symlink, sharing another home's credentials; remove it and log in again for this account",
+                    path.display()
+                ),
+            },
             Drift::SameHome { main, shadow } => format!(
                 "shadow home {} is the same as or nested in main home {}; refusing to link a home into itself",
                 shadow.display(),
@@ -327,6 +346,18 @@ pub fn check(main: &Path, shadow: &Path) -> anyhow::Result<Vec<Drift>> {
             }
         }
     }
+    // Private files are never linked: a symlink here would share the
+    // account's credentials/cache with another home (T3 rejects this too).
+    // Regular private files and absent entries are fine and stay silent.
+    for name in PRIVATE {
+        let path = shadow.join(name);
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            out.push(Drift::PrivateLink {
+                actual: fs::read_link(&path).ok(),
+                path,
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -461,6 +492,22 @@ pub fn fix(
                 }
             }
             Err(e) => return Err(e.into()),
+        }
+    }
+    // A symlinked private file would share credentials with another home:
+    // back up the link itself and leave the entry absent (the user must log
+    // in again for that account). Regular private files are never touched.
+    for name in PRIVATE {
+        let path = shadow.join(name);
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            plan.changes.push(Change::BackupRemove {
+                path: path.clone(),
+                backup: backup_dest(state, name),
+            });
+            plan.deferred.push(format!(
+                "{} was a symlink sharing another home's credentials; removed, log in again for this account",
+                path.display()
+            ));
         }
     }
     Ok(plan)
@@ -689,6 +736,78 @@ mod tests {
         assert_eq!(
             fs::read(fx.shadow.join("auth.json")).unwrap(),
             b"shadow-login"
+        );
+        assert!(check(&fx.main, &fx.shadow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn private_symlink_is_drift_and_fix_removes_it() {
+        let fx = fixture();
+        for name in PRIVATE {
+            fs::write(fx.main.join(name), "main-secret").unwrap();
+        }
+        sync(&fx);
+        // Symlinked private files in the shadow share credentials with
+        // another home: drift, whatever the target (including dangling).
+        std::os::unix::fs::symlink(fx.main.join("auth.json"), fx.shadow.join("auth.json")).unwrap();
+        std::os::unix::fs::symlink(fx.main.join("auth.lock"), fx.shadow.join("auth.lock")).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("/nonexistent/models_cache.json"),
+            fx.shadow.join("models_cache.json"),
+        )
+        .unwrap();
+        let drift = check(&fx.main, &fx.shadow).unwrap();
+        assert_eq!(
+            drift
+                .iter()
+                .filter(|d| matches!(d, Drift::PrivateLink { .. }))
+                .count(),
+            3,
+            "{drift:?}"
+        );
+        assert!(
+            drift.iter().all(|d| matches!(
+                d,
+                Drift::PrivateLink { .. } | Drift::MissingLink { .. }
+            )),
+            "{drift:?}"
+        );
+        // fix backs up each link and leaves the entry absent (log in again);
+        // regular private files would never reach this path.
+        let plan = fix(&fx.main, &fx.shadow, &fx.state, false).unwrap();
+        assert_eq!(
+            plan.changes
+                .iter()
+                .filter(|c| matches!(c, Change::BackupRemove { .. }))
+                .count(),
+            3,
+            "{:?}",
+            plan.changes
+        );
+        assert_eq!(plan.deferred.len(), 3);
+        assert!(
+            plan.deferred.iter().all(|d| d.contains("log in again")),
+            "{:?}",
+            plan.deferred
+        );
+        apply_changes(&plan.changes).unwrap();
+        for name in PRIVATE {
+            assert!(
+                fs::symlink_metadata(fx.shadow.join(name)).is_err(),
+                "{name} must be absent after fix"
+            );
+        }
+        // Link identities were backed up outside both homes.
+        let backups: Vec<PathBuf> = fs::read_dir(fx.state.join("backups"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 3);
+        assert!(
+            backups
+                .iter()
+                .all(|b| fs::symlink_metadata(b).is_ok_and(|m| m.file_type().is_symlink())),
+            "{backups:?}"
         );
         assert!(check(&fx.main, &fx.shadow).unwrap().is_empty());
     }
