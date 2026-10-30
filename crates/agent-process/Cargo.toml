@@ -1,0 +1,15 @@
+[package]
+name = "agent-process"
+version = "0.1.0"
+edition = "2024"
+description = "Own long-running agent processes: separate process group plus ownership registry"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/netherguy4/agentdeck"
+rust-version = "1.93"
+
+[[bin]]
+name = "agent-process"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1.0", features = ["preserve_order"] }
