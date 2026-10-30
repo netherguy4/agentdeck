@@ -177,6 +177,7 @@ dependencies = [
 name = "agentdeck-router"
 version = "0.1.0"
 dependencies = [
+ "agentdeck-core",
  "anyhow",
  "libc",
  "regex",

@@ -238,9 +238,14 @@ pub fn router_json_value(reg: &Registry) -> anyhow::Result<Value> {
     let mut root = Map::new();
     root.insert("version".into(), Value::from(version));
     root.insert("pool".into(), Value::Array(pool));
+    // A prefix account refines an instance another account maps, and the router
+    // validates in file order: prefix accounts go last.
+    let (prefixed, plain): (Vec<_>, Vec<_>) = accounts
+        .into_iter()
+        .partition(|(_, v)| v.get("modelPrefix").is_some());
     root.insert(
         "accounts".into(),
-        Value::Object(accounts.into_iter().collect()),
+        Value::Object(plain.into_iter().chain(prefixed).collect()),
     );
     root.insert(
         "usageStatePath".into(),

@@ -147,16 +147,12 @@ pub struct RouterConfig {
 }
 
 pub fn router_config() -> anyhow::Result<RouterConfig> {
-    let file = std::env::var("MODEL_ROUTE_ROUTER_JSON").unwrap_or_else(|_| {
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let dir = std::path::Path::new(&exe)
-            .parent()
-            .map(|p| p.join("router.json"))
-            .unwrap();
-        dir.to_string_lossy().into_owned()
-    });
+    let file = match std::env::var("MODEL_ROUTE_ROUTER_JSON") {
+        Ok(file) => file,
+        Err(_) => agentdeck_core::router::router_json_path(&agentdeck_core::Paths::from_env()?)
+            .display()
+            .to_string(),
+    };
     load_router_json(&file)
 }
 
@@ -750,5 +746,47 @@ pub fn validate_target(ranking: &[Ranked], provider: &str, model: &str) -> Valid
             "score {:.3} below {}/{}; margin is {TARGET_MARGIN}",
             gap, best.candidate.provider, best.candidate.model
         ))
+    }
+}
+
+#[cfg(test)]
+mod generated_config_tests {
+    use super::*;
+
+    /// The real shape: a shared opencode instance with a prefix account.
+    #[test]
+    fn loader_accepts_what_the_generator_writes() {
+        let reg = agentdeck_core::registry::Registry::from_toml(
+            r#"
+version = 1
+[[instance]]
+id = "opencode"
+harness = "opencode"
+display_name = "opencode"
+home = "~/.local/share/opencode"
+[[pool]]
+instance = "opencode"
+model = "opencode-go/m"
+[pool.options]
+[[usage]]
+id = "openrouter-main"
+kind = "openrouter"
+display = "OpenRouter"
+api_key_env = "K"
+[[usage]]
+id = "opencode-go"
+kind = "opencode-go"
+display = "Go"
+"#,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("router-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("router.json");
+        let value = agentdeck_core::router::router_json_value(&reg).unwrap();
+        std::fs::write(&file, value.to_string()).unwrap();
+        let config = load_router_json(file.to_str().unwrap()).unwrap();
+        assert_eq!(config.meta.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
