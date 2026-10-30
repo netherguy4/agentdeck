@@ -227,8 +227,8 @@ pub fn merge_settings(old: &Value, desired: &BTreeMap<String, Value>) -> anyhow:
                 for key in ["driver", "enabled"] {
                     obj.insert(key.into(), want[key].clone());
                 }
-                // An id-only name is what import fills in for a nameless instance.
-                if obj.contains_key("displayName") || want["displayName"].as_str() != Some(id) {
+                // T3 has its own label for a nameless default instance: keep it nameless.
+                if obj.contains_key("displayName") {
                     obj.insert("displayName".into(), want["displayName"].clone());
                 }
                 let cfg = obj

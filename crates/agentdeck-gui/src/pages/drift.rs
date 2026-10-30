@@ -870,6 +870,10 @@ pub fn view(state: &State) -> Element<'_, Message> {
             fl!(loader(), "drift-working")
         )));
     }
+    if state.snapshot.groups.is_empty() && state.snapshot.error.is_none() {
+        // Groups exist once the check ran, even with nothing to report.
+        col = col.push(st::muted(fl!(loader(), "instances-loading")));
+    }
     let mut first = true;
     if let Some(pending) = &state.pending {
         let mut lines: Vec<Element<'_, Message>> = Vec::new();

@@ -37,16 +37,16 @@ fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
         Some(scope) => format!("{} · {scope}", bar.label),
         None => bar.label.clone(),
     };
-    let mut row = iced::widget::row![
+    // Fixed side columns keep every bar the same length.
+    let reset = bar.resets_in_mins.map(reset_label).unwrap_or_default();
+    iced::widget::row![
         st::muted(label).width(150),
         st::quota_bar(bar.used_percent as f32).length(Length::Fill),
         st::body(format!("{:.0}%", bar.used_percent)).width(44),
+        st::muted(reset).width(160),
     ]
-    .spacing(st::SPACE_S);
-    if let Some(mins) = bar.resets_in_mins {
-        row = row.push(st::muted(reset_label(mins)));
-    }
-    row.into()
+    .spacing(st::SPACE_S)
+    .into()
 }
 
 fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {

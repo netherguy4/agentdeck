@@ -60,6 +60,15 @@ pub fn describe_outcome(title: &str, outcome: &StopOutcome) -> String {
     )
 }
 
+/// Wrapper command lines run to pages of shell; one line is enough to recognize one.
+fn short_cmd(cmd: &str) -> String {
+    let line = cmd.lines().next().unwrap_or_default();
+    match line.char_indices().nth(90) {
+        Some((end, _)) => format!("{}…", &line[..end]),
+        None => line.to_string(),
+    }
+}
+
 fn member_line(p: &ProcInfo) -> String {
     format!(
         "{}  CPU {:.1}%  RSS {}  IO {}/{}  {}",
@@ -68,7 +77,7 @@ fn member_line(p: &ProcInfo) -> String {
         mega(p.rss_bytes),
         maybe_mega(p.read_bytes),
         maybe_mega(p.write_bytes),
-        p.display_cmd(),
+        short_cmd(&p.display_cmd()),
     )
 }
 

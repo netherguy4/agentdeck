@@ -168,7 +168,7 @@ fn env_tag(path: &Path, key: &str) -> Option<String> {
         .find_map(|e| e.strip_prefix(&prefix).map(str::to_string))
 }
 
-/// First `t3code-*.scope` segment in `/proc/<pid>/cgroup`, if any.
+/// First T3 unit segment (`t3code-*.scope`, `t3code.service`) in `/proc/<pid>/cgroup`.
 fn scope_of(proc: &Path) -> Option<String> {
     scope_cgroup(proc).map(|(scope, _)| scope)
 }
@@ -181,7 +181,9 @@ fn scope_cgroup(proc: &Path) -> Option<(String, String)> {
         let path = path.rsplit_once(':').map(|(_, p)| p).unwrap_or(path);
         for seg in path.split('/') {
             let seg = seg.trim();
-            if seg.starts_with("t3code-") && seg.ends_with(".scope") {
+            // T3 session wrappers still live in the T3 service unit before they exec
+            // into a per-agent scope: both are T3's, and only T3 may interrupt them.
+            if (seg.starts_with("t3code-") && seg.ends_with(".scope")) || seg == "t3code.service" {
                 return Some((seg.to_string(), path.to_string()));
             }
         }
