@@ -153,6 +153,12 @@ impl Change {
                 if path.is_dir() && !path.is_symlink() {
                     fs_extra_copy_dir(path, backup)?;
                     fs::remove_dir_all(path)?;
+                } else if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    // Back up the link itself, never traversing the target
+                    // (it may be dangling or belong to another home).
+                    let target = fs::read_link(path)?;
+                    std::os::unix::fs::symlink(target, backup)?;
+                    fs::remove_file(path)?;
                 } else {
                     fs::copy(path, backup)?;
                     fs::remove_file(path)?;

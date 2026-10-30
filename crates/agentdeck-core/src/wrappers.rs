@@ -116,12 +116,18 @@ fn sh_quote(path: &Path) -> String {
 /// Render the wrapper script. `home` must already be tilde-expanded.
 pub fn script_contents(inst: &Instance, home: &Path) -> anyhow::Result<Vec<u8>> {
     check_harness(inst)?;
+    // Codex credentials stay in CODEX_HOME/auth.json, never in the shared
+    // keyring (same `-c` override T3 passes as launchArgs).
+    let bin = binary(inst);
+    let exec = match inst.harness {
+        Harness::Codex => format!("exec {bin} -c 'cli_auth_credentials_store=\"file\"' \"$@\""),
+        _ => format!("exec {bin} \"$@\""),
+    };
     Ok(format!(
-        "#!/bin/sh\n{MARKER_PREFIX}{id}\nexport {var}={home}\nexec {bin} \"$@\"\n",
+        "#!/bin/sh\n{MARKER_PREFIX}{id}\nexport {var}={home}\n{exec}\n",
         id = inst.id,
         var = env_var(inst),
         home = sh_quote(home),
-        bin = binary(inst),
     )
     .into_bytes())
 }
@@ -464,6 +470,22 @@ mod tests {
         let script =
             String::from_utf8(script_contents(&codex, &PathBuf::from("/h/x")).unwrap()).unwrap();
         assert!(script.contains("export CODEX_HOME='/h/x'\n"), "{script}");
+        assert!(
+            script.ends_with("exec codex -c 'cli_auth_credentials_store=\"file\"' \"$@\"\n"),
+            "{script}"
+        );
+        // Claude wrappers keep a plain exec (no credential-store override).
+        assert!(
+            !String::from_utf8(
+                script_contents(
+                    &inst("claude_second", Harness::Claude),
+                    &PathBuf::from("/h/x")
+                )
+                .unwrap()
+            )
+            .unwrap()
+            .contains("cli_auth_credentials_store"),
+        );
 
         let mut custom = inst("claude_second", Harness::Claude);
         custom.binary = Some("/opt/claude/bin/claude".to_string());
