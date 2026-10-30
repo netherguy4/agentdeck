@@ -6,6 +6,7 @@ pub mod codex;
 pub mod login;
 pub mod paths;
 pub mod pool;
+pub mod processes;
 pub mod registry;
 pub mod t3;
 pub mod usage;

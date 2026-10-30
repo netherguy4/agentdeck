@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agentdeck_core::{Paths, Registry, t3};
+use agentdeck_core::{Paths, Registry, processes, t3};
 use agentdeck_usage::model::{self, AppState};
 
 /// Canonical usage state file, then the old ai-usage path the daemon still
@@ -61,6 +61,7 @@ pub struct Data {
     pub standalone: Vec<UsageQuotas>,
     /// Registry-level failure (unreadable file); per-source gaps stay silent.
     pub error: Option<String>,
+    pub processes: Vec<processes::SessionGroup>,
 }
 
 fn quotas_for(
@@ -144,5 +145,7 @@ pub fn load(paths: &Paths) -> Data {
         .filter(|u| u.instance.is_none())
         .map(|u| quotas_for(&u.id, &u.display, u.kind.as_str(), &accounts))
         .collect();
+    // Read-only /proc snapshot; gaps become dashes, never an error.
+    data.processes = processes::snapshot().groups;
     data
 }

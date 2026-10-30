@@ -34,12 +34,18 @@ pub enum Message {
     Tick,
     Loaded(Data),
     SelectPage(Page),
+    ProcStop(usize),
+    ProcConfirm,
+    ProcCancel,
+    ProcForce(bool),
+    ProcDone { title: String, result: String },
 }
 
 pub struct State {
     page: Page,
     data: Data,
     paths: Option<agentdeck_core::Paths>,
+    proc_ui: crate::pages::processes::ProcUi,
 }
 
 impl State {
@@ -52,6 +58,7 @@ impl State {
                 page: Page::Instances,
                 data: Data::default(),
                 paths,
+                proc_ui: crate::pages::processes::ProcUi::default(),
             },
             match first {
                 Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
@@ -66,11 +73,16 @@ impl State {
             page: Page::Instances,
             data,
             paths: Some(paths),
+            proc_ui: crate::pages::processes::ProcUi::default(),
         }
     }
 
     pub fn page(&self) -> Page {
         self.page
+    }
+
+    pub fn proc_ui(&self) -> &crate::pages::processes::ProcUi {
+        &self.proc_ui
     }
 }
 
@@ -88,11 +100,93 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.data = data;
             Task::none()
         }
+        Message::ProcStop(i) => {
+            // Fresh identity-checked member list for the confirmation; the
+            // snapshot rows are the fallback (e.g. the group just exited).
+            let pending = state.data.processes.get(i).map(|g| {
+                let members = agentdeck_core::processes::group_members(
+                    &agentdeck_core::processes::proc_root(),
+                    g.pid,
+                    g.start_ticks,
+                )
+                .unwrap_or_else(|_| g.processes.clone());
+                crate::pages::processes::PendingStop {
+                    group: i,
+                    title: g.title.clone(),
+                    members,
+                }
+            });
+            state.proc_ui.pending = pending;
+            state.proc_ui.force = false;
+            state.proc_ui.result = None;
+            Task::none()
+        }
+        Message::ProcConfirm => match state.proc_ui.pending.clone() {
+            // The owner's click is the approval: stop off the UI thread.
+            Some(pending) => {
+                let group = state.data.processes.get(pending.group).cloned();
+                let force = state.proc_ui.force;
+                state.proc_ui.pending = None;
+                match group.filter(|g| g.can_stop) {
+                    Some(g) => Task::perform(
+                        async move {
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                agentdeck_core::processes::stop_group(
+                                    g.pid,
+                                    g.start_ticks,
+                                    std::time::Duration::from_secs(5),
+                                    force,
+                                )
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .and_then(|r| r);
+                            match outcome {
+                                Ok(o) => {
+                                    let result = crate::pages::processes::describe_outcome(
+                                        &g.title, &o.outcome,
+                                    );
+                                    Message::ProcDone {
+                                        title: g.title,
+                                        result,
+                                    }
+                                }
+                                Err(e) => Message::ProcDone {
+                                    title: g.title.clone(),
+                                    result: format!("{}: {e:#}", g.title),
+                                },
+                            }
+                        },
+                        |m| m,
+                    ),
+                    None => Task::none(),
+                }
+            }
+            None => Task::none(),
+        },
+        Message::ProcCancel => {
+            state.proc_ui.pending = None;
+            Task::none()
+        }
+        Message::ProcForce(force) => {
+            state.proc_ui.force = force;
+            Task::none()
+        }
+        Message::ProcDone { title: _, result } => {
+            state.proc_ui.result = Some(result);
+            // Refresh behind the result line.
+            match state.paths.clone() {
+                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                None => Task::none(),
+            }
+        }
     }
 }
 
-pub fn subscription(_state: &State) -> Subscription<Message> {
-    iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick)
+pub fn subscription(state: &State) -> Subscription<Message> {
+    // The Processes page shows live resources; everything else keeps 5 s.
+    let secs = if state.page == Page::Processes { 2 } else { 5 };
+    iced::time::every(Duration::from_secs(secs)).map(|_| Message::Tick)
 }
 
 fn sidebar(state: &State) -> Element<'_, Message> {
@@ -117,7 +211,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Instances => crate::pages::instances::view(&state.data),
         Page::Drift => crate::pages::other::drift(),
         Page::Plugins => crate::pages::other::plugins(),
-        Page::Processes => crate::pages::other::processes(),
+        Page::Processes => crate::pages::processes::view(&state.data, &state.proc_ui),
     };
     iced::widget::row![
         sidebar(state),
