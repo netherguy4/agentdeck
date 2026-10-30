@@ -16,10 +16,6 @@ fn placeholder<'a>(title: String) -> Element<'a, Message> {
     .into()
 }
 
-pub fn drift<'a>() -> Element<'a, Message> {
-    placeholder(fl!(loader(), "drift-title"))
-}
-
 pub fn processes<'a>() -> Element<'a, Message> {
     placeholder(fl!(loader(), "processes-title"))
 }

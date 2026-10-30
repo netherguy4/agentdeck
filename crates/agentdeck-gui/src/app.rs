@@ -9,6 +9,7 @@ use iced::{Element, Length, Subscription, Task, Theme};
 use crate::data::{self, Data};
 use crate::i18n::loader;
 use crate::pages::add_instance::{self, AddMsg};
+use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +50,7 @@ pub enum Message {
     CancelPlugin,
     ConfirmPlugin,
     PluginDone(Result<String, String>),
+    Drift(drift::Message),
 }
 
 #[derive(Debug, Clone)]
@@ -66,9 +68,20 @@ pub struct RemoveAsk {
     pub working: bool,
 }
 
+fn drift_ctx(paths: &agentdeck_core::Paths) -> DriftCtx {
+    DriftCtx {
+        paths: paths.clone(),
+        home: std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default(),
+        t3_root: agentdeck_core::t3::t3_root().ok(),
+    }
+}
+
 pub struct State {
     page: Page,
     data: Data,
+    drift: drift::State,
     paths: Option<agentdeck_core::Paths>,
     add: add_instance::Wizard,
     remove: Option<RemoveAsk>,
@@ -84,6 +97,7 @@ impl State {
             Self {
                 page: Page::Instances,
                 data: Data::default(),
+                drift: drift::State::default(),
                 paths,
                 add: add_instance::Wizard::default(),
                 remove: None,
@@ -101,6 +115,7 @@ impl State {
         Self {
             page: Page::Instances,
             data,
+            drift: drift::State::default(),
             paths: Some(paths),
             add: add_instance::Wizard::default(),
             remove: None,
@@ -125,7 +140,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Tick => match state.paths.clone() {
-            Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+            Some(paths) => {
+                let drift_paths = paths.clone();
+                Task::batch([
+                    Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                    Task::perform(
+                        async move {
+                            let ctx = drift_ctx(&drift_paths);
+                            drift::load(ctx)
+                        },
+                        Message::Drift,
+                    ),
+                ])
+            }
             None => Task::none(),
         },
         Message::Loaded(data) => {
@@ -199,6 +226,12 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Noop => Task::none(),
+        Message::Drift(inner) => match state.paths.clone() {
+            Some(paths) => {
+                drift::update(&mut state.drift, drift_ctx(&paths), inner).map(Message::Drift)
+            }
+            None => Task::none(),
+        },
         Message::EnablePlugin(name) => {
             preview_plugin(state, &name, true);
             Task::none()
@@ -313,7 +346,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let content: Element<'_, Message> = match state.page {
         Page::Instances => crate::pages::instances::view(&state.data, state.remove.as_ref()),
         Page::AddInstance => crate::pages::add_instance::view(&state.add),
-        Page::Drift => crate::pages::other::drift(),
+        Page::Drift => crate::pages::drift::view(&state.drift).map(Message::Drift),
         Page::Plugins => crate::pages::plugins::view(&state.data, state.pending.as_ref()),
         Page::Processes => crate::pages::other::processes(),
     };
