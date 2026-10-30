@@ -589,6 +589,40 @@ fn legacy_hook_command(paths: &Paths, harness: &str) -> String {
     )
 }
 
+/// The hook of the standalone `~/.general/scripts/model-route`: enable replaces
+/// it everywhere it is registered, including secondary Claude accounts.
+fn standalone_hook_command(home: &Path, harness: &str) -> String {
+    format!(
+        "{} --harness {harness}",
+        home.join(".general/scripts/model-route/hook.mjs").display()
+    )
+}
+
+/// Claude settings files holding a router hook: the primary always, secondary
+/// accounts (`~/.claude-*`) when they already carry one of ours.
+fn claude_hook_targets(home: &Path, paths: &Paths, exe: &Path) -> Vec<PathBuf> {
+    let mut targets = vec![claude_settings(home)];
+    let commands = [
+        standalone_hook_command(home, "claude"),
+        legacy_hook_command(paths, "claude"),
+        hook_command(exe, "claude"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(home) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".claude-"))
+            .map(|e| e.path().join("settings.json"))
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .is_ok_and(|t| commands.iter().any(|c| t.contains(c.as_str())))
+            })
+            .collect();
+        dirs.sort();
+        targets.extend(dirs);
+    }
+    targets
+}
+
 /// Plan hook registration (files only; the old standalone copy stays
 /// untouched). Fails closed: any malformed harness file aborts the plan.
 pub fn plan_hooks_enable(
@@ -599,8 +633,7 @@ pub fn plan_hooks_enable(
 ) -> anyhow::Result<Vec<Change>> {
     let mut changes = Vec::new();
     // Claude.
-    {
-        let path = claude_settings(home);
+    for path in claude_hook_targets(home, paths, exe) {
         let (old, mut v) = read_json(&path)?;
         let changed = {
             let root = object(&mut v)?;
@@ -609,6 +642,11 @@ pub fn plan_hooks_enable(
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(hooks)?)?;
             remove_hook(list, CLAUDE_MATCHER, &legacy_hook_command(paths, "claude"));
+            remove_hook(
+                list,
+                CLAUDE_MATCHER,
+                &standalone_hook_command(home, "claude"),
+            );
             insert_hook(list, CLAUDE_MATCHER, &hook_command(exe, "claude"))
         };
         if changed {
@@ -626,6 +664,7 @@ pub fn plan_hooks_enable(
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(hooks)?)?;
             remove_hook(list, CODEX_MATCHER, &legacy_hook_command(paths, "codex"));
+            remove_hook(list, CODEX_MATCHER, &standalone_hook_command(home, "codex"));
             insert_hook(list, CODEX_MATCHER, &hook_command(exe, "codex"))
         };
         if changed {
@@ -643,6 +682,7 @@ pub fn plan_hooks_enable(
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(plugin)?)?;
             remove_hook(list, AGY_MATCHER, &legacy_hook_command(paths, "agy"));
+            remove_hook(list, AGY_MATCHER, &standalone_hook_command(home, "agy"));
             insert_hook(list, AGY_MATCHER, &hook_command(exe, "agy"))
         };
         if changed {
@@ -674,7 +714,11 @@ pub fn plan_hooks_enable(
         let text = opencode_plugin_text(exe);
         let old = std::fs::read(&path).ok();
         if old.as_deref() != Some(text.as_bytes()) {
+            let standalone = old
+                .as_deref()
+                .is_some_and(|b| String::from_utf8_lossy(b).contains("model-route/hook.mjs"));
             if old.is_some()
+                && !standalone
                 && old.as_deref() != Some(opencode_plugin_text_legacy(paths).as_bytes())
             {
                 anyhow::bail!(
@@ -682,7 +726,14 @@ pub fn plan_hooks_enable(
                     path.display()
                 );
             }
-            changes.extend(plan_write_file(path, old.as_deref(), text.as_bytes()));
+            changes.push(Change::WriteFile {
+                backup: old
+                    .is_some()
+                    .then(|| crate::changes::backup_dest(state_dir, "model-route.ts")),
+                path,
+                contents: text.into_bytes(),
+                old,
+            });
         }
     }
     Ok(changes)
@@ -696,10 +747,11 @@ pub fn plan_hooks_disable(
     state_dir: &Path,
 ) -> anyhow::Result<Vec<Change>> {
     let mut changes = Vec::new();
-    for (path, matcher, harness) in [
-        (claude_settings(home), CLAUDE_MATCHER, "claude"),
-        (codex_hooks(home), CODEX_MATCHER, "codex"),
-    ] {
+    let targets = claude_hook_targets(home, paths, exe)
+        .into_iter()
+        .map(|p| (p, CLAUDE_MATCHER, "claude"))
+        .chain([(codex_hooks(home), CODEX_MATCHER, "codex")]);
+    for (path, matcher, harness) in targets {
         let Ok((old, mut v)) = read_json(&path) else {
             continue;
         };
@@ -957,5 +1009,43 @@ mod tests {
         let changes = plan_router_files(&paths, &reg).unwrap();
         assert!(!changes.is_empty());
         assert!(!router_json_path(&paths).exists());
+    }
+
+    #[test]
+    fn enable_replaces_standalone_hooks_everywhere() {
+        let (paths, home) = test_paths("standalone");
+        let exe = home.join("agentdeck");
+        let standalone = standalone_hook_command(&home, "claude");
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": CLAUDE_MATCHER, "hooks": [{"type": "command", "command": standalone}]}
+        ]}});
+        for dir in [".claude", ".claude-second"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+            std::fs::write(home.join(dir).join("settings.json"), settings.to_string()).unwrap();
+        }
+        let plugin = opencode_plugin(&home);
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, "// spawns model-route/hook.mjs\n").unwrap();
+
+        let changes = plan_hooks_enable(&home, &paths, &exe, &paths.state_dir).unwrap();
+        crate::changes::apply_changes(&changes).unwrap();
+
+        for dir in [".claude", ".claude-second"] {
+            let text = std::fs::read_to_string(home.join(dir).join("settings.json")).unwrap();
+            assert!(!text.contains("model-route/hook.mjs"), "{dir}: {text}");
+            assert!(
+                text.contains(&hook_command(&exe, "claude")),
+                "{dir}: {text}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&plugin).unwrap(),
+            opencode_plugin_text(&exe)
+        );
+
+        let changes = plan_hooks_disable(&home, &paths, &exe, &paths.state_dir).unwrap();
+        crate::changes::apply_changes(&changes).unwrap();
+        let text = std::fs::read_to_string(home.join(".claude-second/settings.json")).unwrap();
+        assert!(!text.contains(&hook_command(&exe, "claude")), "{text}");
     }
 }

@@ -117,6 +117,12 @@ fn check_t3_slug(id: &str) -> anyhow::Result<()> {
 
 /// Desired T3 envelope for one registry instance. `main_codex_home` is the
 /// home of the registry instance id `codex` when present.
+/// T3 resolves `homePath` lexically, without expanding `~`.
+fn absolute(path: &str) -> String {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    crate::sync::expand_tilde(path, &home).display().to_string()
+}
+
 fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::Result<Value> {
     check_t3_slug(&inst.id)?;
     let driver = match inst.harness {
@@ -128,14 +134,14 @@ fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::R
     let mut config = Map::new();
     match inst.harness {
         Harness::Claude => {
-            config.insert("homePath".into(), Value::String(inst.home.clone()));
+            config.insert("homePath".into(), Value::String(absolute(&inst.home)));
             if let Some(bin) = &inst.binary {
                 config.insert("binaryPath".into(), Value::String(bin.clone()));
             }
         }
         Harness::Codex => {
             let main = main_codex_home.unwrap_or(&inst.home);
-            config.insert("homePath".into(), Value::String(main.to_string()));
+            config.insert("homePath".into(), Value::String(absolute(main)));
             if inst.home != main {
                 config.insert("shadowHomePath".into(), Value::String(inst.home.clone()));
             }
@@ -185,6 +191,20 @@ fn desired_map(reg: &Registry) -> anyhow::Result<BTreeMap<String, Value>> {
     Ok(out)
 }
 
+/// T3 keeps `homePath` absolute or empty (empty = the harness default), so an
+/// equivalent `~/` spelling from the registry must not rewrite it.
+fn same_home(old: &str, want: &Value) -> bool {
+    let Some(want) = want.as_str() else {
+        return false;
+    };
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let want = crate::sync::expand_tilde(want, &home);
+    if old.is_empty() {
+        return want == home.join(".claude") || want == home.join(".codex");
+    }
+    crate::sync::expand_tilde(old, &home) == want
+}
+
 /// Merge desired envelopes into parsed settings: only `providerInstances`
 /// entries for managed ids change, and within an existing envelope only
 /// `driver`/`displayName`/`enabled` plus our own `config` keys. Everything
@@ -204,8 +224,12 @@ pub fn merge_settings(old: &Value, desired: &BTreeMap<String, Value>) -> anyhow:
                 let obj = existing
                     .as_object_mut()
                     .ok_or_else(|| anyhow::anyhow!("providerInstances[{id:?}] is not an object"))?;
-                for key in ["driver", "displayName", "enabled"] {
+                for key in ["driver", "enabled"] {
                     obj.insert(key.into(), want[key].clone());
+                }
+                // An id-only name is what import fills in for a nameless instance.
+                if obj.contains_key("displayName") || want["displayName"].as_str() != Some(id) {
+                    obj.insert("displayName".into(), want["displayName"].clone());
                 }
                 let cfg = obj
                     .entry("config")
@@ -216,7 +240,11 @@ pub fn merge_settings(old: &Value, desired: &BTreeMap<String, Value>) -> anyhow:
                 let want_cfg = want["config"].as_object().expect("envelope has config");
                 validate_config_fields(want["driver"].as_str().unwrap_or_default(), want_cfg)?;
                 for (k, v) in want_cfg {
-                    cfg_obj.insert(k.clone(), v.clone());
+                    let unchanged = k == "homePath"
+                        && same_home(cfg_obj.get(k).and_then(Value::as_str).unwrap_or(""), v);
+                    if !unchanged {
+                        cfg_obj.insert(k.clone(), v.clone());
+                    }
                 }
             }
             None => {
@@ -379,20 +407,19 @@ pub fn sync_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result<V
     let new = merge_settings(&old, &desired)?;
     let old_pi = &old["providerInstances"];
     let mut entries = Vec::with_capacity(desired.len());
-    for (id, env) in &desired {
+    for id in desired.keys() {
         let before = old_pi.get(id).cloned();
+        let after = new["providerInstances"][id].clone();
         let action = match &before {
             None => "created",
-            Some(b) if *b == *env => "unchanged",
+            Some(b) if *b == after => "unchanged",
             _ => "updated",
         };
-        // Note: "updated" compares against the desired envelope, which only
-        // carries our own keys; the merge keeps the instance's other fields.
         entries.push(SyncEntry {
             id: id.clone(),
             action,
             before,
-            after: env.clone(),
+            after,
         });
     }
     if new != old && !dry_run {
@@ -1303,5 +1330,23 @@ mod tests {
         assert!(!paths.backup_dir().exists());
         assert!(reenable(&paths, &t3, "nope", &re_opts(2)).is_err());
         assert!(reenable(&paths, &t3, "nope", &opts).is_err());
+    }
+
+    #[test]
+    fn home_spelling_and_id_names_do_not_rewrite_settings() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let old = serde_json::json!({"providerInstances": {
+            "codex": {"driver": "codex", "enabled": true, "config": {"homePath": "", "binaryPath": "codex"}},
+            "two": {"driver": "codex", "enabled": true, "config": {"homePath": format!("{home}/.codex")}},
+        }});
+        let want = |id: &str| {
+            serde_json::json!({"driver": "codex", "displayName": id, "enabled": true,
+                "config": {"homePath": "~/.codex"}})
+        };
+        let desired = BTreeMap::from([
+            ("codex".to_string(), want("codex")),
+            ("two".to_string(), want("two")),
+        ]);
+        assert_eq!(merge_settings(&old, &desired).unwrap(), old);
     }
 }
