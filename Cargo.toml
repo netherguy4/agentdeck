@@ -9,9 +9,8 @@ rust-version = "1.93"
 
 [workspace]
 members = [".", "crates/*"]
-default-members = [".", "crates/*"]
-# The COSMIC applet builds on its own (libcosmic); M2 decides how it joins the workspace.
-exclude = ["cosmic"]
+# libcosmic is heavy: the applet builds in its own CI job, not in the default gates.
+default-members = [".", "crates/agentdeck", "crates/agentdeck-core", "crates/agentdeck-usage", "crates/agent-process"]
 resolver = "2"
 
 [dependencies]

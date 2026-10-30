@@ -65,3 +65,22 @@ jobs:
 
       - name: Check
         run: cargo check --all-targets --locked
+
+  applet:
+    name: Check COSMIC applet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install libcosmic system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+
+      - name: Check applet
+        run: cargo check -p agentdeck-applet --locked
