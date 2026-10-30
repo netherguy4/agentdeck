@@ -1,12 +1,13 @@
 //! One row per registry instance: identity, T3 health, quota bars.
 
 use i18n_embed_fl::fl;
-use iced::widget::{Space, button, column, progress_bar, text};
+use iced::widget::{button, column};
 use iced::{Element, Length};
 
 use crate::app::{Message, Page, RemoveAsk};
-use crate::data::{Data, UsageQuotas};
+use crate::data::{Data, QuotaBar, UsageQuotas};
 use crate::i18n::loader;
+use crate::style as st;
 
 fn account_status(status: &str) -> String {
     match status {
@@ -18,31 +19,94 @@ fn account_status(status: &str) -> String {
     }
 }
 
+/// "resets in 2h 15m" / "resets in 40m"; the countdown math lives in data.
+fn reset_label(mins: i64) -> String {
+    if mins >= 60 {
+        let h: i64 = mins / 60;
+        let m: i64 = mins % 60;
+        fl!(loader(), "quota-in-hours", h = h, m = m)
+    } else {
+        fl!(loader(), "quota-in-mins", m = mins.max(0))
+    }
+}
+
+fn quota_row(bar: &QuotaBar) -> Element<'_, Message> {
+    // Window labels stay as the provider data gives them; the scope marks a
+    // per-model window so it is not confused with the shared one.
+    let label = match &bar.scope {
+        Some(scope) => format!("{} · {scope}", bar.label),
+        None => bar.label.clone(),
+    };
+    let mut row = iced::widget::row![
+        st::muted(label).width(150),
+        st::quota_bar(bar.used_percent as f32).length(Length::Fill),
+        st::body(format!("{:.0}%", bar.used_percent)).width(44),
+    ]
+    .spacing(st::SPACE_S);
+    if let Some(mins) = bar.resets_in_mins {
+        row = row.push(st::muted(reset_label(mins)));
+    }
+    row.into()
+}
+
 fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {
-    let mut col = column![text(&u.display).size(14)].spacing(4);
+    // Account header carries the name plus status; window labels belong to
+    // the bar rows below, not mixed into this line.
+    let mut col = column![].spacing(st::SPACE_XS);
+    let header = if u.status.is_empty() {
+        u.display.clone()
+    } else {
+        format!("{} · {}", u.display, account_status(&u.status))
+    };
+    col = col.push(st::body(header));
     if u.bars.is_empty() {
         match &u.error {
-            Some(error) => col = col.push(text(error).size(12)),
-            None => col = col.push(text(fl!(loader(), "quotas-no-data")).size(12)),
+            Some(error) => col = col.push(st::muted(error.clone())),
+            None => col = col.push(st::muted(fl!(loader(), "quotas-no-data"))),
         }
     } else {
-        if !u.status.is_empty() {
-            col = col.push(text(account_status(&u.status)).size(12));
-        }
         for bar in &u.bars {
-            let label = match &bar.scope {
-                Some(scope) => format!("{} · {scope}", bar.label),
-                None => bar.label.clone(),
-            };
-            col = col.push(
-                iced::widget::row![
-                    text(label).size(12).width(160),
-                    progress_bar(0.0..=100.0, bar.used_percent as f32).length(Length::Fill),
-                    text(format!("{:.0}%", bar.used_percent)).size(12).width(44),
-                ]
-                .spacing(8),
-            );
+            col = col.push(quota_row(bar));
         }
+    }
+    col.into()
+}
+
+fn instance_row(inst: &crate::data::InstanceRow) -> Element<'_, Message> {
+    // Name and status share the headline; identity details stay muted below.
+    let state = if inst.enabled {
+        fl!(loader(), "status-enabled")
+    } else {
+        fl!(loader(), "status-disabled")
+    };
+    let t3 = match &inst.t3 {
+        Some(info) => {
+            let mut line = format!(
+                "{} {}",
+                fl!(loader(), "t3-label"),
+                info.status.as_deref().unwrap_or("—")
+            );
+            if let Some(n) = info.threads {
+                line.push_str(&format!(" · {}", fl!(loader(), "threads-count", count = n)));
+            }
+            line
+        }
+        None => fl!(loader(), "t3-unavailable"),
+    };
+    let mut col = column![
+        iced::widget::row![
+            st::heading(inst.display_name.clone()),
+            st::muted(state),
+            button(st::body(fl!(loader(), "instances-remove")))
+                .style(button::secondary)
+                .on_press(Message::RemoveAsk(inst.id.clone())),
+        ]
+        .spacing(st::SPACE_S),
+        st::muted(format!("{} · {} · {t3}", inst.id, inst.harness)),
+    ]
+    .spacing(st::SPACE_XS);
+    for u in &inst.quotas {
+        col = col.push(quotas_view(u));
     }
     col.into()
 }
@@ -50,65 +114,31 @@ fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {
 pub fn view<'a>(data: &'a Data, remove: Option<&'a RemoveAsk>) -> Element<'a, Message> {
     let mut col = column![
         iced::widget::row![
-            text(fl!(loader(), "instances-title")).size(22),
-            button(text(fl!(loader(), "instances-add")).size(13))
+            st::title(fl!(loader(), "instances-title")),
+            button(st::body(fl!(loader(), "instances-add")))
                 .style(button::secondary)
                 .on_press(Message::SelectPage(Page::AddInstance)),
         ]
-        .spacing(12),
+        .spacing(st::SPACE_M),
     ]
-    .spacing(12);
+    .spacing(st::SPACE_M);
     if let Some(error) = &data.error {
-        col = col.push(text(fl!(loader(), "load-error", what = error)).size(13));
+        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
     if data.instances.is_empty() {
-        col = col.push(text(fl!(loader(), "instances-empty")).size(13));
+        col = col.push(st::muted(fl!(loader(), "instances-empty")));
     }
-    for inst in &data.instances {
-        let state = if inst.enabled {
-            fl!(loader(), "status-enabled")
-        } else {
-            fl!(loader(), "status-disabled")
-        };
-        let t3 = match &inst.t3 {
-            Some(info) => {
-                let mut line = format!(
-                    "{} {}",
-                    fl!(loader(), "t3-label"),
-                    info.status.as_deref().unwrap_or("—")
-                );
-                if let Some(n) = info.threads {
-                    line.push_str(&format!(" · {}", fl!(loader(), "threads-count", count = n)));
-                }
-                line
-            }
-            None => fl!(loader(), "t3-unavailable"),
-        };
-        let mut card = column![
-            iced::widget::row![
-                text(&inst.display_name).size(16),
-                text(&inst.id).size(12),
-                text(&inst.harness).size(12),
-                text(state).size(12),
-                button(text(fl!(loader(), "instances-remove")).size(12))
-                    .style(button::secondary)
-                    .on_press(Message::RemoveAsk(inst.id.clone())),
-            ]
-            .spacing(8),
-            text(t3).size(12),
-        ]
-        .spacing(4);
-        if !inst.quotas.is_empty() {
-            card = card.push(text(fl!(loader(), "instances-quotas")).size(13));
-            for u in &inst.quotas {
-                card = card.push(quotas_view(u));
-            }
+    for (i, inst) in data.instances.iter().enumerate() {
+        if i > 0 {
+            col = col.push(st::divider());
         }
-        col = col.push(card);
-        col = col.push(Space::new().height(Length::Fixed(8.0)));
+        col = col.push(instance_row(inst));
     }
     if !data.standalone.is_empty() {
-        col = col.push(text(fl!(loader(), "instances-standalone")).size(16));
+        if !data.instances.is_empty() {
+            col = col.push(st::divider());
+        }
+        col = col.push(st::heading(fl!(loader(), "instances-standalone")));
         for u in &data.standalone {
             col = col.push(quotas_view(u));
         }
@@ -120,25 +150,27 @@ pub fn view<'a>(data: &'a Data, remove: Option<&'a RemoveAsk>) -> Element<'a, Me
 }
 
 fn remove_panel(ask: &RemoveAsk) -> Element<'_, Message> {
-    let mut col =
-        column![text(fl!(loader(), "remove-ask", id = ask.id.clone())).size(16)].spacing(6);
+    let mut lines: Vec<Element<'_, Message>> = Vec::new();
     if let Some(n) = ask.threads.filter(|&n| n > 0) {
-        col = col.push(text(fl!(loader(), "remove-threads", count = n)).size(12));
+        lines.push(st::muted(fl!(loader(), "remove-threads", count = n)).into());
     }
-    col = col.push(text(fl!(loader(), "remove-keep-home")).size(12));
+    lines.push(st::muted(fl!(loader(), "remove-keep-home")).into());
     if let Some(error) = &ask.error {
-        col = col.push(text(fl!(loader(), "load-error", what = error)).size(12));
+        lines.push(st::muted(fl!(loader(), "load-error", what = error)).into());
     }
-    col = col.push(
-        iced::widget::row![
-            button(text(fl!(loader(), "remove-confirm")).size(13))
-                .style(button::primary)
-                .on_press_maybe((!ask.working).then_some(Message::RemoveConfirm)),
-            button(text(fl!(loader(), "remove-cancel")).size(13))
+    st::panel(
+        fl!(loader(), "remove-ask", id = ask.id.clone()),
+        lines,
+        vec![
+            // Destructive: the only danger button on this page.
+            button(st::body(fl!(loader(), "remove-confirm")))
+                .style(button::danger)
+                .on_press_maybe((!ask.working).then_some(Message::RemoveConfirm))
+                .into(),
+            button(st::body(fl!(loader(), "remove-cancel")))
                 .style(button::secondary)
-                .on_press(Message::RemoveCancel),
-        ]
-        .spacing(8),
-    );
-    col.into()
+                .on_press(Message::RemoveCancel)
+                .into(),
+        ],
+    )
 }

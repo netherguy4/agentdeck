@@ -31,6 +31,8 @@ account-ok = ок
 account-stale = устаревшие
 account-error = ошибка
 account-waiting = ожидание
+quota-in-hours = сброс через { $h } ч { $m } мин
+quota-in-mins = сброс через { $m } мин
 
 drift-title = Расхождения
 drift-no-drift = Расхождений нет.

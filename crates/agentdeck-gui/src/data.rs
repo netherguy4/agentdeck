@@ -34,6 +34,8 @@ pub struct QuotaBar {
     pub label: String,
     pub used_percent: f64,
     pub scope: Option<String>,
+    /// Whole minutes until the window resets, when the provider reports it.
+    pub resets_in_mins: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,6 +75,21 @@ pub struct Data {
     pub processes: Vec<processes::SessionGroup>,
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Whole minutes until `resets_at`, or `None` when already past / unknown.
+fn resets_in_mins(now: i64, resets_at: Option<i64>) -> Option<i64> {
+    resets_at.and_then(|t| {
+        let mins = (t - now).div_euclid(60);
+        (mins > 0).then_some(mins)
+    })
+}
+
 fn quotas_for(
     usage_id: &str,
     display: &str,
@@ -82,6 +99,7 @@ fn quotas_for(
     let account = accounts
         .iter()
         .find(|a| a.id == usage_id && a.provider == kind);
+    let now = now_secs();
     UsageQuotas {
         usage_id: usage_id.to_string(),
         display: display.to_string(),
@@ -95,6 +113,7 @@ fn quotas_for(
                         label: w.label.clone(),
                         used_percent: w.used_percent,
                         scope: w.scope.clone(),
+                        resets_in_mins: resets_in_mins(now, w.resets_at),
                     })
                     .collect()
             })
@@ -172,4 +191,21 @@ pub fn load(paths: &Paths) -> Data {
     // Read-only /proc snapshot; gaps become dashes, never an error.
     data.processes = processes::snapshot().groups;
     data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resets_in_mins;
+
+    #[test]
+    fn reset_countdown_rounds_down_and_ignores_the_past() {
+        assert_eq!(
+            resets_in_mins(1_000, Some(1_000 + 2 * 3_600 + 15 * 60)),
+            Some(135)
+        );
+        assert_eq!(resets_in_mins(1_000, Some(1_000 + 40 * 60)), Some(40));
+        assert_eq!(resets_in_mins(1_000, Some(1_000)), None);
+        assert_eq!(resets_in_mins(1_000, Some(999)), None);
+        assert_eq!(resets_in_mins(1_000, None), None);
+    }
 }

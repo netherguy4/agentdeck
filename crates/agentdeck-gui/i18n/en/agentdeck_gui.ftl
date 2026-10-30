@@ -29,6 +29,8 @@ account-ok = ok
 account-stale = stale
 account-error = error
 account-waiting = waiting
+quota-in-hours = resets in { $h }h { $m }m
+quota-in-mins = resets in { $m }m
 
 drift-title = Drift
 drift-no-drift = No drift.

@@ -11,6 +11,7 @@ use crate::i18n::loader;
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
+use crate::style as st;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
@@ -420,20 +421,19 @@ pub fn subscription(state: &State) -> Subscription<Message> {
 }
 
 fn sidebar(state: &State) -> Element<'_, Message> {
-    let mut col = column![].spacing(4).width(180);
+    // Light sidebar: plain text buttons, the selected page in accent fill.
+    let mut col = column![].spacing(st::SPACE_XS).width(st::SIDEBAR_WIDTH);
     for page in [Page::Instances, Page::Drift, Page::Plugins, Page::Processes] {
-        // The default button style is the accent fill, so non-selected pages
-        // need the quiet variant explicitly.
-        let mut btn = button(text(page.label()).size(14))
+        let mut btn = button(text(page.label()).size(st::BODY).width(Length::Fill))
             .width(Length::Fill)
-            .style(button::secondary)
+            .style(button::text)
             .on_press(Message::SelectPage(page));
         if state.page == page {
             btn = btn.style(button::primary);
         }
         col = col.push(btn);
     }
-    container(col).padding(16).into()
+    container(col).padding(st::SPACE_L).into()
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
@@ -446,7 +446,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     };
     iced::widget::row![
         sidebar(state),
-        scrollable(container(content).padding(20)).width(Length::Fill),
+        scrollable(container(content).padding(st::SPACE_L)).width(Length::Fill),
     ]
     .into()
 }
