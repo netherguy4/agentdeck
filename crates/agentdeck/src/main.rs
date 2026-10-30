@@ -4,8 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod cmd_claude;
 mod cmd_codex;
 mod cmd_daemon;
+mod cmd_harness;
 mod cmd_login;
 mod cmd_migrate;
+mod cmd_opencode;
 mod cmd_plugin;
 mod cmd_pool;
 mod cmd_ps;
@@ -50,6 +52,16 @@ enum Cmd {
     Codex {
         #[command(subcommand)]
         cmd: cmd_codex::CodexCmd,
+    },
+    /// Show OpenCode accounts and switch the active one.
+    Opencode {
+        #[command(subcommand)]
+        cmd: cmd_opencode::OpencodeCmd,
+    },
+    /// Detect harness binaries and run their official updaters/installers.
+    Harness {
+        #[command(subcommand)]
+        cmd: cmd_harness::HarnessCmd,
     },
     /// T3 integration: status, sync and import of providerInstances.
     T3 {
@@ -248,6 +260,8 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         } => cmd_login::run(paths, &id, device_auth, open)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
+        Cmd::Opencode { cmd } => cmd_opencode::run(&cmd)?,
+        Cmd::Harness { cmd } => cmd_harness::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(paths, cmd)?,
         Cmd::Migrate { cmd } => cmd_migrate::run(paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {

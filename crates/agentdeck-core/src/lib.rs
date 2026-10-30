@@ -1,9 +1,12 @@
 //! Registry and harness adapters shared by the agentdeck CLI, GUI and daemon.
 
+pub mod agy;
 pub mod changes;
 pub mod claude;
 pub mod codex;
+pub mod harness;
 pub mod login;
+pub mod opencode;
 pub mod paths;
 pub mod plugins;
 pub mod pool;

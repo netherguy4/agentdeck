@@ -13,6 +13,11 @@ pub fn run(paths: &Paths, id: &str, device_auth: bool, open: bool) -> anyhow::Re
     let inst = reg
         .get(id)
         .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?;
+    if inst.harness == Harness::Agy {
+        // No login CLI exists; the IDE sign-in is the only path.
+        println!("{id}: {}", agentdeck_core::agy::LOGIN_HINT);
+        return Ok(());
+    }
     if device_auth && inst.harness != Harness::Codex {
         anyhow::bail!("--device-auth is only supported for codex instances");
     }
