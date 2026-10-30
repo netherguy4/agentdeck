@@ -204,6 +204,8 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os();
     let argv0 = args.next().unwrap_or_default();
     if std::path::Path::new(&argv0).file_name() == Some("agent-process".as_ref()) {
+        // SAFETY: single-threaded here; `| head` ends the listing quietly, as in the shell original.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
         std::process::exit(agent_process::main(args.collect()));
     }
     // Installed as a symlink named `claude-t3-shell`, the binary is the T3
