@@ -573,6 +573,274 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
     Ok(found)
 }
 
+/// Outcome of [`reenable`]. Exit codes map as 0 = Recovered or DryRun,
+/// 1 = FailedAgain, 2 = Timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReenableOutcome {
+    Recovered,
+    FailedAgain,
+    Timeout,
+    DryRun,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReenableOpts {
+    /// Stage-2 deadline in seconds: wait for a fresh probe after writing
+    /// `enabled = true` (E2: 20 s probe + watch/cache margin; default 30).
+    pub timeout_secs: u64,
+    /// Skip the enabled-and-ready refusal.
+    pub force: bool,
+    /// Validate and report only; write nothing.
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReenableReport {
+    pub outcome: ReenableOutcome,
+    /// Settings writes plus every observed cache transition, in order.
+    pub events: Vec<String>,
+    /// Final line for the CLI: recovered / failed again / timeout / dry-run.
+    pub final_line: String,
+}
+
+/// Full cache snapshot for the toggle protocol (E2 §4-5): T3 writes
+/// `enabled`, `status`, `checkedAt` (and a `message` on failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheState {
+    enabled: Option<bool>,
+    status: Option<String>,
+    checked_at: Option<String>,
+    message: Option<String>,
+}
+
+fn read_cache_state(t3_root: &Path, id: &str) -> Option<CacheState> {
+    let raw = fs::read(caches_dir(t3_root).join(format!("{id}.json"))).ok()?;
+    let v: Value = serde_json::from_slice(&raw).ok()?;
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(CacheState {
+        enabled: v.get("enabled").and_then(Value::as_bool),
+        status: text("status"),
+        checked_at: text("checkedAt"),
+        message: text("message"),
+    })
+}
+
+fn cache_line(id: &str, s: &CacheState) -> String {
+    format!(
+        "cache: {id} enabled={} status={} checkedAt={}",
+        s.enabled.map_or("?".to_string(), |b| b.to_string()),
+        s.status.as_deref().unwrap_or("?"),
+        s.checked_at.as_deref().unwrap_or("?"),
+    )
+}
+
+/// Re-read settings, set only `providerInstances[id].enabled` (plus a
+/// conflicting legacy nested `config.enabled`, which would also force the
+/// instance off), then backup + atomic-write + verify. Other instances and
+/// fields are preserved verbatim. Returns whether the file changed.
+fn set_instance_enabled(
+    t3_root: &Path,
+    backup_dir: &Path,
+    id: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    check_t3_slug(id)?;
+    let raw = fs::read(settings_file(t3_root))
+        .map_err(|e| anyhow::anyhow!("cannot read settings.json: {e}"))?;
+    let indent = detect_indent(&String::from_utf8_lossy(&raw));
+    let old = parse_settings_strict(&raw)?;
+    let mut new = old.clone();
+    let pi = new
+        .get_mut("providerInstances")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("settings.json has no providerInstances object"))?;
+    let env = pi
+        .get_mut(id)
+        .ok_or_else(|| anyhow::anyhow!("unknown T3 instance {id:?}"))?;
+    let obj = env
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("providerInstances[{id:?}] is not an object"))?;
+    obj.insert("enabled".into(), Value::Bool(enabled));
+    if let Some(cfg) = obj.get_mut("config").and_then(|v| v.as_object_mut())
+        && cfg.get("enabled").and_then(Value::as_bool) == Some(!enabled)
+    {
+        cfg.insert("enabled".into(), Value::Bool(enabled));
+    }
+    if new == old {
+        return Ok(false);
+    }
+    write_settings_verified(t3_root, &new, &indent, backup_dir)?;
+    Ok(true)
+}
+
+/// Poll `caches/<id>.json` every 100 ms until `accept` matches or the
+/// deadline passes. Every observed state change is pushed to `events`.
+fn poll_cache(
+    t3_root: &Path,
+    id: &str,
+    deadline: std::time::Instant,
+    events: &mut Vec<String>,
+    last: &mut Option<CacheState>,
+    accept: impl Fn(&CacheState) -> bool,
+) -> Option<CacheState> {
+    loop {
+        if let Some(state) = read_cache_state(t3_root, id) {
+            if last.as_ref() != Some(&state) {
+                events.push(cache_line(id, &state));
+                *last = Some(state.clone());
+            }
+            if accept(&state) {
+                return Some(state);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Re-enable a failed instance with the false→observe→true toggle (E2 §6):
+/// write `enabled = false`, wait up to 5 s for a fresh disabled cache result
+/// (proves T3 saw the write despite its 100 ms settings debounce), re-read
+/// and write `enabled = true`, then wait up to `timeout_secs` for a fresh
+/// probe newer than the disabled acknowledgement. Refuses when the instance
+/// is enabled and its cache says ready (nothing to do) unless forced.
+pub fn reenable(
+    paths: &Paths,
+    t3_root: &Path,
+    id: &str,
+    opts: &ReenableOpts,
+) -> anyhow::Result<ReenableReport> {
+    use std::time::{Duration, Instant};
+    check_t3_slug(id)?;
+    if opts.timeout_secs == 0 {
+        anyhow::bail!("timeout-secs must be at least 1");
+    }
+    let mut events = Vec::new();
+    let raw = fs::read(settings_file(t3_root))
+        .map_err(|e| anyhow::anyhow!("cannot read settings.json: {e}"))?;
+    let settings = parse_settings_strict(&raw)?;
+    let env = settings
+        .get("providerInstances")
+        .and_then(|v| v.as_object())
+        .and_then(|pi| pi.get(id))
+        .ok_or_else(|| anyhow::anyhow!("unknown T3 instance {id:?}"))?;
+    let enabled_now = env.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let pre = read_cache_state(t3_root, id);
+    if enabled_now
+        && !opts.force
+        && pre
+            .as_ref()
+            .is_some_and(|s| s.status.as_deref() == Some("ready"))
+    {
+        anyhow::bail!("nothing to do: {id:?} is enabled and its cache says ready (use --force)");
+    }
+    if opts.dry_run {
+        return Ok(ReenableReport {
+            outcome: ReenableOutcome::DryRun,
+            events,
+            final_line: format!(
+                "dry-run: would set {id:?} enabled=false, wait for a fresh disabled cache, set enabled=true, wait up to {}s; settings.json unchanged",
+                opts.timeout_secs
+            ),
+        });
+    }
+    // Stage 1: false, then wait for acknowledgement (5 s deadline per E2).
+    let mut last = pre.clone();
+    if set_instance_enabled(t3_root, &paths.backup_dir(), id, false)? {
+        events.push(format!("settings: {id} enabled=false"));
+    } else {
+        events.push(format!("settings: {id} already enabled=false"));
+    }
+    let baseline = pre.as_ref().and_then(|s| s.checked_at.clone());
+    let already_acked = !enabled_now
+        && pre
+            .as_ref()
+            .is_some_and(|s| s.enabled == Some(false) && s.status.as_deref() == Some("disabled"));
+    let ack = if already_acked {
+        pre.clone().expect("already_acked implies cache present")
+    } else {
+        match poll_cache(
+            t3_root,
+            id,
+            Instant::now() + Duration::from_secs(5),
+            &mut events,
+            &mut last,
+            |s| {
+                s.enabled == Some(false)
+                    && s.status.as_deref() == Some("disabled")
+                    && s.checked_at != baseline
+            },
+        ) {
+            Some(s) => s,
+            None => {
+                return Ok(ReenableReport {
+                    outcome: ReenableOutcome::Timeout,
+                    events,
+                    final_line: format!(
+                        "{id}: timeout: no fresh disabled cache; settings enabled=false, runtime recovery unverified"
+                    ),
+                });
+            }
+        }
+    };
+    // Stage 2: true, then wait for a fresh probe newer than the ack.
+    let ack_ts = ack.checked_at.clone();
+    set_instance_enabled(t3_root, &paths.backup_dir(), id, true)?;
+    events.push(format!("settings: {id} enabled=true"));
+    let fresh_terminal = poll_cache(
+        t3_root,
+        id,
+        Instant::now() + Duration::from_secs(opts.timeout_secs),
+        &mut events,
+        &mut last,
+        |s| {
+            let fresh = s.checked_at != ack_ts
+                || (ack_ts.is_none()
+                    && s.enabled == Some(true)
+                    && matches!(
+                        s.status.as_deref(),
+                        Some("ready" | "error" | "disabled" | "unavailable")
+                    ));
+            fresh
+                && matches!(
+                    s.status.as_deref(),
+                    Some("ready" | "error" | "disabled" | "unavailable")
+                )
+        },
+    );
+    match fresh_terminal {
+        Some(s) if s.status.as_deref() == Some("ready") && s.enabled != Some(false) => {
+            Ok(ReenableReport {
+                outcome: ReenableOutcome::Recovered,
+                events,
+                final_line: format!(
+                    "{id}: recovered: ready @ {}",
+                    s.checked_at.as_deref().unwrap_or("?")
+                ),
+            })
+        }
+        Some(s) => {
+            let msg = s
+                .message
+                .clone()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| s.status.clone().unwrap_or_else(|| "unknown".into()));
+            Ok(ReenableReport {
+                outcome: ReenableOutcome::FailedAgain,
+                events,
+                final_line: format!("{id}: failed again: {msg}"),
+            })
+        }
+        None => Ok(ReenableReport {
+            outcome: ReenableOutcome::Timeout,
+            events,
+            final_line: format!("{id}: timeout: settings updated, runtime recovery unverified"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +1062,234 @@ mod tests {
         assert!(sync_t3(&paths, &t3, false).is_err());
         assert!(t3_status(&paths, &t3).is_err());
         assert!(import_t3(&paths, &t3, false).is_err());
+    }
+
+    // --- reenable: fake T3 thread reacting to settings writes with cache files.
+
+    const RE_SETTINGS: &str = r##"{
+  "favorites": [],
+  "providerHealthRefreshInterval": 300000,
+  "customTop": {
+    "keep": [
+      1,
+      2,
+      3
+    ]
+  },
+  "providerInstances": {
+    "broken": {
+      "driver": "codex",
+      "displayName": "Broken",
+      "enabled": true,
+      "accentColor": "#abcdef",
+      "config": {
+        "binaryPath": "codex",
+        "homePath": "/main/.codex",
+        "shadowHomePath": "/broken/.codex"
+      },
+      "environment": [
+        {
+          "name": "S",
+          "value": "x",
+          "sensitive": true
+        }
+      ]
+    },
+    "other": {
+      "driver": "claudeAgent",
+      "displayName": "Other",
+      "enabled": true,
+      "config": {
+        "binaryPath": "claude",
+        "homePath": "/other/.claude"
+      }
+    }
+  }
+}
+"##;
+
+    #[derive(Clone, Copy)]
+    enum FakeBehavior {
+        Recover,
+        Fail,
+        Silent,
+    }
+
+    /// Fake T3: watches settings.json; on an `enabled` transition of `id`,
+    /// writes a disabled cache for false, and per behavior a ready / error
+    /// cache (or nothing) for true. First observation never writes.
+    fn spawn_fake(
+        t3: PathBuf,
+        id: &str,
+        behavior: FakeBehavior,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        use std::sync::atomic::Ordering;
+        let (t3, id) = (t3, id.to_string());
+        std::thread::spawn(move || {
+            let mut n: u64 = 0;
+            let mut last: Option<bool> = None;
+            while !stop.load(Ordering::SeqCst) {
+                let enabled = fs::read(t3.join("userdata/settings.json"))
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                    .and_then(|v| {
+                        v.get("providerInstances")?
+                            .get(&id)?
+                            .get("enabled")?
+                            .as_bool()
+                    });
+                if let Some(en) = enabled {
+                    match last {
+                        None => last = Some(en),
+                        Some(prev) if prev != en => {
+                            last = Some(en);
+                            n += 1;
+                            let body = if !en {
+                                format!(
+                                    r#"{{"enabled": false, "status": "disabled", "checkedAt": "test-{n}", "models": []}}"#
+                                )
+                            } else {
+                                match behavior {
+                                    FakeBehavior::Recover => format!(
+                                        r#"{{"enabled": true, "status": "ready", "checkedAt": "test-{n}", "models": []}}"#
+                                    ),
+                                    FakeBehavior::Fail => format!(
+                                        r#"{{"enabled": true, "status": "error", "checkedAt": "test-{n}", "message": "boom: auth failed", "models": []}}"#
+                                    ),
+                                    FakeBehavior::Silent => String::new(),
+                                }
+                            };
+                            if !body.is_empty() {
+                                let _ = fs::write(t3.join(format!("caches/{id}.json")), body);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    }
+
+    fn re_opts(timeout_secs: u64) -> ReenableOpts {
+        ReenableOpts {
+            timeout_secs,
+            force: false,
+            dry_run: false,
+        }
+    }
+
+    fn stop_fake(
+        stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        h: std::thread::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::Ordering;
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn reenable_recovered_roundtrip_is_byte_identical() {
+        let (paths, t3, _g) = setup("re-ok", RE_SETTINGS);
+        let before = fs::read(settings_file(&t3)).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let h = spawn_fake(t3.clone(), "broken", FakeBehavior::Recover, stop.clone());
+        let r = reenable(&paths, &t3, "broken", &re_opts(10)).unwrap();
+        stop_fake(&stop, h);
+        assert_eq!(r.outcome, ReenableOutcome::Recovered);
+        assert!(r.final_line.contains("recovered"), "{}", r.final_line);
+        assert!(r.events.iter().any(|e| e.contains("enabled=false")));
+        assert!(r.events.iter().any(|e| e.contains("enabled=true")));
+        // Full toggle restores the file byte-for-byte: nothing else touched.
+        assert_eq!(fs::read(settings_file(&t3)).unwrap(), before);
+        let v: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(
+            v["providerInstances"]["other"]["config"]["homePath"],
+            "/other/.claude"
+        );
+        assert_eq!(v["customTop"]["keep"], serde_json::json!([1, 2, 3]));
+        // Both writes were backed up.
+        assert!(fs::read_dir(paths.backup_dir()).unwrap().count() >= 2);
+    }
+
+    #[test]
+    fn reenable_failed_again_reports_message() {
+        let (paths, t3, _g) = setup("re-fail", RE_SETTINGS);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let h = spawn_fake(t3.clone(), "broken", FakeBehavior::Fail, stop.clone());
+        let r = reenable(&paths, &t3, "broken", &re_opts(10)).unwrap();
+        stop_fake(&stop, h);
+        assert_eq!(r.outcome, ReenableOutcome::FailedAgain);
+        assert!(r.final_line.contains("failed again"), "{}", r.final_line);
+        assert!(
+            r.final_line.contains("boom: auth failed"),
+            "{}",
+            r.final_line
+        );
+        // Settings still end enabled (the true write landed).
+        let v: Value = serde_json::from_slice(&fs::read(settings_file(&t3)).unwrap()).unwrap();
+        assert_eq!(
+            v["providerInstances"]["broken"]["enabled"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn reenable_timeout_when_no_fresh_probe() {
+        let (paths, t3, _g) = setup("re-timeout", RE_SETTINGS);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let h = spawn_fake(t3.clone(), "broken", FakeBehavior::Silent, stop.clone());
+        let r = reenable(&paths, &t3, "broken", &re_opts(1)).unwrap();
+        stop_fake(&stop, h);
+        assert_eq!(r.outcome, ReenableOutcome::Timeout);
+        assert!(r.final_line.contains("timeout"), "{}", r.final_line);
+        assert!(
+            r.final_line.contains("settings updated"),
+            "{}",
+            r.final_line
+        );
+        let v: Value = serde_json::from_slice(&fs::read(settings_file(&t3)).unwrap()).unwrap();
+        assert_eq!(
+            v["providerInstances"]["broken"]["enabled"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn reenable_refuses_enabled_and_ready_unless_forced() {
+        let (paths, t3, _g) = setup("re-refuse", RE_SETTINGS);
+        fs::write(
+            t3.join("caches/broken.json"),
+            r#"{"enabled": true, "status": "ready", "checkedAt": "t0", "models": []}"#,
+        )
+        .unwrap();
+        let before = fs::read(settings_file(&t3)).unwrap();
+        let err = reenable(&paths, &t3, "broken", &re_opts(2)).unwrap_err();
+        assert!(err.to_string().contains("nothing to do"), "{err}");
+        assert_eq!(fs::read(settings_file(&t3)).unwrap(), before);
+        // Forced: the toggle runs against the fake and recovers.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let h = spawn_fake(t3.clone(), "broken", FakeBehavior::Recover, stop.clone());
+        let mut opts = re_opts(10);
+        opts.force = true;
+        let r = reenable(&paths, &t3, "broken", &opts).unwrap();
+        stop_fake(&stop, h);
+        assert_eq!(r.outcome, ReenableOutcome::Recovered);
+    }
+
+    #[test]
+    fn reenable_dry_run_and_unknown_id_write_nothing() {
+        let (paths, t3, _g) = setup("re-dry", RE_SETTINGS);
+        let before = fs::read(settings_file(&t3)).unwrap();
+        let mut opts = re_opts(2);
+        opts.dry_run = true;
+        let r = reenable(&paths, &t3, "broken", &opts).unwrap();
+        assert_eq!(r.outcome, ReenableOutcome::DryRun);
+        assert!(r.final_line.contains("dry-run"), "{}", r.final_line);
+        assert_eq!(fs::read(settings_file(&t3)).unwrap(), before);
+        assert!(!paths.backup_dir().exists());
+        assert!(reenable(&paths, &t3, "nope", &re_opts(2)).is_err());
+        assert!(reenable(&paths, &t3, "nope", &opts).is_err());
     }
 }
