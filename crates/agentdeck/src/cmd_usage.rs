@@ -1,5 +1,6 @@
 use agentdeck_core::Paths;
 use agentdeck_core::usage::{self, UsageEntry, UsageKind};
+use agentdeck_usage::daemon;
 use clap::{Subcommand, ValueEnum};
 
 #[derive(Subcommand)]
@@ -28,8 +29,6 @@ pub enum UsageCmd {
         #[arg(long)]
         api_key_env: Option<String>,
         #[arg(long)]
-        api_key_file: Option<String>,
-        #[arg(long)]
         db_file: Option<String>,
         #[arg(long)]
         dry_run: bool,
@@ -39,6 +38,19 @@ pub enum UsageCmd {
         id: String,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Run one polling cycle (refuses while the daemon holds the lock).
+    Once {
+        /// Also write the old ai-usage state paths. Off by default.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        compat_write_ai_usage: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show sources, backoff ages and state freshness. Read-only, no network.
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -69,7 +81,7 @@ fn opt(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.is_empty())
 }
 
-pub fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
+pub async fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
     match cmd {
         UsageCmd::Accounts { json } => {
             let reg = agentdeck_core::Registry::load(paths)?;
@@ -91,7 +103,6 @@ pub fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
             codex_home,
             token_file,
             api_key_env,
-            api_key_file,
             db_file,
             dry_run,
         } => {
@@ -104,7 +115,6 @@ pub fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 codex_home: opt(codex_home),
                 token_file: opt(token_file),
                 api_key_env: opt(api_key_env),
-                api_key_file: opt(api_key_file),
                 db_file: opt(db_file),
                 extra: Default::default(),
             };
@@ -129,6 +139,82 @@ pub fn run(paths: &Paths, cmd: UsageCmd) -> anyhow::Result<()> {
                 println!("removed usage {id}");
             }
         }
+        UsageCmd::Once {
+            compat_write_ai_usage,
+            dry_run,
+        } => {
+            let reg = agentdeck_core::Registry::load(paths)?;
+            let accounts = agentdeck_usage::config::accounts_from_registry(&reg.usage)?;
+            let stale = agentdeck_usage::config::Config::default().stale_seconds;
+            let mut dpaths = daemon::DaemonPaths::for_agentdeck(
+                &paths.state_dir,
+                &daemon::agentdeck_runtime_dir(),
+            );
+            if !compat_write_ai_usage {
+                dpaths = dpaths.without_compat();
+            }
+            let state = daemon::run_once(&dpaths, &accounts, stale, dry_run).await?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            if dry_run {
+                println!("dry-run: state unchanged");
+            }
+        }
+        UsageCmd::Doctor { json } => {
+            let reg = agentdeck_core::Registry::load(paths)?;
+            let accounts = agentdeck_usage::config::accounts_from_registry(&reg.usage)?;
+            let dpaths = daemon::DaemonPaths::for_agentdeck(
+                &paths.state_dir,
+                &daemon::agentdeck_runtime_dir(),
+            );
+            let report = daemon::doctor(&dpaths, &accounts, daemon::old_service_active);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_doctor(&report);
+            }
+        }
     }
     Ok(())
+}
+
+fn print_doctor(report: &daemon::DoctorReport) {
+    println!("agentdeck usage doctor\n");
+    println!("sources: {}", report.sources.len());
+    for s in &report.sources {
+        let inst = s
+            .instance
+            .as_ref()
+            .map(|i| format!(" instance={i}"))
+            .unwrap_or_default();
+        println!("  {} {}{} {}", s.id, s.kind, inst, s.source);
+    }
+    for b in &report.backoffs {
+        match (b.age_secs, b.retry_in_secs) {
+            (_, Some(retry)) => println!("  backoff {}: retry in {} с", b.id, retry),
+            (Some(age), None) => println!("  backoff {}: last update {} с ago", b.id, age),
+            (None, None) => println!("  backoff {}: no state at {}", b.id, b.file.display()),
+        }
+    }
+    for f in [&report.canonical]
+        .into_iter()
+        .chain(report.compat_canonical.iter())
+        .chain(report.compat_runtime.iter())
+        .chain([&report.runtime])
+    {
+        match (f.updated_at, f.age_secs) {
+            (Some(t), Some(age)) => {
+                println!("  {}: updated_at={t} ({age} с ago)", f.path.display())
+            }
+            _ => println!("  {}: missing", f.path.display()),
+        }
+    }
+    println!(
+        "  ai-usage.service: {}",
+        if report.old_service_active {
+            "active (daemon refuses to start)"
+        } else {
+            "inactive"
+        }
+    );
+    println!("  lock: {}", if report.lock_held { "held" } else { "free" });
 }

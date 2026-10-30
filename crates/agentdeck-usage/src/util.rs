@@ -195,11 +195,16 @@ pub fn resolve_command(command: &str) -> Option<String> {
 }
 
 pub fn load_secrets_env() -> Result<()> {
-    let path = secrets_file()?;
+    load_secrets_env_from(&secrets_file()?)
+}
+
+/// Shared loader: `path` holds `KEY=value` lines, existing process vars win.
+/// Values are never printed.
+pub fn load_secrets_env_from(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let raw = fs::read_to_string(&path)?;
+    let raw = fs::read_to_string(path)?;
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {

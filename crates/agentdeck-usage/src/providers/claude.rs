@@ -442,7 +442,9 @@ impl UsageCache {
     }
 }
 
-fn usage_cache_path(id: &str) -> PathBuf {
+/// File name of the per-account cooldown cache, so `doctor` can report its
+/// age from an injectable directory instead of the production state dir.
+pub fn usage_cache_file_name(id: &str) -> String {
     // `validate_id` уже не пускает сюда ничего лишнего, но имя файла собирается
     // из внешней строки — фильтр стоит дешевле разбирательства с '../'.
     let safe: String = id
@@ -455,7 +457,11 @@ fn usage_cache_path(id: &str) -> PathBuf {
             }
         })
         .collect();
-    crate::util::persistent_state_dir().join(format!("claude-usage-{safe}.json"))
+    format!("claude-usage-{safe}.json")
+}
+
+fn usage_cache_path(id: &str) -> PathBuf {
+    crate::util::persistent_state_dir().join(usage_cache_file_name(id))
 }
 
 fn read_usage_cache(path: &Path) -> UsageCache {

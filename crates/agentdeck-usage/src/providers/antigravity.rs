@@ -102,8 +102,14 @@ pub struct Snapshot {
 
 /// Снимок живёт вне tmpfs: `agy` / Google API обновляют его периодически, и после
 /// перезагрузки восстановить квоту без этого файла невозможно до первого запроса.
+/// File name of the quota snapshot, so `doctor` can report its age from an
+/// injectable directory instead of the production state dir.
+pub fn snapshot_file_name(account_id: &str) -> String {
+    format!("antigravity-usage-{account_id}.json")
+}
+
 pub fn snapshot_path(account_id: &str) -> PathBuf {
-    crate::util::persistent_state_dir().join(format!("antigravity-usage-{account_id}.json"))
+    crate::util::persistent_state_dir().join(snapshot_file_name(account_id))
 }
 
 /// Путь, по которому снимок лежал до переезда на постоянный каталог.

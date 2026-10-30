@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod cmd_claude;
 mod cmd_codex;
+mod cmd_daemon;
 mod cmd_login;
 mod cmd_pool;
 mod cmd_t3;
@@ -33,6 +34,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_usage::UsageCmd,
     },
+    /// Run the usage polling daemon (single writer).
+    Daemon(cmd_daemon::DaemonArgs),
     /// Sync and drift-check secondary Claude accounts.
     Claude {
         #[command(subcommand)]
@@ -134,24 +137,53 @@ fn main() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     let paths = Paths::from_env()?;
-    match cli.cmd {
-        Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
-        Cmd::Usage { cmd } => cmd_usage::run(&paths, cmd)?,
-        Cmd::Wrapper { cmd } => cmd_wrapper::run(&paths, cmd)?,
+    agentdeck_usage::daemon::load_agentdeck_secrets(&paths.config_dir)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    match runtime.block_on(async_main(&paths, cli.cmd)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Single-writer lock and old-service refusal need stable exit codes.
+            if error
+                .downcast_ref::<agentdeck_usage::daemon::LockHeld>()
+                .is_some()
+            {
+                eprintln!("agentdeck: {error:#}");
+                std::process::exit(3);
+            }
+            if error
+                .downcast_ref::<agentdeck_usage::daemon::OldServiceActive>()
+                .is_some()
+            {
+                eprintln!("agentdeck: {error:#}");
+                std::process::exit(4);
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
+        Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
+        Cmd::Usage { cmd } => cmd_usage::run(paths, cmd).await?,
+        Cmd::Daemon(args) => cmd_daemon::run(paths, args).await?,
+        Cmd::Wrapper { cmd } => cmd_wrapper::run(paths, cmd)?,
         Cmd::Login {
             id,
             device_auth,
             open,
-        } => cmd_login::run(&paths, &id, device_auth, open)?,
+        } => cmd_login::run(paths, &id, device_auth, open)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
-        Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
+        Cmd::T3 { cmd } => cmd_t3::run_t3(paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
             InstanceCmd::List { json } => {
                 if json {
-                    println!("{}", agentdeck_core::registry::instances_json(&paths)?);
+                    println!("{}", agentdeck_core::registry::instances_json(paths)?);
                 } else {
-                    for i in agentdeck_core::registry::list_instances(&paths)? {
+                    for i in agentdeck_core::registry::list_instances(paths)? {
                         println!(
                             "{} {} {} enabled={} t3={}",
                             i.id,
@@ -173,7 +205,7 @@ fn main() -> anyhow::Result<()> {
                 dry_run,
             } => {
                 let changes = agentdeck_core::registry::add_instance(
-                    &paths,
+                    paths,
                     AddSpec {
                         id: id.clone(),
                         harness: harness.as_core(),
@@ -204,7 +236,7 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 let (changes, home) =
-                    agentdeck_core::registry::remove_instance(&paths, &id, dry_run)?;
+                    agentdeck_core::registry::remove_instance(paths, &id, dry_run)?;
                 for c in &changes {
                     println!("{c}", c = c.describe());
                 }
@@ -219,7 +251,7 @@ fn main() -> anyhow::Result<()> {
                 enabled,
                 dry_run,
             } => {
-                let changes = agentdeck_core::registry::set_enabled(&paths, &id, enabled, dry_run)?;
+                let changes = agentdeck_core::registry::set_enabled(paths, &id, enabled, dry_run)?;
                 for c in &changes {
                     println!("{c}", c = c.describe());
                 }

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod daemon;
 pub mod history;
 pub mod model;
 pub mod providers;

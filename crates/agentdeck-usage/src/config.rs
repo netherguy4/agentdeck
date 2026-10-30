@@ -319,21 +319,16 @@ pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfi
     Ok(config.accounts)
 }
 
-/// Env-var pointer for key-based kinds. A file pointer is recorded but the
-/// providers only read env vars, so it stays an explicit error until wired.
+/// Env-var pointer for key-based kinds. Only `api_key_env` is supported:
+/// keys live in the 0600 env file, never inline.
 fn key_env(e: &UsageEntry) -> Result<String> {
-    match (&e.api_key_env, &e.api_key_file) {
-        (Some(env), None) => Ok(env.clone()),
-        (None, Some(_)) => bail!(
-            "usage {:?}: api_key_file sources are recorded but not yet readable; use api_key_env",
-            e.id
-        ),
-        _ => bail!(
-            "usage {:?} (kind {}): set exactly one of api_key_env, api_key_file",
+    e.api_key_env.clone().with_context(|| {
+        format!(
+            "usage {:?} (kind {}): missing \"api_key_env\"",
             e.id,
             e.kind.as_str()
-        ),
-    }
+        )
+    })
 }
 
 #[cfg(test)]
