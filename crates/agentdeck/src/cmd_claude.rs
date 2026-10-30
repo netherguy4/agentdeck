@@ -84,7 +84,7 @@ pub fn run(cmd: &ClaudeCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn expand_tilde(value: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         home.to_path_buf()
     } else if let Some(rest) = value.strip_prefix("~/") {

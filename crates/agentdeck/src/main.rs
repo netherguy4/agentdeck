@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod cmd_claude;
 mod cmd_pool;
 mod cmd_t3;
+mod cmd_wrapper;
 
 #[derive(Parser)]
 #[command(name = "agentdeck", version, about = "Manage harness instances")]
@@ -33,6 +34,11 @@ enum Cmd {
     T3 {
         #[command(subcommand)]
         cmd: cmd_t3::T3Cmd,
+    },
+    /// Per-instance terminal wrappers (claude@second) and .desktop launchers.
+    Wrapper {
+        #[command(subcommand)]
+        cmd: cmd_wrapper::WrapperCmd,
     },
 }
 
@@ -106,6 +112,7 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
+        Cmd::Wrapper { cmd } => cmd_wrapper::run(&paths, cmd)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
