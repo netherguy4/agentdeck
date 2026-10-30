@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version without v prefix (for example 0.1.0)"
-        required: true
-        default: "0.1.0"
 
 permissions:
   contents: write
@@ -20,14 +14,6 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            arch: x86_64
-          - target: aarch64-unknown-linux-gnu
-            arch: aarch64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -36,87 +22,49 @@ jobs:
         id: version
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="${{ inputs.version }}"
-          fi
+          VERSION="${GITHUB_REF_NAME#v}"
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || {
             echo "Invalid version: $VERSION" >&2
             exit 1
           }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Set package version
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          version = os.environ["VERSION"]
-
-          manifest = Path("Cargo.toml")
-          text = manifest.read_text(encoding="utf-8")
-          text, count = re.subn(
-              r'(?m)^version = "[^"]+"$',
-              f'version = "{version}"',
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("Could not update Cargo.toml package version")
-          manifest.write_text(text, encoding="utf-8")
-
-          # Cargo.lock содержит собственный пакет, поэтому без синхронного
-          # обновления сборка с --locked упала бы на изменённой версии.
-          lock = Path("Cargo.lock")
-          text = lock.read_text(encoding="utf-8")
-          text, count = re.subn(
-              r'(?ms)^(\[\[package\]\]\nname = "ai-usage"\nversion = )"[^"]+"',
-              lambda match: f'{match.group(1)}"{version}"',
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("Could not update Cargo.lock package version")
-          lock.write_text(text, encoding="utf-8")
-          PY
-
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add "${{ matrix.target }}"
 
-      - name: Install cross compiler and packaging tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu zip
-
-      - name: Install packaging tools
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zip
+          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
 
       - name: Build
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+        run: |
+          cargo build --release --locked -p agentdeck -p agentdeck-applet
 
       - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          scripts/package.sh \
-            "target/${{ matrix.target }}/release/ai-usage" \
-            "${{ steps.version.outputs.version }}" \
-            "${{ matrix.arch }}"
+          mkdir -p dist
+          for bin in agentdeck agentdeck-applet; do
+            stage="dist/$bin-$VERSION-x86_64"
+            mkdir -p "$stage"
+            install -m 0755 "target/release/$bin" "$stage/$bin"
+            cp LICENSE README.md "$stage/"
+            tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"
+            rm -rf "$stage"
+          done
+          cp crates/agentdeck/agentdeck.desktop dist/
+          ls dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ai-usage-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          name: agentdeck-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/agentdeck.desktop
           if-no-files-found: error
 
   publish:
@@ -125,7 +73,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: ai-usage-*
+          name: agentdeck-x86_64
           path: dist
           merge-multiple: true
 
@@ -135,26 +83,13 @@ jobs:
           sha256sum ./*.tar.gz > SHA256SUMS
 
       - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          # Пометка prerelease важна не только для витрины: install-online.sh
-          # берёт /releases/latest, который prerelease не возвращает, поэтому
-          # rc не попадёт к пользователям установки одной командой.
           EXTRA=()
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             EXTRA+=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS dist/agentdeck.desktop \
             --generate-notes --verify-tag "${EXTRA[@]}"
-
-      - name: Keep manual build artifacts
-        if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ai-usage-release-bundles
-          path: |
-            dist/*.tar.gz
-            dist/SHA256SUMS

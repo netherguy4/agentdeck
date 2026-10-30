@@ -41,15 +41,6 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
-      - name: Check GNOME extension syntax
-        run: node --check extension/ai-usage@netherguy4/extension.js
-
-      - name: Check shell scripts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-          shellcheck install.sh uninstall.sh install-online.sh scripts/package.sh
-
   msrv:
     name: Build on declared MSRV
     runs-on: ubuntu-latest

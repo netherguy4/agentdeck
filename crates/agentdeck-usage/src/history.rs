@@ -1,21 +1,16 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 use serde_json::json;
 
 use crate::model::AppState;
-use crate::util;
 
 /// Предел файла журнала: при превышении он уезжает в `history.jsonl.1`, и
 /// вместе с ним хранится примерно месяц активной работы.
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
-
-pub fn history_file() -> PathBuf {
-    util::persistent_state_dir().join("history.jsonl")
-}
 
 /// Дописывает снимок лимитов в JSONL-журнал, чтобы внешние инструменты могли
 /// сопоставить расход процентов с сессиями (сам `state.json` хранит только

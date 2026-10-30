@@ -117,21 +117,6 @@ fn legacy_snapshot_path(account_id: &str) -> PathBuf {
     crate::util::runtime_dir().join(format!("antigravity-usage-{account_id}.json"))
 }
 
-pub fn hook_script_path(account_id: &str) -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    Ok(crate::hooks::agy_hook_script_path(&base, account_id))
-}
-
-pub fn install_hook_script(account_id: &str) -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    crate::hooks::install_agy_hook_script(&base, &std::env::current_exe()?, account_id)
-}
-
-pub fn remove_hook_script(account_id: &str) -> Result<bool> {
-    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    crate::hooks::remove_agy_hook_script(&base, account_id)
-}
-
 /// Official `agy` custom status-line hook.
 ///
 /// Antigravity sends account and quota metadata as JSON on stdin. The hook

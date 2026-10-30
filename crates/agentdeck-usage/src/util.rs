@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 /// Process-wide state-dir override. The `agentdeck` binary sets it once at
-/// startup to `XDG_STATE/agentdeck/usage`; the old `ai-usage` binary never
-/// sets it, so its default paths stay byte-identical.
+/// startup to `XDG_STATE/agentdeck/usage`; unset, the default stays the
+/// `ai-usage` tree the compat copies and the migrator read.
 static STATE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set once at `agentdeck` startup, before any provider runs. Later calls are ignored.
@@ -58,8 +58,8 @@ pub fn state_file() -> PathBuf {
 /// такой каталог означает потерю данных при каждой перезагрузке.
 ///
 /// The `agentdeck` binary overrides this once at startup (see
-/// [`set_state_dir_override`]); unset, it is the old `ai-usage` dir so the
-/// old binary stays byte-identical.
+/// [`set_state_dir_override`]); unset, it is the `ai-usage` dir the compat
+/// copies and the migrator read.
 pub fn persistent_state_dir() -> PathBuf {
     if let Some(dir) = STATE_DIR_OVERRIDE.get() {
         return dir.clone();
@@ -67,17 +67,12 @@ pub fn persistent_state_dir() -> PathBuf {
     legacy_persistent_state_dir()
 }
 
-/// The old `~/.local/state/ai-usage` tree: compat copies, the old binary,
-/// and everything the migrator reads. Never overridden.
+/// The `~/.local/state/ai-usage` tree: compat copies, and everything the
+/// migrator reads. Never overridden.
 pub fn legacy_persistent_state_dir() -> PathBuf {
     dirs::state_dir()
         .map(|dir| dir.join("ai-usage"))
         .unwrap_or_else(runtime_dir)
-}
-
-pub fn secrets_file() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    Ok(base.join("ai-usage").join("secrets.env"))
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -122,34 +117,6 @@ pub fn validate_id(id: &str) -> Result<()> {
         bail!("ID может содержать только латинские буквы, цифры, '-' и '_'");
     }
     Ok(())
-}
-
-pub fn env_name_for_provider_and_id(provider: &str, id: &str) -> String {
-    let prov_norm: String = provider
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let id_norm: String = id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("AI_USAGE_{prov_norm}_{id_norm}")
-}
-
-pub fn env_name_for_id(id: &str) -> String {
-    env_name_for_provider_and_id("deepseek", id)
 }
 
 /// `claude_max_5x` → `Max 5x`, `plus` → `Plus`.
@@ -216,10 +183,6 @@ pub fn resolve_command(command: &str) -> Option<String> {
         }
     }
     None
-}
-
-pub fn load_secrets_env() -> Result<()> {
-    load_secrets_env_from(&secrets_file()?)
 }
 
 /// Shared loader: `path` holds `KEY=value` lines, existing process vars win.
@@ -371,15 +334,6 @@ mod tests {
         for id in ["", "../etc", "a/b", "a b", "café", "a.b"] {
             assert!(validate_id(id).is_err(), "ID '{id}' должен быть отклонён");
         }
-    }
-
-    #[test]
-    fn env_name_is_uppercase_and_prefixed() {
-        assert_eq!(
-            env_name_for_id("deepseek-main"),
-            "AI_USAGE_DEEPSEEK_DEEPSEEK_MAIN"
-        );
-        assert_eq!(env_name_for_id("a_b"), "AI_USAGE_DEEPSEEK_A_B");
     }
 
     #[test]

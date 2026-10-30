@@ -14,7 +14,7 @@ import { Transform } from 'node:stream';
 
 export const SOCKET_ENV = 'T3_SHELL_MCP_SOCKET';
 export const ORIGINAL_BIN =
-  process.env.CLAUDE_SHELL_MCP_ORIGINAL ?? '/home/user/.local/bin/claude';
+  process.env.CLAUDE_SHELL_MCP_ORIGINAL ?? path.join(os.homedir(), '.local/bin/claude');
 
 export function isStreamingArgs(argv = []) {
   for (let i = 0; i < argv.length; i++) {

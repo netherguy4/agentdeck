@@ -496,29 +496,6 @@ fn read_token(config_dir: &Path) -> Option<OauthCredentials> {
     serde_json::from_str::<CredentialsFile>(&raw).ok()?.oauth
 }
 
-/// Строка для `doctor`: есть ли рабочий доступ к лимитам.
-pub fn credentials_status(config_dir: &Path) -> (bool, String) {
-    let path = crate::util::expand_home(config_dir).join(".credentials.json");
-    let Some(credentials) = read_token(config_dir) else {
-        return (false, format!("нет входа, ожидался {}", path.display()));
-    };
-    match credentials.expires_at {
-        Some(expires_at) if expires_at / 1000 <= crate::util::unix_now() => (
-            false,
-            if credentials.refresh_token.is_some() {
-                "токен истёк — сервис продлит его автоматически".to_owned()
-            } else {
-                "токен истёк — выполни вход: claude auth login".to_owned()
-            },
-        ),
-        Some(expires_at) => {
-            let hours = (expires_at / 1000 - crate::util::unix_now()) / 3600;
-            (true, format!("вход есть, токен ещё {hours} ч"))
-        }
-        None => (true, "вход есть".to_owned()),
-    }
-}
-
 // ── Провайдер ───────────────────────────────────────────────────────────────
 
 pub async fn fetch(

@@ -164,27 +164,15 @@ fn masked_email(email: &str) -> String {
 fn provider_icon(provider: &str) -> widget::icon::Handle {
     let bytes: &'static [u8] = match provider {
         "codex" => {
-            include_bytes!(
-                "../../../extension/ai-usage@netherguy4/icons/ai-usage-codex-symbolic.svg"
-            )
+            include_bytes!("../icons/ai-usage-codex-symbolic.svg")
         }
         "claude" => {
-            include_bytes!(
-                "../../../extension/ai-usage@netherguy4/icons/ai-usage-claude-symbolic.svg"
-            )
+            include_bytes!("../icons/ai-usage-claude-symbolic.svg")
         }
-        "antigravity" => include_bytes!(
-            "../../../extension/ai-usage@netherguy4/icons/ai-usage-antigravity-symbolic.svg"
-        ),
-        "deepseek" => include_bytes!(
-            "../../../extension/ai-usage@netherguy4/icons/ai-usage-deepseek-symbolic.svg"
-        ),
-        "openrouter" => include_bytes!(
-            "../../../extension/ai-usage@netherguy4/icons/ai-usage-openrouter-symbolic.svg"
-        ),
-        "opencode-go" => include_bytes!(
-            "../../../extension/ai-usage@netherguy4/icons/ai-usage-opencode-go-symbolic.svg"
-        ),
+        "antigravity" => include_bytes!("../icons/ai-usage-antigravity-symbolic.svg"),
+        "deepseek" => include_bytes!("../icons/ai-usage-deepseek-symbolic.svg"),
+        "openrouter" => include_bytes!("../icons/ai-usage-openrouter-symbolic.svg"),
+        "opencode-go" => include_bytes!("../icons/ai-usage-opencode-go-symbolic.svg"),
         _ => return widget::icon::from_name("dialog-information-symbolic").into(),
     };
     widget::icon::from_svg_bytes(bytes).symbolic(true)

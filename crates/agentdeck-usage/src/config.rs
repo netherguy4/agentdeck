@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -31,11 +30,7 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    pub fn refresh_interval(&self) -> u64 {
-        self.refresh_seconds.max(MIN_REFRESH_SECONDS)
-    }
-}
+impl Config {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
@@ -108,17 +103,6 @@ impl AccountConfig {
         }
     }
 
-    pub fn set_name(&mut self, value: String) {
-        match self {
-            Self::Claude { name, .. }
-            | Self::Codex { name, .. }
-            | Self::Deepseek { name, .. }
-            | Self::Openrouter { name, .. }
-            | Self::Antigravity { name, .. }
-            | Self::OpencodeGo { name, .. } => *name = value,
-        }
-    }
-
     pub fn provider(&self) -> &'static str {
         match self {
             Self::Claude { .. } => "claude",
@@ -169,22 +153,6 @@ pub(crate) fn default_openrouter_base_url() -> String {
     "https://openrouter.ai/api/v1".to_owned()
 }
 
-pub fn config_path() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    Ok(base.join("ai-usage").join("config.toml"))
-}
-
-pub fn load() -> Result<Config> {
-    let path = config_path()?;
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
-    parse_str(&raw, &path)
-}
-
 /// Parse an old `config.toml` from explicit bytes: the migrator reads a
 /// fixture or an injected HOME instead of the production path.
 pub fn parse_str(raw: &str, what: &Path) -> Result<Config> {
@@ -192,17 +160,6 @@ pub fn parse_str(raw: &str, what: &Path) -> Result<Config> {
         toml::from_str(raw).with_context(|| format!("Некорректный TOML в {}", what.display()))?;
     validate(&config).with_context(|| format!("Некорректная конфигурация в {}", what.display()))?;
     Ok(config)
-}
-
-pub fn save(config: &Config) -> Result<PathBuf> {
-    validate(config)?;
-    let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let raw = toml::to_string_pretty(config)?;
-    crate::util::atomic_write(&path, raw.as_bytes())?;
-    Ok(path)
 }
 
 /// Проверяет инварианты, которые нельзя выразить типами: уникальность ID и
@@ -240,28 +197,6 @@ pub fn validate(config: &Config) -> Result<()> {
     }
 
     Ok(())
-}
-
-pub fn upsert_account(config: &mut Config, account: AccountConfig) {
-    if let Some(index) = config
-        .accounts
-        .iter()
-        .position(|item| item.id() == account.id())
-    {
-        config.accounts[index] = account;
-    } else {
-        config.accounts.push(account);
-    }
-}
-
-/// Удаляет аккаунт и возвращает его, если он был.
-pub fn remove_account(config: &mut Config, id: &str) -> Option<AccountConfig> {
-    let index = config.accounts.iter().position(|item| item.id() == id)?;
-    Some(config.accounts.remove(index))
-}
-
-pub fn find_account<'a>(config: &'a Config, id: &str) -> Option<&'a AccountConfig> {
-    config.accounts.iter().find(|item| item.id() == id)
 }
 
 /// Build the provider account list from validated `[[usage]]` registry entries.
@@ -340,6 +275,7 @@ fn key_env(e: &UsageEntry) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn claude(id: &str, dir: &str) -> AccountConfig {
         AccountConfig::Claude {
@@ -407,16 +343,6 @@ mod tests {
             ["claude", "codex", "deepseek", "openrouter", "antigravity"]
         );
         validate(&parsed).unwrap();
-    }
-
-    #[test]
-    fn example_config_is_valid() {
-        // Пример из репозитория должен и разбираться, и проходить валидацию,
-        // иначе документация ведёт пользователя в нерабочую конфигурацию.
-        let raw = include_str!("../../../config/config.example.toml");
-        let config: Config = toml::from_str(raw).unwrap();
-        validate(&config).unwrap();
-        assert_eq!(config.accounts.len(), 6);
     }
 
     #[test]
@@ -530,20 +456,6 @@ mod tests {
             ..Config::default()
         };
         assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn refresh_interval_has_a_floor() {
-        let config = Config {
-            refresh_seconds: 1,
-            ..Config::default()
-        };
-        assert_eq!(config.refresh_interval(), MIN_REFRESH_SECONDS);
-        let config = Config {
-            refresh_seconds: 300,
-            ..Config::default()
-        };
-        assert_eq!(config.refresh_interval(), 300);
     }
 
     #[test]

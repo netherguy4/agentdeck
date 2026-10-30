@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=agentdeck
+Name[ru]=agentdeck
+Exec=agentdeck
+Icon=utilities-system-monitor-symbolic
+Terminal=false
+Categories=Development;Utility;

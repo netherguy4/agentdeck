@@ -1,16 +1,15 @@
 //! Hook entry points shared by `agentdeck usage hook` / `usage hooks plan`.
 //!
-//! The old `ai-usage` binary keeps its `claude-hook`/`agy-hook` subcommands
-//! through the provider functions (same bytes); the new CLI reads stdin and
-//! writes snapshots through this module, so hooks land in the state dir the
-//! daemon reads (the process-wide override from [`crate::util`]).
-//! Installing or replacing hooks in real settings is NOT done here:
-//! [`plan`] only reports current vs desired commands for the owner to apply.
+//! The new CLI reads stdin and writes snapshots through this module, so hooks
+//! land in the state dir the daemon reads (the process-wide override from
+//! [`crate::util`]). Installing or replacing hooks in real settings is NOT
+//! done here: [`plan`] only reports current vs desired commands for the owner
+//! to apply.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::config::AccountConfig;
@@ -59,21 +58,6 @@ pub fn agy_hook_command(exe: &Path, account: &str) -> String {
     )
 }
 
-/// Command the old binary installs (`agy-hook` flat subcommand). The old
-/// binary installs through this, so its scripts stay byte-identical.
-pub fn legacy_agy_hook_command(exe: &Path, account: &str) -> String {
-    format!(
-        "{} agy-hook --account {}",
-        crate::util::shell_single_quote(&exe.to_string_lossy()),
-        crate::util::shell_single_quote(account)
-    )
-}
-
-/// Wrapper script body running `command`.
-pub fn agy_hook_script_body(command: &str) -> String {
-    format!("#!/bin/sh\nexec {command}\n")
-}
-
 /// Hook script location. Unchanged from the old binary so existing
 /// `/statusline` installs keep working; relocation is a later owner step.
 pub fn agy_hook_script_path(config_base: &Path, account: &str) -> PathBuf {
@@ -81,27 +65,6 @@ pub fn agy_hook_script_path(config_base: &Path, account: &str) -> PathBuf {
         .join("ai-usage")
         .join("hooks")
         .join(format!("agy-{account}.sh"))
-}
-
-pub fn install_agy_hook_script(config_base: &Path, exe: &Path, account: &str) -> Result<PathBuf> {
-    crate::util::validate_id(account)?;
-    let path = agy_hook_script_path(config_base, account);
-    crate::util::atomic_write_mode(
-        &path,
-        agy_hook_script_body(&legacy_agy_hook_command(exe, account)).as_bytes(),
-        Some(0o700),
-    )?;
-    Ok(path)
-}
-
-pub fn remove_agy_hook_script(config_base: &Path, account: &str) -> Result<bool> {
-    let path = agy_hook_script_path(config_base, account);
-    if !path.exists() {
-        return Ok(false);
-    }
-    std::fs::remove_file(&path)
-        .with_context(|| format!("Не удалось удалить {}", path.display()))?;
-    Ok(true)
 }
 
 /// Current `statusLine.command` in a Claude config dir, if one is set.
@@ -213,12 +176,9 @@ mod tests {
         .unwrap();
         // Agy wrapper installed by the old binary (legacy body, byte-checked).
         let config_base = dir.join("config");
-        let legacy_body = agy_hook_script_body(&legacy_agy_hook_command(
-            Path::new("/usr/bin/ai-usage"),
-            "agy-main",
-        ));
+        let legacy_body = "#!/bin/sh\nexec '/usr/bin/ai-usage' agy-hook --account 'agy-main'\n";
         fs::create_dir_all(config_base.join("ai-usage/hooks")).unwrap();
-        fs::write(agy_hook_script_path(&config_base, "agy-main"), &legacy_body).unwrap();
+        fs::write(agy_hook_script_path(&config_base, "agy-main"), legacy_body).unwrap();
         assert!(legacy_body.contains("agy-hook --account"));
 
         let accounts = vec![

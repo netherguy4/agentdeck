@@ -1,12 +1,9 @@
-//! Polling loop and state publishing shared by `agentdeck daemon`,
-//! `agentdeck usage once` and the old `ai-usage` binary.
+//! Polling loop and state publishing shared by `agentdeck daemon` and
+//! `agentdeck usage once`.
 //!
-//! Moved out of the root `src/main.rs` with its semantics intact: per-provider
-//! deadline, last-known-good merge, SIGTERM drain (incl. the Claude detached
-//! write-back via `finish_refreshes`), history writes, failure backoff.
-//! The only differences between callers are the paths and the account source:
-//! the old binary re-reads its config file every cycle, the new daemon reads
-//! `[[usage]]` once at startup (restart to apply).
+//! Per-provider deadline, last-known-good merge, SIGTERM drain (incl. the
+//! Claude detached write-back via `finish_refreshes`), history writes, failure
+//! backoff. The daemon reads `[[usage]]` once at startup (restart to apply).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +46,7 @@ impl std::fmt::Display for OldServiceActive {
 impl std::error::Error for OldServiceActive {}
 
 /// Every file a polling cycle reads or writes. All temp-dir injectable;
-/// production instances come from [`DaemonPaths::for_agentdeck`] / [`DaemonPaths::legacy`].
+/// production instances come from [`DaemonPaths::for_agentdeck`].
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
     /// Canonical state, always 0600.
@@ -83,19 +80,6 @@ impl DaemonPaths {
             history: dir.join("history.jsonl"),
             cooldown_dir: dir.clone(),
             lock: dir.join(LOCK_FILE_NAME),
-        }
-    }
-
-    /// Paths the old `ai-usage` binary has always used. No compat copies.
-    pub fn legacy() -> Self {
-        Self {
-            canonical: util::legacy_persistent_state_dir().join("state.json"),
-            runtime: util::state_file(),
-            compat_canonical: Vec::new(),
-            compat_runtime: Vec::new(),
-            history: history::history_file(),
-            cooldown_dir: util::legacy_persistent_state_dir(),
-            lock: util::legacy_persistent_state_dir().join(LOCK_FILE_NAME),
         }
     }
 
@@ -290,8 +274,7 @@ fn log_cycle(state: &AppState) {
 }
 
 /// Run the polling loop until SIGTERM/SIGINT. `load` provides fresh
-/// `(accounts, refresh_seconds, stale_seconds)` every cycle for the old
-/// binary; the new daemon passes pre-loaded values (restart to apply).
+/// `(accounts, refresh_seconds, stale_seconds)` every cycle.
 /// Holds the single-writer lock for life; refuses while the old service is
 /// active. Drains in-flight Claude credential write-back before returning.
 pub async fn run_daemon(
