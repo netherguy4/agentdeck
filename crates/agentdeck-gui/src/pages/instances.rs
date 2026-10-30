@@ -1,10 +1,10 @@
 //! One row per registry instance: identity, T3 health, quota bars.
 
 use i18n_embed_fl::fl;
-use iced::widget::{Space, column, progress_bar, text};
+use iced::widget::{Space, button, column, progress_bar, text};
 use iced::{Element, Length};
 
-use crate::app::Message;
+use crate::app::{Message, Page, RemoveAsk};
 use crate::data::{Data, UsageQuotas};
 use crate::i18n::loader;
 
@@ -47,8 +47,17 @@ fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {
     col.into()
 }
 
-pub fn view(data: &Data) -> Element<'_, Message> {
-    let mut col = column![text(fl!(loader(), "instances-title")).size(22)].spacing(12);
+pub fn view<'a>(data: &'a Data, remove: Option<&'a RemoveAsk>) -> Element<'a, Message> {
+    let mut col = column![
+        iced::widget::row![
+            text(fl!(loader(), "instances-title")).size(22),
+            button(text(fl!(loader(), "instances-add")).size(13))
+                .style(button::secondary)
+                .on_press(Message::SelectPage(Page::AddInstance)),
+        ]
+        .spacing(12),
+    ]
+    .spacing(12);
     if let Some(error) = &data.error {
         col = col.push(text(fl!(loader(), "load-error", what = error)).size(13));
     }
@@ -81,6 +90,9 @@ pub fn view(data: &Data) -> Element<'_, Message> {
                 text(&inst.id).size(12),
                 text(&inst.harness).size(12),
                 text(state).size(12),
+                button(text(fl!(loader(), "instances-remove")).size(12))
+                    .style(button::secondary)
+                    .on_press(Message::RemoveAsk(inst.id.clone())),
             ]
             .spacing(8),
             text(t3).size(12),
@@ -101,5 +113,32 @@ pub fn view(data: &Data) -> Element<'_, Message> {
             col = col.push(quotas_view(u));
         }
     }
+    if let Some(ask) = remove {
+        col = col.push(remove_panel(ask));
+    }
+    col.into()
+}
+
+fn remove_panel(ask: &RemoveAsk) -> Element<'_, Message> {
+    let mut col =
+        column![text(fl!(loader(), "remove-ask", id = ask.id.clone())).size(16)].spacing(6);
+    if let Some(n) = ask.threads.filter(|&n| n > 0) {
+        col = col.push(text(fl!(loader(), "remove-threads", count = n)).size(12));
+    }
+    col = col.push(text(fl!(loader(), "remove-keep-home")).size(12));
+    if let Some(error) = &ask.error {
+        col = col.push(text(fl!(loader(), "load-error", what = error)).size(12));
+    }
+    col = col.push(
+        iced::widget::row![
+            button(text(fl!(loader(), "remove-confirm")).size(13))
+                .style(button::primary)
+                .on_press_maybe((!ask.working).then_some(Message::RemoveConfirm)),
+            button(text(fl!(loader(), "remove-cancel")).size(13))
+                .style(button::secondary)
+                .on_press(Message::RemoveCancel),
+        ]
+        .spacing(8),
+    );
     col.into()
 }

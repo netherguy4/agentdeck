@@ -8,12 +8,14 @@ use iced::{Element, Length, Subscription, Task, Theme};
 
 use crate::data::{self, Data};
 use crate::i18n::loader;
+use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::plugins::Pending;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
     #[default]
     Instances,
+    AddInstance,
     Drift,
     Plugins,
     Processes,
@@ -23,6 +25,7 @@ impl Page {
     fn label(self) -> String {
         match self {
             Self::Instances => fl!(loader(), "nav-instances"),
+            Self::AddInstance => fl!(loader(), "add-title"),
             Self::Drift => fl!(loader(), "nav-drift"),
             Self::Plugins => fl!(loader(), "nav-plugins"),
             Self::Processes => fl!(loader(), "nav-processes"),
@@ -35,6 +38,12 @@ pub enum Message {
     Tick,
     Loaded(Data),
     SelectPage(Page),
+    Add(AddMsg),
+    RemoveAsk(String),
+    RemoveCancel,
+    RemoveConfirm,
+    RemoveDone(Result<RemoveOutcome, String>),
+    Noop,
     EnablePlugin(String),
     DisablePlugin(String),
     CancelPlugin,
@@ -42,10 +51,27 @@ pub enum Message {
     PluginDone(Result<String, String>),
 }
 
+#[derive(Debug, Clone)]
+pub struct RemoveOutcome {
+    pub id: String,
+    pub lines: Vec<String>,
+    pub home: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RemoveAsk {
+    pub id: String,
+    pub threads: Option<u64>,
+    pub error: Option<String>,
+    pub working: bool,
+}
+
 pub struct State {
     page: Page,
     data: Data,
     paths: Option<agentdeck_core::Paths>,
+    add: add_instance::Wizard,
+    remove: Option<RemoveAsk>,
     pending: Option<Pending>,
 }
 
@@ -59,6 +85,8 @@ impl State {
                 page: Page::Instances,
                 data: Data::default(),
                 paths,
+                add: add_instance::Wizard::default(),
+                remove: None,
                 pending: None,
             },
             match first {
@@ -74,6 +102,8 @@ impl State {
             page: Page::Instances,
             data,
             paths: Some(paths),
+            add: add_instance::Wizard::default(),
+            remove: None,
             pending: None,
         }
     }
@@ -88,6 +118,10 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::SelectPage(page) => {
             state.page = page;
             state.pending = None;
+            state.remove = None;
+            if page == Page::AddInstance {
+                state.add = add_instance::Wizard::default();
+            }
             Task::none()
         }
         Message::Tick => match state.paths.clone() {
@@ -98,6 +132,73 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.data = data;
             Task::none()
         }
+        Message::Add(msg) => match state.paths.clone() {
+            Some(paths) => add_instance::update_wizard(&mut state.add, msg, &paths),
+            None => Task::none(),
+        },
+        Message::RemoveAsk(id) => {
+            // Read-only thread count for the confirmation; core refuses the
+            // removal itself when pool/usage entries still reference the id.
+            let threads = agentdeck_core::t3::t3_root()
+                .ok()
+                .and_then(|root| agentdeck_core::t3::thread_count(&root, &id).unwrap_or(None));
+            state.remove = Some(RemoveAsk {
+                id,
+                threads,
+                error: None,
+                working: false,
+            });
+            Task::none()
+        }
+        Message::RemoveCancel => {
+            state.remove = None;
+            Task::none()
+        }
+        Message::RemoveConfirm => {
+            let Some(ask) = state.remove.clone() else {
+                return Task::none();
+            };
+            let id = ask.id.clone();
+            match state.paths.clone() {
+                Some(paths) => {
+                    if let Some(current) = state.remove.as_mut() {
+                        current.working = true;
+                    }
+                    Task::perform(
+                        async move {
+                            agentdeck_core::registry::remove_instance(&paths, &id, false)
+                                .map(|(changes, home)| RemoveOutcome {
+                                    id: id.clone(),
+                                    lines: changes.iter().map(|c| c.describe()).collect(),
+                                    home,
+                                })
+                                .map_err(|e| format!("{e:#}"))
+                        },
+                        Message::RemoveDone,
+                    )
+                }
+                None => Task::none(),
+            }
+        }
+        Message::RemoveDone(result) => {
+            match result {
+                Ok(outcome) => {
+                    state.data.instances.retain(|i| i.id != outcome.id);
+                    state.remove = None;
+                }
+                Err(e) => {
+                    if let Some(ask) = state.remove.as_mut() {
+                        ask.working = false;
+                        ask.error = Some(e);
+                    }
+                }
+            }
+            match state.paths.clone() {
+                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                None => Task::none(),
+            }
+        }
+        Message::Noop => Task::none(),
         Message::EnablePlugin(name) => {
             preview_plugin(state, &name, true);
             Task::none()
@@ -184,8 +285,11 @@ fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<Stri
     })
 }
 
-pub fn subscription(_state: &State) -> Subscription<Message> {
-    iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick)
+pub fn subscription(state: &State) -> Subscription<Message> {
+    Subscription::batch([
+        iced::time::every(Duration::from_secs(5)).map(|_| Message::Tick),
+        add_instance::subscription(&state.add),
+    ])
 }
 
 fn sidebar(state: &State) -> Element<'_, Message> {
@@ -207,7 +311,8 @@ fn sidebar(state: &State) -> Element<'_, Message> {
 
 pub fn view(state: &State) -> Element<'_, Message> {
     let content: Element<'_, Message> = match state.page {
-        Page::Instances => crate::pages::instances::view(&state.data),
+        Page::Instances => crate::pages::instances::view(&state.data, state.remove.as_ref()),
+        Page::AddInstance => crate::pages::add_instance::view(&state.add),
         Page::Drift => crate::pages::other::drift(),
         Page::Plugins => crate::pages::plugins::view(&state.data, state.pending.as_ref()),
         Page::Processes => crate::pages::other::processes(),

@@ -10,6 +10,8 @@ load-error = Не удалось загрузить: { $what }
 
 instances-title = Инстансы
 instances-empty = В реестре пока нет инстансов.
+instances-add = Добавить
+instances-remove = Удалить
 instances-quotas = Квоты
 instances-standalone = Другие источники расхода
 quotas-no-data = Данных об использовании пока нет.
@@ -45,3 +47,43 @@ plugins-disabled = выключен
 plugins-unavailable = недоступен (нужен T3)
 plugins-preview-enable = Включение { $name } выполнит:
 plugins-preview-disable = Выключение { $name } уберёт его файлы (данные сохранятся):
+add-title = Новый инстанс
+add-back = Назад к инстансам
+add-harness = Harness
+add-harness-note = opencode и agy появятся в M7.
+add-id = ID инстанса
+add-id-note = ID нельзя переименовать: к ним привязана история T3.
+add-display-name = Отображаемое имя
+add-home = Домашний каталог
+add-home-use-suggestion = Подставить
+add-preview = Предпросмотр
+add-apply = Применить
+add-working = Работаю…
+add-login-title = Вход
+add-login-start = Начать вход
+add-login-device-auth = Вход по коду устройства (codex)
+add-login-code = Вставленный код
+add-login-send = Отправить
+add-login-cancel = Отмена
+add-login-copy = Копировать
+add-login-open = Открыть
+add-login-cancelled = Вход отменён.
+add-login-done = Процесс входа завершился с кодом 0.
+add-login-failed = Ошибка входа: { $reason }.
+add-login-retry-device = Порт 1455 занят; повторить через код устройства
+add-login-device-code = Код устройства: { $code }
+add-open-failed = Не удалось открыть браузер; скопируйте ссылку.
+add-wrapper-title = Обёртка терминала (необязательно)
+add-t3-title = Синхронизация с T3 (необязательно)
+
+remove-ask = Удалить { $id }?
+remove-confirm = Удалить
+remove-cancel = Оставить
+remove-keep-home = Каталог входа сохраняется.
+remove-threads =
+    { $count ->
+        [one] У T3 остался { $count } поток этого id; история сохранится, но не запустится.
+        [few] У T3 осталось { $count } потока этого id; история сохранится, но не запустится.
+        [many] У T3 осталось { $count } потоков этого id; история сохранится, но не запустится.
+       *[other] У T3 осталось { $count } потоков этого id; история сохранится, но не запустится.
+    }
