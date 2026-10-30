@@ -359,7 +359,11 @@ fn t3_group(paths: &Paths, t3_root: Option<&Path>) -> Group {
             ..Item::default()
         }),
         Ok(rows) => {
-            for r in rows.iter().filter(|r| !r.in_registry) {
+            // T3 also offers drivers agentdeck cannot import (cursor, grok, ...).
+            let importable = |r: &&t3::T3StatusRow| {
+                !r.in_registry && matches!(r.driver.as_str(), "claudeAgent" | "codex")
+            };
+            for r in rows.iter().filter(importable) {
                 items.push(Item {
                     key: "t3import".into(),
                     text: format!("{} (driver={})", r.id, r.driver),
