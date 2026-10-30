@@ -8,6 +8,7 @@ mod cmd_login;
 mod cmd_migrate;
 mod cmd_plugin;
 mod cmd_pool;
+mod cmd_ps;
 mod cmd_service;
 mod cmd_t3;
 mod cmd_usage;
@@ -74,6 +75,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
     },
+    /// Live agent-process tree (read-only; stopping stays `agent-process stop`).
+    Ps(cmd_ps::PsArgs),
     /// Run the official login CLI for an instance inside a PTY.
     Login {
         /// Registry instance id to log in.
@@ -213,6 +216,7 @@ fn run_gui() -> anyhow::Result<()> {
 async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
+        Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
         Cmd::Usage { cmd } => cmd_usage::run(paths, cmd).await?,

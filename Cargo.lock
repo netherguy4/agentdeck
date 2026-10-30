@@ -165,6 +165,7 @@ dependencies = [
  "iced_test",
  "rust-embed",
  "serde_json",
+ "tokio",
  "unic-langid",
 ]
 

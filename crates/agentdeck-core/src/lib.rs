@@ -7,6 +7,7 @@ pub mod login;
 pub mod paths;
 pub mod plugins;
 pub mod pool;
+pub mod processes;
 pub mod registry;
 pub mod service;
 pub mod t3;

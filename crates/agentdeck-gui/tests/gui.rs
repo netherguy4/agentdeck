@@ -665,3 +665,136 @@ fn plugins_page_preview_cancel_and_snapshots() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+fn fixture_proc(pid: u32, cmd: &str) -> agentdeck_core::processes::ProcInfo {
+    agentdeck_core::processes::ProcInfo {
+        pid,
+        ppid: 1,
+        pgrp: pid,
+        comm: cmd.to_string(),
+        argv: vec![cmd.to_string(), "60".to_string()],
+        cpu_percent: 0.5,
+        rss_bytes: 2_000_000,
+        read_bytes: Some(4096),
+        write_bytes: Some(0),
+        start_ticks: 1000,
+        scope: None,
+        owner_tag: Some("ses1".to_string()),
+    }
+}
+
+fn fixture_groups() -> Vec<agentdeck_core::processes::SessionGroup> {
+    use agentdeck_core::processes::{GroupKind, SessionGroup};
+    vec![
+        SessionGroup {
+            kind: GroupKind::Agent {
+                owner: "ses1".to_string(),
+                id: "abc".to_string(),
+            },
+            title: "ses1 (abc)".to_string(),
+            pid: 100,
+            start_ticks: 1000,
+            pgrp: 100,
+            can_stop: true,
+            processes: vec![fixture_proc(100, "sleep"), fixture_proc(101, "sh")],
+            cpu_percent: 1.0,
+            rss_bytes: 4_000_000,
+            read_bytes: Some(8192),
+            write_bytes: Some(0),
+            scope_mem_bytes: None,
+        },
+        SessionGroup {
+            kind: GroupKind::T3 {
+                scope: "t3code-abc123.scope".to_string(),
+            },
+            title: "t3code-abc123.scope".to_string(),
+            pid: 200,
+            start_ticks: 2000,
+            pgrp: 200,
+            can_stop: false,
+            processes: vec![fixture_proc(200, "node")],
+            cpu_percent: 2.5,
+            rss_bytes: 90_000_000,
+            read_bytes: None,
+            write_bytes: None,
+            scope_mem_bytes: None,
+        },
+    ]
+}
+
+#[test]
+fn snapshots_processes_en_ru_and_stop_dialog() {
+    let _env = lock_env();
+    let (paths, _dir, _guard) = fixture_paths("procs");
+    std::fs::create_dir_all(SNAPSHOTS).unwrap();
+
+    for (lang, stem) in [("en", "processes_en"), ("ru", "processes_ru")] {
+        agentdeck_gui::i18n::set_language(lang);
+        let data = data::Data {
+            processes: fixture_groups(),
+            ..data::Data::default()
+        };
+        let mut state = app::State::for_tests(paths.clone(), data);
+        let _ = app::update(
+            &mut state,
+            app::Message::SelectPage(agentdeck_gui::Page::Processes),
+        );
+        let mut ui = iced_test::simulator(app::view(&state));
+        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        assert!(
+            snapshot
+                .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
+                .expect("snapshot compare/write"),
+            "snapshot {stem} changed"
+        );
+        let goldens: Vec<_> = std::fs::read_dir(SNAPSHOTS)
+            .expect("snapshots dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with(stem))
+                    && p.extension().and_then(|e| e.to_str()) == Some("png")
+            })
+            .collect();
+        assert_eq!(goldens.len(), 1, "one golden per stem: {goldens:?}");
+        let bytes = std::fs::metadata(&goldens[0]).expect("golden png").len();
+        assert!(bytes > 1_024, "golden {} looks empty", goldens[0].display());
+        assert!(
+            bytes < 100 * 1024,
+            "golden {} over 100 KB",
+            goldens[0].display()
+        );
+    }
+
+    // Stop opens a confirmation listing every process; Cancel closes it.
+    // Fixture pids are fake, so the fresh member lookup falls back to the
+    // snapshot rows and nothing is ever signaled.
+    agentdeck_gui::i18n::set_language("en");
+    let data = data::Data {
+        processes: fixture_groups(),
+        ..data::Data::default()
+    };
+    let mut state = app::State::for_tests(paths, data);
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Processes),
+    );
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("Stop").expect("stop button");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    assert!(state.proc_ui().pending.is_some());
+    let _ = app::update(&mut state, app::Message::ProcForce(true));
+    assert!(state.proc_ui().force);
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.find("Stop now").expect("confirm button");
+    ui.find("100  sleep 60").expect("listed member pid");
+    ui.click("Cancel").expect("cancel button");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    assert!(state.proc_ui().pending.is_none());
+}

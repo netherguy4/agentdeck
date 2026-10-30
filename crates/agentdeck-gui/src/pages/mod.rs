@@ -3,5 +3,5 @@
 pub mod add_instance;
 pub mod drift;
 pub mod instances;
-pub mod other;
 pub mod plugins;
+pub mod processes;
