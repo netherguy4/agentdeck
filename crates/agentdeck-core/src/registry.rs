@@ -11,7 +11,7 @@
 //! t3 = true
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -89,6 +89,10 @@ pub struct Registry {
     pub pool: Vec<PoolEntry>,
     #[serde(default)]
     pub usage: Vec<UsageEntry>,
+    /// Built-in plugin flags (`agent-process = true`). Absent table or key
+    /// means disabled, so files written before plugins stay valid.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, bool>,
     /// Unknown top-level tables/keys survive rewrites.
     #[serde(flatten)]
     pub extra: toml::map::Map<String, toml::Value>,
@@ -101,6 +105,7 @@ impl Registry {
             instances: Vec::new(),
             pool: Vec::new(),
             usage: Vec::new(),
+            plugins: Default::default(),
             extra: Default::default(),
         }
     }

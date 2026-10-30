@@ -6,6 +6,7 @@ mod cmd_codex;
 mod cmd_daemon;
 mod cmd_login;
 mod cmd_migrate;
+mod cmd_plugin;
 mod cmd_pool;
 mod cmd_service;
 mod cmd_t3;
@@ -67,6 +68,11 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: cmd_service::ServiceCmd,
+    },
+    /// Enable or disable built-in plugins (agent-process, ai-usage).
+    Plugin {
+        #[command(subcommand)]
+        cmd: cmd_plugin::PluginCmd,
     },
     /// Run the official login CLI for an instance inside a PTY.
     Login {
@@ -208,6 +214,7 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
+        Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
         Cmd::Usage { cmd } => cmd_usage::run(paths, cmd).await?,
         Cmd::Daemon(args) => cmd_daemon::run(paths, args).await?,
         Cmd::Wrapper { cmd } => cmd_wrapper::run(paths, cmd)?,

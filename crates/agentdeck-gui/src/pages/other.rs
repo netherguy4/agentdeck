@@ -20,10 +20,6 @@ pub fn drift<'a>() -> Element<'a, Message> {
     placeholder(fl!(loader(), "drift-title"))
 }
 
-pub fn plugins<'a>() -> Element<'a, Message> {
-    placeholder(fl!(loader(), "plugins-title"))
-}
-
 pub fn processes<'a>() -> Element<'a, Message> {
     placeholder(fl!(loader(), "processes-title"))
 }

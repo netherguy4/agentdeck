@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agentdeck_core::{Paths, Registry, t3};
+use agentdeck_core::{Paths, Registry, plugins, t3};
 use agentdeck_usage::model::{self, AppState};
 
 /// Canonical usage state file, then the old ai-usage path the daemon still
@@ -56,9 +56,18 @@ pub struct InstanceRow {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct PluginRow {
+    pub name: String,
+    pub enabled: bool,
+    pub available: bool,
+    pub detail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Data {
     pub instances: Vec<InstanceRow>,
     pub standalone: Vec<UsageQuotas>,
+    pub plugins: Vec<PluginRow>,
     /// Registry-level failure (unreadable file); per-source gaps stay silent.
     pub error: Option<String>,
 }
@@ -143,6 +152,21 @@ pub fn load(paths: &Paths) -> Data {
         .iter()
         .filter(|u| u.instance.is_none())
         .map(|u| quotas_for(&u.id, &u.display, u.kind.as_str(), &accounts))
+        .collect();
+    // Plugin status is read-only (link/unit/block presence); a missing HOME
+    // just reports everything absent.
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let exe = std::env::current_exe().unwrap_or_default();
+    data.plugins = plugins::status(paths, &home, &exe)
+        .into_iter()
+        .map(|s| PluginRow {
+            name: s.name.to_string(),
+            enabled: s.enabled,
+            available: s.available,
+            detail: s.detail,
+        })
         .collect();
     data
 }

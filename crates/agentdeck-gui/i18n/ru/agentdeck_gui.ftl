@@ -34,3 +34,14 @@ drift-title = Расхождения
 plugins-title = Плагины
 processes-title = Процессы
 coming-soon = Появится в следующих юнитах.
+
+plugins-empty = Нет доступных плагинов.
+plugins-enable = Включить
+plugins-disable = Выключить
+plugins-confirm = Подтвердить
+plugins-cancel = Отмена
+plugins-enabled = включён
+plugins-disabled = выключен
+plugins-unavailable = недоступен (нужен T3)
+plugins-preview-enable = Включение { $name } выполнит:
+plugins-preview-disable = Выключение { $name } уберёт его файлы (данные сохранятся):

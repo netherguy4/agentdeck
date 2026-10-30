@@ -140,6 +140,9 @@ impl Change {
                 Ok(())
             }
             Change::Symlink { link, target } => {
+                if let Some(parent) = link.parent() {
+                    fs::create_dir_all(parent)?;
+                }
                 if fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
                     fs::remove_file(link)?;
                 }
