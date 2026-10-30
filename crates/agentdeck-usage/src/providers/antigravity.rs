@@ -119,32 +119,17 @@ fn legacy_snapshot_path(account_id: &str) -> PathBuf {
 
 pub fn hook_script_path(account_id: &str) -> Result<PathBuf> {
     let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
-    Ok(base
-        .join("ai-usage")
-        .join("hooks")
-        .join(format!("agy-{account_id}.sh")))
+    Ok(crate::hooks::agy_hook_script_path(&base, account_id))
 }
 
 pub fn install_hook_script(account_id: &str) -> Result<PathBuf> {
-    crate::util::validate_id(account_id)?;
-    let path = hook_script_path(account_id)?;
-    let executable = std::env::current_exe()?;
-    let body = format!(
-        "#!/bin/sh\nexec {} agy-hook --account {}\n",
-        crate::util::shell_single_quote(&executable.to_string_lossy()),
-        crate::util::shell_single_quote(account_id),
-    );
-    crate::util::atomic_write_mode(&path, body.as_bytes(), Some(0o700))?;
-    Ok(path)
+    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
+    crate::hooks::install_agy_hook_script(&base, &std::env::current_exe()?, account_id)
 }
 
 pub fn remove_hook_script(account_id: &str) -> Result<bool> {
-    let path = hook_script_path(account_id)?;
-    if !path.exists() {
-        return Ok(false);
-    }
-    fs::remove_file(&path).with_context(|| format!("Не удалось удалить {}", path.display()))?;
-    Ok(true)
+    let base = dirs::config_dir().context("Не удалось определить каталог конфигурации")?;
+    crate::hooks::remove_agy_hook_script(&base, account_id)
 }
 
 /// Official `agy` custom status-line hook.

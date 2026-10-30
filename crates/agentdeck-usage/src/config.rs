@@ -182,9 +182,15 @@ pub fn load() -> Result<Config> {
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
+    parse_str(&raw, &path)
+}
+
+/// Parse an old `config.toml` from explicit bytes: the migrator reads a
+/// fixture or an injected HOME instead of the production path.
+pub fn parse_str(raw: &str, what: &Path) -> Result<Config> {
     let config: Config =
-        toml::from_str(&raw).with_context(|| format!("Некорректный TOML в {}", path.display()))?;
-    validate(&config).with_context(|| format!("Некорректная конфигурация в {}", path.display()))?;
+        toml::from_str(raw).with_context(|| format!("Некорректный TOML в {}", what.display()))?;
+    validate(&config).with_context(|| format!("Некорректная конфигурация в {}", what.display()))?;
     Ok(config)
 }
 
