@@ -10,6 +10,7 @@ mod cmd_plugin;
 mod cmd_pool;
 mod cmd_ps;
 mod cmd_service;
+mod cmd_shared;
 mod cmd_t3;
 mod cmd_usage;
 mod cmd_wrapper;
@@ -74,6 +75,21 @@ enum Cmd {
     Plugin {
         #[command(subcommand)]
         cmd: cmd_plugin::PluginCmd,
+    },
+    /// Sync shared skills into every harness skill dir.
+    Skills {
+        #[command(subcommand)]
+        cmd: cmd_shared::SkillsCmd,
+    },
+    /// Link global instruction files to the shared ~/AGENTS.md.
+    Instructions {
+        #[command(subcommand)]
+        cmd: cmd_shared::InstructionsCmd,
+    },
+    /// Sync the canonical MCP list into secondary accounts and Codex.
+    Mcp {
+        #[command(subcommand)]
+        cmd: cmd_shared::McpCmd,
     },
     /// Live agent-process tree (read-only; stopping stays `agent-process stop`).
     Ps(cmd_ps::PsArgs),
@@ -219,6 +235,9 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,
+        Cmd::Skills { cmd } => cmd_shared::run_skills(paths, cmd)?,
+        Cmd::Instructions { cmd } => cmd_shared::run_instructions(paths, cmd)?,
+        Cmd::Mcp { cmd } => cmd_shared::run_mcp(paths, cmd)?,
         Cmd::Usage { cmd } => cmd_usage::run(paths, cmd).await?,
         Cmd::Daemon(args) => cmd_daemon::run(paths, args).await?,
         Cmd::Wrapper { cmd } => cmd_wrapper::run(paths, cmd)?,

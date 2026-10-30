@@ -251,7 +251,8 @@ pub fn plan_write_script(path: PathBuf, old: Option<&[u8]>, new: &[u8]) -> Optio
     })
 }
 
-fn describe_diff(path: &Path, old: &[u8], new: &[u8]) -> String {
+/// Line-set diff used by redacted printers too (masked texts in, diff out).
+pub fn describe_diff(path: &Path, old: &[u8], new: &[u8]) -> String {
     const MAX_LINES: usize = 30;
     let header = format!("write {}", path.display());
     let (Ok(old_text), Ok(new_text)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {

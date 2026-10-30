@@ -255,7 +255,9 @@ fn plan_settings_merge(
     }
 }
 
-fn plan_mcp_merge(
+/// Merge the primary's `mcpServers` into the secondary `.claude.json`
+/// (backup, every other key kept).
+pub fn plan_mcp_merge(
     primary_json: &Path,
     home: &Path,
     state_dir: &Path,
@@ -354,7 +356,7 @@ fn mcp_of(bytes: &[u8]) -> Value {
 
 /// Clone an `mcpServers` value with `env`/`headers` entries replaced by key
 /// names only, so diffs never leak tokens.
-fn redact_mcp_servers(value: &Value) -> Value {
+pub fn redact_mcp_servers(value: &Value) -> Value {
     let Value::Object(servers) = value else {
         return value.clone();
     };
