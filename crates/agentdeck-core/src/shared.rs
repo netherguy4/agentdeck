@@ -82,16 +82,29 @@ pub fn skill_targets(home: &Path) -> Vec<SkillTarget> {
     out
 }
 
-/// The single skills source dir: `[shared] skills_source` in instances.toml,
-/// defaulting to the owner's `~/.general/skills`.
-pub fn skills_source(paths: &Paths, home: &Path) -> PathBuf {
+/// Skills source dirs: `[shared] skills_source` in instances.toml, a single
+/// dir or a list (default `~/.general/skills` then `~/.agents/skills`, the
+/// sync-skills sources in its order; later entries win on a name clash).
+pub fn skills_source(paths: &Paths, home: &Path) -> Vec<PathBuf> {
     if let Ok(reg) = Registry::load(paths)
         && let Some(table) = reg.extra.get("shared").and_then(|v| v.as_table())
-        && let Some(dir) = table.get("skills_source").and_then(|v| v.as_str())
+        && let Some(value) = table.get("skills_source")
     {
-        return expand_home(dir, home);
+        let mut dirs = Vec::new();
+        if let Some(dir) = value.as_str() {
+            dirs.push(expand_home(dir, home));
+        } else if let Some(list) = value.as_array() {
+            dirs.extend(
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|dir| expand_home(dir, home)),
+            );
+        }
+        if !dirs.is_empty() {
+            return dirs;
+        }
     }
-    home.join(".general/skills")
+    vec![home.join(".general/skills"), home.join(".agents/skills")]
 }
 
 pub(crate) fn expand_home(value: &str, home: &Path) -> PathBuf {
@@ -109,12 +122,15 @@ struct SkillSrc {
     path: PathBuf,
 }
 
-/// Source skills: entries with a `SKILL.md` that are not symlinks and not
-/// per-harness names. Plugin targets additionally get the ponytail skills
-/// (harnesses that load the plugin themselves must not).
-fn skill_sources(source: &Path, home: &Path, plugin: bool) -> Vec<SkillSrc> {
+/// Source skills merged over every source dir: entries with a `SKILL.md`
+/// that are not symlinks and not per-harness names. On a name clash the
+/// later source wins (sync-skills order). Plugin targets additionally get
+/// the ponytail skills (harnesses that load the plugin themselves must not).
+fn skill_sources(sources: &[PathBuf], home: &Path, plugin: bool) -> Vec<SkillSrc> {
     let mut out = Vec::new();
-    collect_skills(source, &mut out);
+    for source in sources {
+        collect_skills(source, &mut out);
+    }
     if plugin {
         collect_skills(
             &home.join(".claude/plugins/marketplaces/ponytail/skills"),
@@ -122,7 +138,15 @@ fn skill_sources(source: &Path, home: &Path, plugin: bool) -> Vec<SkillSrc> {
         );
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    // Stable sort keeps the later source last in each name group; keep that one.
+    let mut seen = BTreeSet::new();
+    let mut deduped: Vec<SkillSrc> = out
+        .into_iter()
+        .rev()
+        .filter(|s| seen.insert(s.name.clone()))
+        .collect();
+    deduped.sort_by(|a, b| a.name.cmp(&b.name));
+    deduped
 }
 
 fn collect_skills(dir: &Path, out: &mut Vec<SkillSrc>) {
@@ -183,7 +207,7 @@ pub struct SkillStatus {
 
 /// Read-only status across every target dir. Never writes.
 pub fn skills_status(home: &Path, paths: &Paths) -> Vec<SkillStatus> {
-    let source = skills_source(paths, home);
+    let source_dirs = skills_source(paths, home);
     let owned = read_manifest(&manifest_path(paths));
     let mut out = Vec::new();
     for target in skill_targets(home) {
@@ -195,7 +219,7 @@ pub fn skills_status(home: &Path, paths: &Paths) -> Vec<SkillStatus> {
             });
             continue;
         }
-        let sources = skill_sources(&source, home, target.plugin);
+        let sources = skill_sources(&source_dirs, home, target.plugin);
         let names: BTreeSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
         for src in &sources {
             let dst = target.dir.join(&src.name);
@@ -217,7 +241,7 @@ pub fn skills_status(home: &Path, paths: &Paths) -> Vec<SkillStatus> {
                     continue;
                 }
                 let dst = entry.path();
-                if dst == source {
+                if source_dirs.contains(&dst) {
                     continue;
                 }
                 let state = if owned.contains(&dst) || managed_copy_of_gone_source(&dst) {
@@ -283,7 +307,7 @@ fn managed_copy_of_gone_source(dst: &Path) -> bool {
 /// apart from no manifest write. Removes only manifest-owned entries (plus
 /// managed copies of vanished sources); foreign entries are left alone.
 pub fn plan_skills_sync(home: &Path, paths: &Paths) -> anyhow::Result<Vec<Change>> {
-    let source = skills_source(paths, home);
+    let source_dirs = skills_source(paths, home);
     let manifest = manifest_path(paths);
     let owned = read_manifest(&manifest);
     let mut owned: BTreeSet<PathBuf> = owned.into_iter().collect();
@@ -292,7 +316,7 @@ pub fn plan_skills_sync(home: &Path, paths: &Paths) -> anyhow::Result<Vec<Change
         if !target.dir.is_dir() {
             continue;
         }
-        let sources = skill_sources(&source, home, target.plugin);
+        let sources = skill_sources(&source_dirs, home, target.plugin);
         let names: BTreeSet<&str> = sources.iter().map(|s| s.name.as_str()).collect();
         for src in &sources {
             let dst = target.dir.join(&src.name);
@@ -353,7 +377,7 @@ pub fn plan_skills_sync(home: &Path, paths: &Paths) -> anyhow::Result<Vec<Change
                     continue;
                 }
                 let dst = entry.path();
-                if dst == source {
+                if source_dirs.contains(&dst) {
                     continue;
                 }
                 if owned.contains(&dst) || managed_copy_of_gone_source(&dst) {
@@ -1101,12 +1125,55 @@ mod tests {
     }
 
     #[test]
+    fn skills_source_single_string_and_list() {
+        let fx = fixture("source-cfg");
+        fs::create_dir_all(&fx.paths.config_dir).unwrap();
+        // Single string still loads.
+        fs::write(
+            fx.paths.registry_file(),
+            "version = 1\n[shared]\nskills_source = \"~/mys/base\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            skills_source(&fx.paths, &fx.home),
+            vec![fx.home.join("mys/base")]
+        );
+        // List form loads in order; empty list falls back to the default.
+        fs::write(
+            fx.paths.registry_file(),
+            "version = 1\n[shared]\nskills_source = [\"~/a\", \"~/b\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            skills_source(&fx.paths, &fx.home),
+            vec![fx.home.join("a"), fx.home.join("b")]
+        );
+        fs::write(
+            fx.paths.registry_file(),
+            "version = 1\n[shared]\nskills_source = []\n",
+        )
+        .unwrap();
+        assert_eq!(
+            skills_source(&fx.paths, &fx.home),
+            vec![
+                fx.home.join(".general/skills"),
+                fx.home.join(".agents/skills")
+            ]
+        );
+    }
+
+    #[test]
     fn skills_parity_with_sync_skills() {
         let script = PathBuf::from("/home/user/.general/scripts/sync-skills");
         if !script.is_file() {
             return; // owner's helper absent (CI): fixture assertions above still hold
         }
         let fx = skills_fixture();
+        // Second source, like sync-skills (~/.agents/skills after
+        // ~/.general/skills). Disjoint names: sync-skills --check reports
+        // drift for either link when a name exists in both sources, so a
+        // clash cannot be --check-clean (precedence is pinned below).
+        write_skill(&fx.home.join(".agents/skills"), "gamma", "# gamma\n");
         sync(&fx);
         let status = std::process::Command::new(&script)
             .arg("--check")
@@ -1129,6 +1196,27 @@ mod tests {
         assert!(
             status.status.success() || drift.is_empty(),
             "drift:\n{text}"
+        );
+    }
+
+    #[test]
+    fn skills_later_source_wins_on_name_clash() {
+        // Same name in both sources: the later one (~/.agents/skills, the
+        // sync-skills order) wins, matching a sync-skills run's steady state.
+        let fx = skills_fixture();
+        write_skill(
+            &fx.home.join(".agents/skills"),
+            "beta",
+            "# beta from agents\n",
+        );
+        sync(&fx);
+        assert_eq!(
+            fs::read_link(fx.home.join(".claude/skills/beta")).unwrap(),
+            fx.home.join(".agents/skills/beta")
+        );
+        assert_eq!(
+            fs::read(fx.home.join(".gemini/skills/beta/SKILL.md")).unwrap(),
+            b"# beta from agents\n"
         );
     }
 
