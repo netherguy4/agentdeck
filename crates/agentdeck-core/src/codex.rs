@@ -380,6 +380,7 @@ fn plan_hook_trust_merge(
                 path: main_path,
                 contents: shadow_bytes,
                 old: None,
+                backup: None,
             }),
             Err(e) => return Err(e.into()),
             Ok(main_bytes) if main_bytes == shadow_bytes => {}
