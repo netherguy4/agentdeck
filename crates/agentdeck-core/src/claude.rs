@@ -91,6 +91,12 @@ impl Drift {
     }
 }
 
+/// The primary profile is the source of the shared files, never a secondary of itself.
+fn is_primary(primary: &Path, home: &Path) -> bool {
+    home == primary
+        || fs::canonicalize(home).is_ok_and(|h| fs::canonicalize(primary).is_ok_and(|p| h == p))
+}
+
 /// Plan the changes that make `home` a secondary account of `primary`.
 /// `primary_json` is the primary's `.claude.json` (`$HOME/.claude.json`);
 /// a missing one is an error.
@@ -101,6 +107,9 @@ pub fn plan_materialize(
     state_dir: &Path,
     primary_json: &Path,
 ) -> anyhow::Result<Vec<Change>> {
+    if is_primary(primary, home) {
+        return Ok(Vec::new());
+    }
     let mut changes = Vec::new();
     if fs::symlink_metadata(home).is_err() {
         changes.push(Change::Mkdir {
@@ -143,6 +152,9 @@ pub fn plan_materialize(
 /// `primary_json` is the primary's `.claude.json`; a missing one is reported
 /// as drift instead of silently skipping the `mcpServers` comparison.
 pub fn check(primary: &Path, home: &Path, primary_json: &Path) -> anyhow::Result<Vec<Drift>> {
+    if is_primary(primary, home) {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     for name in LINKS {
         let link = home.join(name);
@@ -918,5 +930,25 @@ mod tests {
         );
         assert!(import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "nope").is_err());
         assert!(import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "").is_err());
+    }
+
+    #[test]
+    fn primary_is_not_a_secondary_of_itself() {
+        let fx = fixture();
+        assert!(
+            check(&fx.primary, &fx.primary, &fx.primary.join(".claude.json"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            plan_materialize(
+                &fx.primary,
+                &fx.primary,
+                &fx.state,
+                &fx.primary.join(".claude.json")
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 }
