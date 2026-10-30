@@ -229,14 +229,27 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
 
     for (lang, theme, stem) in [
-        ("en", iced::Theme::Dark, "instances_en"),
-        ("en", iced::Theme::Light, "instances_en_light"),
-        ("ru", iced::Theme::Dark, "instances_ru"),
-        ("ru", iced::Theme::Light, "instances_ru_light"),
+        ("en", agentdeck_gui::style::theme(true), "instances_en"),
+        (
+            "en",
+            agentdeck_gui::style::theme(false),
+            "instances_en_light",
+        ),
+        ("ru", agentdeck_gui::style::theme(true), "instances_ru"),
+        (
+            "ru",
+            agentdeck_gui::style::theme(false),
+            "instances_ru_light",
+        ),
     ] {
         agentdeck_gui::i18n::set_language(lang);
         let state = app::State::for_tests(paths.clone(), data.clone());
-        let mut ui = iced_test::simulator(app::view(&state));
+        // Smaller than the default 1024x768 keeps goldens under 100 KB.
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (760.0, 360.0),
+            app::view(&state),
+        );
         let snapshot = ui.snapshot(&theme).expect("headless snapshot");
         // Golden path gains a `-{renderer}` suffix inside matches_image;
         // exactly one file per stem must exist afterwards.
@@ -294,7 +307,10 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         app::Message::SelectPage(agentdeck_gui::Page::Instances),
     );
     let _ = app::update(&mut state, app::Message::RemoveAsk("claude-main".into()));
-    for theme in [&iced::Theme::Dark, &iced::Theme::Light] {
+    for theme in [
+        &agentdeck_gui::style::theme(true),
+        &agentdeck_gui::style::theme(false),
+    ] {
         agentdeck_gui::i18n::set_language("en");
         let mut ui = iced_test::simulator(app::view(&state));
         ui.snapshot(theme).expect("panel renders");
@@ -578,7 +594,9 @@ fn drift_fix_then_reenable_offer_and_snapshots() {
     for (lang, stem) in [("en", "drift_en"), ("ru", "drift_ru")] {
         agentdeck_gui::i18n::set_language(lang);
         let mut ui = iced_test::simulator(drift::view(&state));
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        let snapshot = ui
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
         assert_snapshot(&snapshot, stem);
         let goldens: Vec<_> = std::fs::read_dir(SNAPSHOTS)
             .expect("snapshots dir")
@@ -645,8 +663,14 @@ fn plugins_page_preview_cancel_and_snapshots() {
     assert!(matches!(state.page(), agentdeck_gui::Page::Plugins));
     for (lang, stem) in [("en", "plugins_en"), ("ru", "plugins_ru")] {
         agentdeck_gui::i18n::set_language(lang);
-        let mut ui = iced_test::simulator(app::view(&state));
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (960.0, 600.0),
+            app::view(&state),
+        );
+        let snapshot = ui
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
         assert_snapshot(&snapshot, stem);
         let golden = std::fs::read_dir(SNAPSHOTS)
             .expect("snapshots dir")
@@ -754,7 +778,41 @@ fn fixture_groups() -> Vec<agentdeck_core::processes::SessionGroup> {
             write_bytes: None,
             scope_mem_bytes: None,
         },
+        SessionGroup {
+            kind: GroupKind::Agent {
+                owner: "ses2".to_string(),
+                id: "dev".to_string(),
+            },
+            title: "ses2 (dev)".to_string(),
+            pid: 300,
+            start_ticks: 3000,
+            pgrp: 300,
+            can_stop: true,
+            processes: std::iter::once(fixture_proc(300, "vite"))
+                .chain((301..306).map(|pid| fixture_proc(pid, "mcp-helper")))
+                .collect(),
+            cpu_percent: 12.5,
+            rss_bytes: 310_000_000,
+            read_bytes: None,
+            write_bytes: None,
+            scope_mem_bytes: None,
+        },
     ]
+}
+
+/// Processes page with the busy group expanded, as the goldens show it.
+fn processes_state(paths: &Paths) -> app::State {
+    let data = data::Data {
+        processes: fixture_groups(),
+        ..data::Data::default()
+    };
+    let mut state = app::State::for_tests(paths.clone(), data);
+    let _ = app::update(
+        &mut state,
+        app::Message::SelectPage(agentdeck_gui::Page::Processes),
+    );
+    let _ = app::update(&mut state, app::Message::ProcToggle(300, 3000));
+    state
 }
 
 #[test]
@@ -765,17 +823,19 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
 
     for (lang, stem) in [("en", "processes_en"), ("ru", "processes_ru")] {
         agentdeck_gui::i18n::set_language(lang);
-        let data = data::Data {
-            processes: fixture_groups(),
-            ..data::Data::default()
-        };
-        let mut state = app::State::for_tests(paths.clone(), data);
-        let _ = app::update(
-            &mut state,
-            app::Message::SelectPage(agentdeck_gui::Page::Processes),
+        let state = processes_state(&paths);
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (960.0, 420.0),
+            app::view(&state),
         );
-        let mut ui = iced_test::simulator(app::view(&state));
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        // Non-stoppable T3 scopes are not shown at all.
+        assert!(ui.find("t3code-abc123.scope").is_err());
+        // Identical helpers fold into one line.
+        ui.find("mcp-helper 60 ×5").expect("folded helpers");
+        let snapshot = ui
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
         assert_snapshot(&snapshot, stem);
         let goldens: Vec<_> = std::fs::read_dir(SNAPSHOTS)
             .expect("snapshots dir")
@@ -802,15 +862,29 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
     // Fixture pids are fake, so the fresh member lookup falls back to the
     // snapshot rows and nothing is ever signaled.
     agentdeck_gui::i18n::set_language("en");
-    let data = data::Data {
-        processes: fixture_groups(),
-        ..data::Data::default()
-    };
-    let mut state = app::State::for_tests(paths, data);
-    let _ = app::update(
-        &mut state,
-        app::Message::SelectPage(agentdeck_gui::Page::Processes),
-    );
+    let mut state = processes_state(&paths);
+    let _ = app::update(&mut state, app::Message::ProcToggle(300, 3000));
+    let _ = app::update(&mut state, app::Message::ProcStop(0));
+    assert!(state.proc_ui().pending.is_some());
+    // Esc closes the modal.
+    let _ = app::update(&mut state, app::Message::Escape);
+    assert!(state.proc_ui().pending.is_none());
+    // Enter never confirms the destructive Stop dialog.
+    let _ = app::update(&mut state, app::Message::ProcStop(0));
+    let _ = app::update(&mut state, app::Message::Enter);
+    assert!(state.proc_ui().pending.is_some());
+    let _ = app::update(&mut state, app::Message::ProcCancel);
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("ses1 (abc)").expect("group row toggles");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    {
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.find("sh 60").expect("expanded members");
+    }
+    // Busiest group first: the first Stop is ses2's, and its modal lists
+    // every process, folded helpers included.
     let mut ui = iced_test::simulator(app::view(&state));
     ui.click("Stop").expect("stop button");
     for message in ui.into_messages() {
@@ -821,10 +895,55 @@ fn snapshots_processes_en_ru_and_stop_dialog() {
     assert!(state.proc_ui().force);
     let mut ui = iced_test::simulator(app::view(&state));
     ui.find("Stop now").expect("confirm button");
-    ui.find("100  sleep 60").expect("listed member pid");
+    ui.find("300  vite 60").expect("listed member pid");
+    ui.find("305  mcp-helper 60").expect("every helper listed");
     ui.click("Cancel").expect("cancel button");
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
     assert!(state.proc_ui().pending.is_none());
+}
+
+/// Review shots of the three design variants (Instances, Processes, Stop
+/// modal) for the owner; runs only with AGENTDECK_VARIANT_SHOTS=<dir>.
+#[test]
+fn variant_review_shots() {
+    let Some(dir) = std::env::var_os("AGENTDECK_VARIANT_SHOTS").map(PathBuf::from) else {
+        return;
+    };
+    use agentdeck_gui::style::{Variant, set_variant};
+    let env = lock_env();
+    let (data, paths, _guard) = load_with_fixtures("variants", &env);
+    std::fs::create_dir_all(&dir).unwrap();
+    agentdeck_gui::i18n::set_language("en");
+    for (variant, tag) in [
+        (Variant::Minimal, "a"),
+        (Variant::Glass, "b"),
+        (Variant::Console, "c"),
+    ] {
+        set_variant(variant);
+        let theme = agentdeck_gui::style::theme(true);
+        let instances = app::State::for_tests(paths.clone(), data.clone());
+        let procs = processes_state(&paths);
+        let mut modal = processes_state(&paths);
+        let _ = app::update(&mut modal, app::Message::ProcStop(0));
+        for (name, state) in [
+            ("instances", &instances),
+            ("processes", &procs),
+            ("modal", &modal),
+        ] {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                (1100.0, 700.0),
+                app::view(state),
+            );
+            let shot = ui.snapshot(&theme).expect("headless snapshot");
+            let stem = dir.join(format!("{tag}-{name}"));
+            let written = dir.join(format!("{tag}-{name}-wgpu.png"));
+            let _ = std::fs::remove_file(&written);
+            assert!(shot.matches_image(stem.with_extension("png")).unwrap());
+            std::fs::rename(&written, stem.with_extension("png")).unwrap();
+        }
+    }
+    set_variant(Variant::Minimal);
 }

@@ -208,13 +208,9 @@ fn section<'a>(heading: String, lines: &'a [String], action: (String, Kind)) -> 
     .into()
 }
 
-pub fn view(state: &State) -> Element<'_, Msg> {
-    let mut col = column![st::title(fl!(loader(), "shared-title"))].spacing(st::SPACE_M);
-    if let Some(error) = &state.snap.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
-    }
-    if let Some(p) = &state.pending {
-        col = col.push(st::confirm_panel(
+pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
+    state.pending.as_ref().map(|p| {
+        crate::overlay::confirm(
             fl!(loader(), "shared-preview-title"),
             &p.lines,
             (
@@ -222,7 +218,14 @@ pub fn view(state: &State) -> Element<'_, Msg> {
                 (!p.changes.is_empty()).then_some(Msg::Confirm),
             ),
             (fl!(loader(), "action-cancel"), Msg::Cancel),
-        ));
+        )
+    })
+}
+
+pub fn view(state: &State) -> Element<'_, Msg> {
+    let mut col = column![st::title(fl!(loader(), "shared-title"))].spacing(st::SPACE_M);
+    if let Some(error) = &state.snap.error {
+        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
     col = col.push(section(
         fl!(loader(), "shared-skills"),

@@ -18,7 +18,24 @@ pub struct Pending {
     pub preview: Vec<String>,
 }
 
-pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Message> {
+pub fn modal(p: &Pending) -> crate::overlay::Modal<'_, Message> {
+    let title = if p.enable {
+        fl!(loader(), "plugins-preview-enable", name = p.name.clone())
+    } else {
+        fl!(loader(), "plugins-preview-disable", name = p.name.clone())
+    };
+    crate::overlay::confirm(
+        title,
+        &p.preview,
+        (
+            fl!(loader(), "plugins-confirm"),
+            Some(Message::ConfirmPlugin),
+        ),
+        (fl!(loader(), "plugins-cancel"), Message::CancelPlugin),
+    )
+}
+
+pub fn view(data: &Data) -> Element<'_, Message> {
     let mut col = column![st::title(fl!(loader(), "plugins-title"))].spacing(st::SPACE_M);
     if let Some(error) = &data.error {
         col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
@@ -64,32 +81,6 @@ pub fn view<'a>(data: &'a Data, pending: Option<&'a Pending>) -> Element<'a, Mes
             );
         }
         col = col.push(card);
-    }
-    if let Some(p) = pending {
-        let title = if p.enable {
-            fl!(loader(), "plugins-preview-enable", name = p.name.clone())
-        } else {
-            fl!(loader(), "plugins-preview-disable", name = p.name.clone())
-        };
-        let lines: Vec<Element<'_, Message>> = p
-            .preview
-            .iter()
-            .map(|l| st::body(l.clone()).into())
-            .collect();
-        col = col.push(st::panel(
-            title,
-            lines,
-            vec![
-                button(st::body(fl!(loader(), "plugins-confirm")))
-                    .style(button::primary)
-                    .on_press(Message::ConfirmPlugin)
-                    .into(),
-                button(st::body(fl!(loader(), "plugins-cancel")))
-                    .style(button::secondary)
-                    .on_press(Message::CancelPlugin)
-                    .into(),
-            ],
-        ));
     }
     col.into()
 }

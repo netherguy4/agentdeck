@@ -167,3 +167,21 @@ harness-install = Установить
 harness-run-title = Выполнить эту команду?
 harness-note = Команда выполняется как показано, больше ничего не затрагивается.
 harness-result = { $name }: { $what }
+
+nav-group-accounts = Аккаунты
+nav-group-system = Система
+instances-purpose = Логины харнессов, их статус в T3 и окна квот.
+processes-purpose = Группы процессов агентов, которые можно остановить. Сессии T3 не показаны.
+processes-filter = Фильтр по имени или команде
+processes-no-match = Ни одна группа не подходит под фильтр.
+processes-count = { $count ->
+    [one] { $count } процесс
+    [few] { $count } процесса
+   *[many] { $count } процессов
+}
+remove-done = { $id } удалён.
+col-name = Имя
+col-id = Id
+col-harness = Харнесс
+col-threads = Треды
+col-group = Группа

@@ -163,3 +163,20 @@ harness-install = Install
 harness-run-title = Run this command?
 harness-note = The command runs as shown; nothing else is touched.
 harness-result = { $name }: { $what }
+
+nav-group-accounts = Accounts
+nav-group-system = System
+instances-purpose = Harness logins, their T3 status and quota windows.
+processes-purpose = Agent-owned process groups you can stop. T3 sessions are not listed.
+processes-filter = Filter by name or command
+processes-no-match = No process group matches the filter.
+processes-count = { $count ->
+    [one] { $count } process
+   *[other] { $count } processes
+}
+remove-done = Removed { $id }.
+col-name = Name
+col-id = Id
+col-harness = Harness
+col-threads = Threads
+col-group = Group

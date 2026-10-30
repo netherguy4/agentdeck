@@ -102,8 +102,15 @@ fn wizard_snapshots_en_ru() {
     std::fs::create_dir_all(SNAPSHOTS).unwrap();
     for (lang, stem) in [("en", "add_en"), ("ru", "add_ru")] {
         agentdeck_gui::i18n::set_language(lang);
-        let mut ui = iced_test::simulator(app::view(&state));
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        // Smaller height keeps the golden under 100 KB.
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (900.0, 520.0),
+            app::view(&state),
+        );
+        let snapshot = ui
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
         // Goldens depend on this machine's fonts and GPU rasterizer.
         if std::env::var_os("CI").is_none() {
             assert!(

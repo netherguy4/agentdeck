@@ -3,11 +3,12 @@
 use std::time::Duration;
 
 use i18n_embed_fl::fl;
-use iced::widget::{button, column, container, scrollable, text};
-use iced::{Element, Length, Subscription, Task, Theme};
+use iced::widget::{button, column, container, row, scrollable, text};
+use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 
 use crate::data::{self, Data};
 use crate::i18n::loader;
+use crate::overlay::{self, Modal, Toast};
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
@@ -63,7 +64,14 @@ pub enum Message {
     ProcConfirm,
     ProcCancel,
     ProcForce(bool),
-    ProcDone { title: String, result: String },
+    ProcDone { result: String, error: bool },
+    ProcToggle(u32, u64),
+    ProcFilter(String),
+    Escape,
+    Enter,
+    ThemeMode(iced::theme::Mode),
+    ToastClose(u64),
+    ToastTick,
     Pool(pages::pool::Msg),
     Shared(pages::shared::Msg),
     Harnesses(pages::harnesses::Msg),
@@ -118,6 +126,9 @@ pub struct State {
     pool: pool::State,
     shared: shared::State,
     harnesses: harnesses::State,
+    toasts: Vec<Toast>,
+    next_toast: u64,
+    dark: bool,
 }
 
 fn home_dir() -> std::path::PathBuf {
@@ -159,11 +170,17 @@ impl State {
                 pool: pool::State::default(),
                 shared: shared::State::default(),
                 harnesses: harnesses::State::default(),
+                toasts: Vec::new(),
+                next_toast: 0,
+                dark: true,
             },
-            match first {
-                Some(paths) => load_data(paths),
-                None => Task::none(),
-            },
+            Task::batch([
+                match first {
+                    Some(paths) => load_data(paths),
+                    None => Task::none(),
+                },
+                iced::system::theme().map(Message::ThemeMode),
+            ]),
         )
     }
 
@@ -182,7 +199,24 @@ impl State {
             pool: pool::State::default(),
             shared: shared::State::default(),
             harnesses: harnesses::State::default(),
+            toasts: Vec::new(),
+            next_toast: 0,
+            dark: true,
         }
+    }
+
+    pub fn toasts(&self) -> &[Toast] {
+        &self.toasts
+    }
+
+    fn toast(&mut self, text: String, error: bool) {
+        self.next_toast += 1;
+        self.toasts.push(Toast {
+            id: self.next_toast,
+            text,
+            error,
+            at: std::time::Instant::now(),
+        });
     }
 
     pub fn page(&self) -> Page {
@@ -297,6 +331,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 Ok(outcome) => {
                     state.data.instances.retain(|i| i.id != outcome.id);
                     state.remove = None;
+                    state.toast(fl!(loader(), "remove-done", id = outcome.id), false);
                 }
                 Err(e) => {
                     if let Some(ask) = state.remove.as_mut() {
@@ -328,7 +363,6 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             });
             state.proc_ui.pending = pending;
             state.proc_ui.force = false;
-            state.proc_ui.result = None;
             Task::none()
         }
         Message::ProcConfirm => match state.proc_ui.pending.clone() {
@@ -357,13 +391,13 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                                         &g.title, &o.outcome,
                                     );
                                     Message::ProcDone {
-                                        title: g.title,
                                         result,
+                                        error: false,
                                     }
                                 }
                                 Err(e) => Message::ProcDone {
-                                    title: g.title.clone(),
                                     result: format!("{}: {e:#}", g.title),
+                                    error: true,
                                 },
                             }
                         },
@@ -382,9 +416,9 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.proc_ui.force = force;
             Task::none()
         }
-        Message::ProcDone { title: _, result } => {
-            state.proc_ui.result = Some(result);
-            // Refresh behind the result line.
+        Message::ProcDone { result, error } => {
+            state.toast(result, error);
+            // Refresh behind the toast.
             match state.paths.clone() {
                 Some(paths) => load_data(paths),
                 None => Task::none(),
@@ -402,6 +436,38 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
         },
         Message::Harnesses(msg) => {
             harnesses::update(&mut state.harnesses, msg).map(Message::Harnesses)
+        }
+        Message::ProcToggle(pid, ticks) => {
+            if !state.proc_ui.expanded.remove(&(pid, ticks)) {
+                state.proc_ui.expanded.insert((pid, ticks));
+            }
+            Task::none()
+        }
+        Message::ProcFilter(filter) => {
+            state.proc_ui.filter = filter;
+            Task::none()
+        }
+        // Keys act on the open modal only; its messages decide what happens.
+        Message::Escape => match modal(state).map(|m| m.on_cancel) {
+            Some(msg) => update(state, msg),
+            None => Task::none(),
+        },
+        Message::Enter => match modal(state).and_then(|m| m.on_submit) {
+            Some(msg) => update(state, msg),
+            None => Task::none(),
+        },
+        Message::ThemeMode(mode) => {
+            state.dark = mode != iced::theme::Mode::Light;
+            Task::none()
+        }
+        Message::ToastClose(id) => {
+            state.toasts.retain(|t| t.id != id);
+            Task::none()
+        }
+        Message::ToastTick => {
+            let now = std::time::Instant::now();
+            state.toasts.retain(|t| !overlay::expired(t, now));
+            Task::none()
         }
         Message::Noop => Task::none(),
         Message::Drift(inner) => match state.paths.clone() {
@@ -499,58 +565,209 @@ fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<Stri
 pub fn subscription(state: &State) -> Subscription<Message> {
     // The Processes page shows live resources; everything else keeps 5 s.
     let secs = if state.page == Page::Processes { 2 } else { 5 };
-    Subscription::batch([
+    let mut subs = vec![
         iced::time::every(Duration::from_secs(secs)).map(|_| Message::Tick),
         add_instance::subscription(&state.add),
-    ])
+        iced::keyboard::listen().filter_map(|event| match event {
+            iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(named),
+                ..
+            } => match named {
+                iced::keyboard::key::Named::Escape => Some(Message::Escape),
+                iced::keyboard::key::Named::Enter => Some(Message::Enter),
+                _ => None,
+            },
+            _ => None,
+        }),
+        iced::system::theme_changes().map(Message::ThemeMode),
+    ];
+    if state.toasts.iter().any(|t| !t.error) {
+        subs.push(iced::time::every(Duration::from_millis(500)).map(|_| Message::ToastTick));
+    }
+    Subscription::batch(subs)
+}
+
+/// The dialog open on the current page, if any.
+fn modal(state: &State) -> Option<Modal<'_, Message>> {
+    match state.page {
+        Page::Instances => state.remove.as_ref().map(pages::instances::remove_modal),
+        Page::Processes => state
+            .proc_ui
+            .pending
+            .as_ref()
+            .map(|p| pages::processes::stop_modal(p, state.proc_ui.force)),
+        Page::Plugins => state.pending.as_ref().map(pages::plugins::modal),
+        Page::Drift => drift::modal(&state.drift).map(|m| m.map(Message::Drift)),
+        Page::Pool => pool::modal(&state.pool).map(|m| m.map(Message::Pool)),
+        Page::Shared => shared::modal(&state.shared).map(|m| m.map(Message::Shared)),
+        Page::Harnesses => harnesses::modal(&state.harnesses).map(|m| m.map(Message::Harnesses)),
+        Page::AddInstance => None,
+    }
+}
+
+fn drift_count(state: &State) -> usize {
+    state
+        .drift
+        .snapshot
+        .groups
+        .iter()
+        .map(|g| g.items.len())
+        .sum()
+}
+
+fn nav_item(state: &State, page: Page, icon: st::Icon) -> Element<'_, Message> {
+    let look = st::look();
+    let selected =
+        state.page == page || (page == Page::Instances && state.page == Page::AddInstance);
+    let mut line = row![
+        st::icon_colored(icon, look.body + 2.0, move |c| if selected {
+            c.text
+        } else {
+            c.muted
+        }),
+        text(page.label()).size(look.body).width(Length::Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    if page == Page::Drift && drift_count(state) > 0 {
+        line = line.push(st::pill(drift_count(state).to_string(), st::Tone::Warn));
+    }
+    button(line)
+        .width(Length::Fill)
+        .padding([look.button_pad[0] + 2.0, 10.0])
+        .style(st::nav_style(selected))
+        .on_press(Message::SelectPage(page))
+        .into()
 }
 
 fn sidebar(state: &State) -> Element<'_, Message> {
-    // Light sidebar: plain text buttons, the selected page in accent fill.
-    let mut col = column![].spacing(st::SPACE_XS).width(st::SIDEBAR_WIDTH);
-    for page in [
-        Page::Instances,
-        Page::Drift,
-        Page::Plugins,
-        Page::Pool,
-        Page::Shared,
-        Page::Harnesses,
-        Page::Processes,
-    ] {
-        let mut btn = button(text(page.label()).size(st::BODY).width(Length::Fill))
-            .width(Length::Fill)
-            .style(button::text)
-            .on_press(Message::SelectPage(page));
-        if state.page == page {
-            btn = btn.style(button::primary);
+    let look = st::look();
+    let group = |label: String, items: &[(Page, st::Icon)]| {
+        let mut col = column![container(st::caption(label)).padding([0, 10])].spacing(2);
+        for &(page, icon) in items {
+            col = col.push(nav_item(state, page, icon));
         }
-        col = col.push(btn);
-    }
-    container(col).padding(st::SPACE_L).into()
+        col
+    };
+    let col = column![
+        container(st::heading(fl!(loader(), "app-title"))).padding([4, 10]),
+        group(
+            fl!(loader(), "nav-group-accounts"),
+            &[
+                (Page::Instances, st::Icon::Users),
+                (Page::Drift, st::Icon::Compare),
+                (Page::Pool, st::Icon::Layers),
+            ],
+        ),
+        group(
+            fl!(loader(), "nav-group-system"),
+            &[
+                (Page::Plugins, st::Icon::Plug),
+                (Page::Shared, st::Icon::Share),
+                (Page::Harnesses, st::Icon::Wrench),
+                (Page::Processes, st::Icon::Activity),
+            ],
+        ),
+    ]
+    .spacing(look.gap.max(12.0) + 6.0);
+    container(col)
+        .width(look.sidebar_width)
+        .height(Length::Fill)
+        .padding([look.page_pad, 10.0])
+        .style(st::sidebar_style)
+        .into()
+}
+
+/// Fixed page header: title, one-line purpose, primary action on the right.
+fn page_header<'a>(
+    title: String,
+    purpose: String,
+    action: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let look = st::look();
+    container(
+        row![
+            column![st::title(title), st::muted(purpose)]
+                .spacing(2)
+                .width(Length::Fill),
+            action,
+        ]
+        .spacing(st::SPACE_M)
+        .align_y(Alignment::Center),
+    )
+    .padding([look.page_pad * 0.7, look.page_pad])
+    .into()
 }
 
 pub fn view(state: &State) -> Element<'_, Message> {
+    let look = st::look();
+    let header = match state.page {
+        Page::Instances => Some(page_header(
+            fl!(loader(), "instances-title"),
+            fl!(loader(), "instances-purpose"),
+            st::btn_icon(
+                st::Btn::Primary,
+                st::Icon::Plus,
+                fl!(loader(), "instances-add"),
+            )
+            .on_press(Message::SelectPage(Page::AddInstance))
+            .into(),
+        )),
+        Page::Processes => Some(page_header(
+            fl!(loader(), "processes-title"),
+            fl!(loader(), "processes-purpose"),
+            pages::processes::filter_input(&state.proc_ui),
+        )),
+        // Part 2 moves the remaining pages' titles into this header.
+        _ => None,
+    };
     let content: Element<'_, Message> = match state.page {
-        Page::Instances => crate::pages::instances::view(&state.data, state.remove.as_ref()),
-        Page::AddInstance => crate::pages::add_instance::view(&state.add),
-        Page::Drift => crate::pages::drift::view(&state.drift).map(Message::Drift),
-        Page::Plugins => crate::pages::plugins::view(&state.data, state.pending.as_ref()),
-        Page::Processes => crate::pages::processes::view(&state.data, &state.proc_ui),
+        Page::Instances => pages::instances::view(&state.data),
+        Page::AddInstance => add_instance::view(&state.add),
+        Page::Drift => drift::view(&state.drift).map(Message::Drift),
+        Page::Plugins => pages::plugins::view(&state.data),
+        Page::Processes => pages::processes::view(&state.data, &state.proc_ui),
         Page::Pool => pool::view(&state.pool).map(Message::Pool),
         Page::Shared => shared::view(&state.shared).map(Message::Shared),
         Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),
     };
-    iced::widget::row![
-        sidebar(state),
-        scrollable(container(content).padding(st::SPACE_L)).width(Length::Fill),
-    ]
-    .into()
+    let mut main = column![];
+    if let Some(header) = header {
+        main = main.push(header).push(st::hairline());
+    }
+    let body = container(
+        container(content)
+            .max_width(look.content_max)
+            .padding(look.page_pad),
+    )
+    .center_x(Length::Fill);
+    let main = main.push(
+        scrollable(body)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(6)
+                    .scroller_width(6)
+                    .margin(2),
+            ))
+            .style(st::scroll_style)
+            .height(Length::Fill)
+            .width(Length::Fill),
+    );
+    let shell = row![sidebar(state), st::hairline_v(), main].height(Length::Fill);
+    overlay::layer(
+        shell.into(),
+        overlay::toasts(&state.toasts, Message::ToastClose),
+        modal(state),
+    )
 }
 
-/// `None` lets iced match the system color scheme (dark/light); it falls back
-/// to its own default when the OS exposes nothing.
-pub fn theme(_state: &State) -> Option<Theme> {
-    None
+/// Variant palette, following the system dark/light preference.
+pub fn theme(state: &State) -> Option<Theme> {
+    Some(st::theme(state.dark))
+}
+
+pub fn style(_state: &State, theme: &Theme) -> iced::theme::Style {
+    st::app_style(theme)
 }
 
 pub fn title(_state: &State) -> String {
