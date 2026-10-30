@@ -1,4 +1,5 @@
-//! `agentdeck t3` commands: read-only status, validated sync, registry import.
+//! `agentdeck t3` commands: read-only status, validated sync, registry import,
+//! and the false→observe→true re-enable toggle for failed instances.
 
 use agentdeck_core::{Paths, t3};
 use clap::Subcommand;
@@ -19,6 +20,18 @@ pub enum T3Cmd {
     Import {
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Re-enable a failed instance: toggle enabled false→true in settings,
+    /// observing a fresh disabled cache result before writing true, then wait
+    /// for a fresh probe. Exits 0 = recovered, 1 = failed again, 2 = timeout.
+    Reenable {
+        id: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
     },
 }
 
@@ -91,6 +104,32 @@ pub fn run_t3(paths: &Paths, cmd: T3Cmd) -> anyhow::Result<()> {
                 println!("nothing to import");
             } else if dry_run {
                 println!("dry-run: registry unchanged");
+            }
+        }
+        T3Cmd::Reenable {
+            id,
+            dry_run,
+            force,
+            timeout_secs,
+        } => {
+            let report = t3::reenable(
+                paths,
+                &root,
+                &id,
+                &t3::ReenableOpts {
+                    timeout_secs,
+                    force,
+                    dry_run,
+                },
+            )?;
+            for e in &report.events {
+                println!("{e}");
+            }
+            println!("{}", report.final_line);
+            match report.outcome {
+                t3::ReenableOutcome::Recovered | t3::ReenableOutcome::DryRun => {}
+                t3::ReenableOutcome::FailedAgain => std::process::exit(1),
+                t3::ReenableOutcome::Timeout => std::process::exit(2),
             }
         }
     }
