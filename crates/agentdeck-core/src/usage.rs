@@ -74,8 +74,6 @@ pub struct UsageEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_file: Option<String>,
     /// Unknown keys are preserved verbatim so a rewrite never loses them.
     #[serde(flatten, default)]
@@ -123,7 +121,6 @@ impl UsageEntry {
                 no("codex_home", &self.codex_home)?;
                 no("token_file", &self.token_file)?;
                 no("api_key_env", &self.api_key_env)?;
-                no("api_key_file", &self.api_key_file)?;
                 no("db_file", &self.db_file)?;
             }
             UsageKind::Codex => {
@@ -131,25 +128,17 @@ impl UsageEntry {
                 no("config_dir", &self.config_dir)?;
                 no("token_file", &self.token_file)?;
                 no("api_key_env", &self.api_key_env)?;
-                no("api_key_file", &self.api_key_file)?;
                 no("db_file", &self.db_file)?;
             }
             UsageKind::Antigravity => {
                 no("config_dir", &self.config_dir)?;
                 no("codex_home", &self.codex_home)?;
                 no("api_key_env", &self.api_key_env)?;
-                no("api_key_file", &self.api_key_file)?;
                 no("db_file", &self.db_file)?;
             }
             UsageKind::Deepseek | UsageKind::Openrouter => {
-                match (&self.api_key_env, &self.api_key_file) {
-                    (Some(_), None) | (None, Some(_)) => {}
-                    _ => anyhow::bail!(
-                        "usage {:?} (kind {}): set exactly one of api_key_env, api_key_file",
-                        self.id,
-                        self.kind.as_str()
-                    ),
-                }
+                // Keys live in the 0600 env file; the schema only holds the var name.
+                req("api_key_env", &self.api_key_env)?;
                 no("config_dir", &self.config_dir)?;
                 no("codex_home", &self.codex_home)?;
                 no("token_file", &self.token_file)?;
@@ -160,7 +149,6 @@ impl UsageEntry {
                 no("codex_home", &self.codex_home)?;
                 no("token_file", &self.token_file)?;
                 no("api_key_env", &self.api_key_env)?;
-                no("api_key_file", &self.api_key_file)?;
             }
         }
         Ok(())
@@ -326,7 +314,6 @@ mod tests {
             codex_home: None,
             token_file: None,
             api_key_env: None,
-            api_key_file: None,
             db_file: None,
             extra: Default::default(),
         };
@@ -377,16 +364,22 @@ mod tests {
             )
             .is_err()
         );
-        // deepseek needs exactly one key pointer
+        // deepseek needs a key pointer
         assert!(
             Registry::from_toml("version = 1\n[[usage]]\nid = \"a\"\nkind = \"deepseek\"\n")
                 .is_err()
         );
-        assert!(
-            Registry::from_toml(
-                "version = 1\n[[usage]]\nid = \"a\"\nkind = \"deepseek\"\napi_key_env = \"E\"\napi_key_file = \"f\"\n"
-            )
-            .is_err()
+        // a stale api_key_file key is preserved verbatim, not rejected
+        let reg = Registry::from_toml(
+            "version = 1\n[[usage]]\nid = \"a\"\nkind = \"deepseek\"\napi_key_env = \"E\"\napi_key_file = \"f\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reg.usage[0]
+                .extra
+                .get("api_key_file")
+                .and_then(|v| v.as_str()),
+            Some("f")
         );
         // duplicate usage ids
         assert!(

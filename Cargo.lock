@@ -124,6 +124,7 @@ dependencies = [
  "anyhow",
  "clap",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

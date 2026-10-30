@@ -1,18 +1,13 @@
 mod setup;
 
-use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command as StdCommand;
-use std::time::Duration;
 
 use agentdeck_usage::config::AccountConfig;
-use agentdeck_usage::model::AppState;
-use agentdeck_usage::PROVIDER_DEADLINE;
-use agentdeck_usage::{config, history, model, providers, util};
+use agentdeck_usage::{config, daemon, providers, util};
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
-use tokio::task::JoinSet;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -493,151 +488,34 @@ fn init() -> Result<()> {
 }
 
 async fn daemon() -> Result<()> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut consecutive_failures: u32 = 0;
-    let mut last_history = None;
-    loop {
-        let config = config::load()?;
-        let state = refresh(&config).await;
-        write_state(&state)?;
-        log_cycle(&state);
-        // Журнал вторичен: его сбой не должен останавливать обновление панели.
-        if let Err(error) = history::append(&history::history_file(), &state, &mut last_history) {
-            eprintln!("Не удалось дописать history.jsonl: {error}");
-        }
-
-        let has_transient_error = state
-            .accounts
-            .iter()
-            .any(|a| a.status == "error" || (a.status == "stale" && a.error.is_some()));
-
-        let sleep_duration = if has_transient_error {
-            consecutive_failures = consecutive_failures.saturating_add(1);
-            failure_backoff(consecutive_failures, config.refresh_interval())
-        } else {
-            consecutive_failures = 0;
-            Duration::from_secs(config.refresh_interval())
-        };
-
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_duration) => {},
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
-        }
-    }
-    Ok(())
+    // Same polling loop as `agentdeck daemon`, with the old paths and the old
+    // re-read policy (config file is reloaded every cycle). Never refuses on
+    // the old service: this binary IS the old service.
+    daemon::run_daemon(
+        &daemon::DaemonPaths::legacy(),
+        || false,
+        || {
+            let config = config::load()?;
+            Ok((
+                config.accounts,
+                config.refresh_seconds,
+                config.stale_seconds,
+            ))
+        },
+    )
+    .await
 }
 
 async fn once() -> Result<()> {
-    let _terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let config = config::load()?;
-    let state = refresh(&config).await;
-    write_state(&state)?;
+    let state = daemon::run_once(
+        &daemon::DaemonPaths::legacy(),
+        &config.accounts,
+        config.stale_seconds,
+        false,
+    )
+    .await?;
     println!("{}", serde_json::to_string_pretty(&state)?);
-    Ok(())
-}
-
-/// Верхняя граница на один provider fetch (см. agentdeck_usage::PROVIDER_DEADLINE).
-async fn refresh(config: &config::Config) -> AppState {
-    let mut tasks = JoinSet::new();
-    for (index, account) in config.accounts.iter().cloned().enumerate() {
-        let stale_seconds = config.stale_seconds;
-        tasks.spawn(async move {
-            let id = account.id().to_owned();
-            let name = account.name().to_owned();
-            let provider = account.provider();
-            let fetch = providers::fetch(account, stale_seconds);
-            let state = match tokio::time::timeout(PROVIDER_DEADLINE, fetch).await {
-                Ok(state) => state,
-                Err(_) => model::AccountState::error(
-                    &id,
-                    &name,
-                    provider,
-                    format!(
-                        "Провайдер не ответил за {} секунд",
-                        PROVIDER_DEADLINE.as_secs()
-                    ),
-                ),
-            };
-            (index, state)
-        });
-    }
-
-    let mut ordered = vec![None; config.accounts.len()];
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((index, state)) => ordered[index] = Some(state),
-            Err(error) => eprintln!("Ошибка задачи обновления: {error}"),
-        }
-    }
-
-    let accounts = ordered.into_iter().flatten().collect();
-    let accounts = model::merge_with_previous(read_state(), accounts);
-
-    AppState {
-        schema_version: model::SCHEMA_VERSION,
-        updated_at: util::unix_now(),
-        accounts,
-    }
-}
-
-/// Однострочный итог цикла в journal: статус, возраст данных и ошибка каждого
-/// аккаунта. Без него причину «старых цифр» приходится выкапывать из state.json
-/// руками. Смотреть: journalctl --user -u ai-usage.service
-fn log_cycle(state: &AppState) {
-    let summary = state
-        .accounts
-        .iter()
-        .map(|account| {
-            let age = state.updated_at.saturating_sub(account.updated_at);
-            let mut part = format!(
-                "{}={} (данные: {})",
-                account.id,
-                account.status,
-                providers::claude::humanize_age(age)
-            );
-            if let Some(error) = &account.error {
-                part.push_str(&format!(" [{}]", error.replace('\n', "; ")));
-            }
-            part
-        })
-        .collect::<Vec<_>>()
-        .join(" | ");
-    eprintln!("[цикл] {summary}");
-}
-
-fn failure_backoff(consecutive_failures: u32, max_interval: u64) -> Duration {
-    let backoff = config::MIN_REFRESH_SECONDS
-        .saturating_mul(1 << (consecutive_failures.saturating_sub(1)).min(3));
-    Duration::from_secs(backoff.min(max_interval))
-}
-
-fn persistent_state_file() -> PathBuf {
-    util::persistent_state_dir().join("state.json")
-}
-
-fn read_state_from(runtime_path: &Path, persistent_path: &Path) -> Option<AppState> {
-    if let Ok(raw) = fs::read_to_string(runtime_path) {
-        if let Ok(state) = serde_json::from_str::<AppState>(&raw) {
-            return Some(state);
-        }
-    }
-    let raw = fs::read_to_string(persistent_path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn read_state() -> Option<AppState> {
-    read_state_from(&util::state_file(), &persistent_state_file())
-}
-
-fn write_state(state: &AppState) -> Result<()> {
-    let bytes = serde_json::to_string_pretty(state)?.into_bytes();
-    let runtime_path = util::state_file();
-    util::atomic_write(&runtime_path, &bytes)?;
-    let persistent_path = persistent_state_file();
-    let _ = util::atomic_write_mode(&persistent_path, &bytes, Some(0o600));
     Ok(())
 }
 
@@ -769,7 +647,10 @@ fn doctor() -> Result<()> {
     }
 
     println!("\nState file: {}", util::state_file().display());
-    println!("Persistent state: {}", persistent_state_file().display());
+    println!(
+        "Persistent state: {}",
+        util::persistent_state_dir().join("state.json").display()
+    );
     println!("Для сетевой проверки: ai-usage once");
     Ok(())
 }
@@ -779,54 +660,5 @@ fn mark(ok: bool) -> &'static str {
         "[OK]"
     } else {
         "[WARN]"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failure_backoff_steps_up_and_caps_at_max_interval() {
-        assert_eq!(failure_backoff(1, 120), Duration::from_secs(15));
-        assert_eq!(failure_backoff(2, 120), Duration::from_secs(30));
-        assert_eq!(failure_backoff(3, 120), Duration::from_secs(60));
-        assert_eq!(failure_backoff(4, 120), Duration::from_secs(120));
-        assert_eq!(failure_backoff(5, 120), Duration::from_secs(120));
-        assert_eq!(failure_backoff(1, 20), Duration::from_secs(15));
-        assert_eq!(failure_backoff(2, 20), Duration::from_secs(20));
-    }
-
-    #[test]
-    fn read_state_falls_back_to_persistent_storage() {
-        let temp = std::env::temp_dir().join(format!("ai-usage-state-test-{}", std::process::id()));
-        let runtime = temp.join("runtime/state.json");
-        let persistent = temp.join("persistent/state.json");
-        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        fs::create_dir_all(persistent.parent().unwrap()).unwrap();
-
-        let app_state = AppState {
-            schema_version: model::SCHEMA_VERSION,
-            updated_at: 12345,
-            accounts: Vec::new(),
-        };
-        let raw = serde_json::to_string(&app_state).unwrap();
-        fs::write(&persistent, &raw).unwrap();
-
-        // Runtime file does not exist yet: falls back to persistent
-        let loaded = read_state_from(&runtime, &persistent).unwrap();
-        assert_eq!(loaded.updated_at, 12345);
-
-        // When runtime file exists, it takes precedence
-        let runtime_state = AppState {
-            schema_version: model::SCHEMA_VERSION,
-            updated_at: 67890,
-            accounts: Vec::new(),
-        };
-        fs::write(&runtime, serde_json::to_string(&runtime_state).unwrap()).unwrap();
-        let loaded = read_state_from(&runtime, &persistent).unwrap();
-        assert_eq!(loaded.updated_at, 67890);
-
-        fs::remove_dir_all(&temp).ok();
     }
 }
