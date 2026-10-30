@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::changes::{Change, plan_write_file};
 use crate::paths::Paths;
 use crate::pool::PoolEntry;
+use crate::usage::{UsageEntry, validate_all};
 
 const CURRENT_VERSION: u32 = 1;
 
@@ -86,6 +87,8 @@ pub struct Registry {
     pub instances: Vec<Instance>,
     #[serde(rename = "pool", default)]
     pub pool: Vec<PoolEntry>,
+    #[serde(default)]
+    pub usage: Vec<UsageEntry>,
     /// Unknown top-level tables/keys survive rewrites.
     #[serde(flatten)]
     pub extra: toml::map::Map<String, toml::Value>,
@@ -97,6 +100,7 @@ impl Registry {
             version: CURRENT_VERSION,
             instances: Vec::new(),
             pool: Vec::new(),
+            usage: Vec::new(),
             extra: Default::default(),
         }
     }
@@ -152,6 +156,7 @@ impl Registry {
                 anyhow::bail!("duplicate pool entry {:?}", a.describe());
             }
         }
+        validate_all(&mut self.usage, &self.instances)?;
         Ok(())
     }
 
@@ -242,6 +247,18 @@ impl Registry {
                 refs.join("\n  ")
             );
         }
+        let used_by: Vec<String> = self
+            .usage
+            .iter()
+            .filter(|u| u.instance.as_deref() == Some(id))
+            .map(|u| u.id.clone())
+            .collect();
+        if !used_by.is_empty() {
+            anyhow::bail!(
+                "cannot remove instance {id:?}: still used by usage entries:\n  {}",
+                used_by.join("\n  ")
+            );
+        }
         let pos = self
             .instances
             .iter()
@@ -261,7 +278,7 @@ impl Registry {
     }
 }
 
-fn check_id(id: &str) -> anyhow::Result<()> {
+pub(crate) fn check_id(id: &str) -> anyhow::Result<()> {
     // T3 slug rule: instance ids double as T3 providerInstance ids
     // (e.g. `claudeAgent`, `codex_second`), so uppercase is allowed.
     if id.is_empty() || id.len() > 64 {

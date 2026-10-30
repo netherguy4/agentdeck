@@ -6,6 +6,7 @@ mod cmd_codex;
 mod cmd_login;
 mod cmd_pool;
 mod cmd_t3;
+mod cmd_usage;
 mod cmd_wrapper;
 
 #[derive(Parser)]
@@ -26,6 +27,11 @@ enum Cmd {
     Pool {
         #[command(subcommand)]
         cmd: cmd_pool::PoolCmd,
+    },
+    /// Manage [[usage]] quota sources in instances.toml.
+    Usage {
+        #[command(subcommand)]
+        cmd: cmd_usage::UsageCmd,
     },
     /// Sync and drift-check secondary Claude accounts.
     Claude {
@@ -130,6 +136,7 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
+        Cmd::Usage { cmd } => cmd_usage::run(&paths, cmd)?,
         Cmd::Wrapper { cmd } => cmd_wrapper::run(&paths, cmd)?,
         Cmd::Login {
             id,

@@ -15,6 +15,7 @@ version = "0.1.0"
 dependencies = [
  "agent-process",
  "agentdeck-core",
+ "agentdeck-usage",
  "anyhow",
  "clap",
  "serde_json",
@@ -37,6 +38,7 @@ dependencies = [
 name = "agentdeck-usage"
 version = "0.1.0"
 dependencies = [
+ "agentdeck-core",
  "anyhow",
  "dirs",
  "reqwest",

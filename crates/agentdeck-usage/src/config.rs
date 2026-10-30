@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use agentdeck_core::usage::{UsageEntry, UsageKind};
+
 /// Ниже этого значения refresh становится бессмысленно частым: каждый Codex
 /// аккаунт поднимает отдельный subprocess.
 pub const MIN_REFRESH_SECONDS: u64 = 15;
@@ -151,19 +153,19 @@ fn default_stale_seconds() -> i64 {
     crate::providers::claude::DEFAULT_STALE_SECONDS
 }
 
-fn default_codex_command() -> String {
+pub(crate) fn default_codex_command() -> String {
     "codex".to_owned()
 }
 
-fn default_codex_limit_id() -> String {
+pub(crate) fn default_codex_limit_id() -> String {
     "codex".to_owned()
 }
 
-fn default_deepseek_base_url() -> String {
+pub(crate) fn default_deepseek_base_url() -> String {
     "https://api.deepseek.com".to_owned()
 }
 
-fn default_openrouter_base_url() -> String {
+pub(crate) fn default_openrouter_base_url() -> String {
     "https://openrouter.ai/api/v1".to_owned()
 }
 
@@ -254,6 +256,84 @@ pub fn remove_account(config: &mut Config, id: &str) -> Option<AccountConfig> {
 
 pub fn find_account<'a>(config: &'a Config, id: &str) -> Option<&'a AccountConfig> {
     config.accounts.iter().find(|item| item.id() == id)
+}
+
+/// Build the provider account list from validated `[[usage]]` registry entries.
+/// Reuses [`validate`] so the exclusive-dir invariants match the old parser.
+pub fn accounts_from_registry(entries: &[UsageEntry]) -> Result<Vec<AccountConfig>> {
+    let mut accounts = Vec::with_capacity(entries.len());
+    for e in entries {
+        let name = if e.display.is_empty() {
+            e.id.clone()
+        } else {
+            e.display.clone()
+        };
+        let path_field = |field: &str, v: &Option<String>| -> Result<std::path::PathBuf> {
+            v.as_ref()
+                .map(std::path::PathBuf::from)
+                .with_context(|| format!("usage {:?}: missing {field:?}", e.id))
+        };
+        accounts.push(match e.kind {
+            UsageKind::Claude => AccountConfig::Claude {
+                id: e.id.clone(),
+                name,
+                config_dir: path_field("config_dir", &e.config_dir)?,
+                plan: None,
+            },
+            UsageKind::Codex => AccountConfig::Codex {
+                id: e.id.clone(),
+                name,
+                codex_home: path_field("codex_home", &e.codex_home)?,
+                command: default_codex_command(),
+                limit_id: default_codex_limit_id(),
+            },
+            UsageKind::Deepseek => AccountConfig::Deepseek {
+                id: e.id.clone(),
+                name,
+                api_key_env: key_env(e)?,
+                base_url: default_deepseek_base_url(),
+            },
+            UsageKind::Openrouter => AccountConfig::Openrouter {
+                id: e.id.clone(),
+                name,
+                api_key_env: key_env(e)?,
+                base_url: default_openrouter_base_url(),
+            },
+            UsageKind::Antigravity => AccountConfig::Antigravity {
+                id: e.id.clone(),
+                name,
+                token_file: e.token_file.as_ref().map(std::path::PathBuf::from),
+            },
+            UsageKind::OpencodeGo => AccountConfig::OpencodeGo {
+                id: e.id.clone(),
+                name,
+                db_file: e.db_file.as_ref().map(std::path::PathBuf::from),
+            },
+        });
+    }
+    let config = Config {
+        accounts,
+        ..Config::default()
+    };
+    validate(&config)?;
+    Ok(config.accounts)
+}
+
+/// Env-var pointer for key-based kinds. A file pointer is recorded but the
+/// providers only read env vars, so it stays an explicit error until wired.
+fn key_env(e: &UsageEntry) -> Result<String> {
+    match (&e.api_key_env, &e.api_key_file) {
+        (Some(env), None) => Ok(env.clone()),
+        (None, Some(_)) => bail!(
+            "usage {:?}: api_key_file sources are recorded but not yet readable; use api_key_env",
+            e.id
+        ),
+        _ => bail!(
+            "usage {:?} (kind {}): set exactly one of api_key_env, api_key_file",
+            e.id,
+            e.kind.as_str()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -472,5 +552,117 @@ mod tests {
             ..Config::default()
         };
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn registry_entries_match_old_config_accounts() {
+        let old_toml = r#"
+refresh_seconds = 120
+stale_seconds = 3600
+
+[[accounts]]
+provider = "claude"
+id = "claude-main"
+name = "Claude"
+config_dir = "~/.claude"
+
+[[accounts]]
+provider = "codex"
+id = "codex-main"
+name = "Codex Personal"
+codex_home = "~/.codex"
+command = "codex"
+limit_id = "codex"
+
+[[accounts]]
+provider = "deepseek"
+id = "deepseek-main"
+name = "DeepSeek"
+api_key_env = "AGENTDECK_DEEPSEEK_MAIN"
+base_url = "https://api.deepseek.com"
+
+[[accounts]]
+provider = "openrouter"
+id = "openrouter-main"
+name = "OpenRouter"
+api_key_env = "AGENTDECK_OPENROUTER_MAIN"
+base_url = "https://openrouter.ai/api/v1"
+
+[[accounts]]
+provider = "antigravity"
+id = "agy-main"
+name = "Google AI Pro"
+
+[[accounts]]
+provider = "antigravity"
+id = "agy-file"
+name = "Custom ACP"
+token_file = "/etc/acp.json"
+
+[[accounts]]
+provider = "opencode-go"
+id = "opencode-go"
+name = "OpenCode Go"
+db_file = "/data/opencode.db"
+"#;
+        let reg_toml = r#"
+version = 1
+
+[[usage]]
+id = "claude-main"
+kind = "claude"
+display = "Claude"
+config_dir = "~/.claude"
+
+[[usage]]
+id = "codex-main"
+kind = "codex"
+display = "Codex Personal"
+codex_home = "~/.codex"
+
+[[usage]]
+id = "deepseek-main"
+kind = "deepseek"
+display = "DeepSeek"
+api_key_env = "AGENTDECK_DEEPSEEK_MAIN"
+
+[[usage]]
+id = "openrouter-main"
+kind = "openrouter"
+display = "OpenRouter"
+api_key_env = "AGENTDECK_OPENROUTER_MAIN"
+
+[[usage]]
+id = "agy-main"
+kind = "antigravity"
+display = "Google AI Pro"
+
+[[usage]]
+id = "agy-file"
+kind = "antigravity"
+display = "Custom ACP"
+token_file = "/etc/acp.json"
+
+[[usage]]
+id = "opencode-go"
+kind = "opencode-go"
+display = "OpenCode Go"
+db_file = "/data/opencode.db"
+"#;
+        let old: Config = toml::from_str(old_toml).unwrap();
+        validate(&old).unwrap();
+        let reg = agentdeck_core::Registry::from_toml(reg_toml).unwrap();
+        assert_eq!(accounts_from_registry(&reg.usage).unwrap(), old.accounts);
+    }
+
+    #[test]
+    fn registry_adapter_rejects_shared_claude_dirs() {
+        let reg = agentdeck_core::Registry::from_toml(
+            "version = 1\n\
+             [[usage]]\nid = \"one\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n\
+             [[usage]]\nid = \"two\"\nkind = \"claude\"\nconfig_dir = \"~/.claude\"\n",
+        )
+        .unwrap();
+        assert!(accounts_from_registry(&reg.usage).is_err());
     }
 }
