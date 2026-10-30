@@ -54,9 +54,7 @@ impl State {
                 paths,
             },
             match first {
-                Some(paths) => {
-                    Task::perform(async move { data::load(&paths) }, Message::Loaded)
-                }
+                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
                 None => Task::none(),
             },
         )
@@ -99,12 +97,7 @@ pub fn subscription(_state: &State) -> Subscription<Message> {
 
 fn sidebar(state: &State) -> Element<'_, Message> {
     let mut col = column![].spacing(4).width(180);
-    for page in [
-        Page::Instances,
-        Page::Drift,
-        Page::Plugins,
-        Page::Processes,
-    ] {
+    for page in [Page::Instances, Page::Drift, Page::Plugins, Page::Processes] {
         // The default button style is the accent fill, so non-selected pages
         // need the quiet variant explicitly.
         let mut btn = button(text(page.label()).size(14))

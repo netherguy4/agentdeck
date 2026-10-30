@@ -131,12 +131,10 @@ pub fn load(paths: &Paths) -> Data {
             display_name: inst.display_name.clone(),
             harness: inst.harness.as_str().to_string(),
             enabled: inst.enabled,
-            t3: t3_rows
-                .get(&inst.id)
-                .map(|(status, threads)| T3Info {
-                    status: status.clone(),
-                    threads: *threads,
-                }),
+            t3: t3_rows.get(&inst.id).map(|(status, threads)| T3Info {
+                status: status.clone(),
+                threads: *threads,
+            }),
             quotas,
         });
     }

@@ -1,8 +1,8 @@
 //! Placeholder pages; later units fill them in.
 
 use i18n_embed_fl::fl;
-use iced::widget::{column, text};
 use iced::Element;
+use iced::widget::{column, text};
 
 use crate::app::Message;
 use crate::i18n::loader;

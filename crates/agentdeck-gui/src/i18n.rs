@@ -33,8 +33,7 @@ pub fn loader() -> &'static FluentLanguageLoader {
 
 /// Switch the active language (tests use it to render RU snapshots).
 pub fn set_language(tag: &str) {
-    let id: unic_langid::LanguageIdentifier =
-        tag.parse().expect("test language tag must parse");
+    let id: unic_langid::LanguageIdentifier = tag.parse().expect("test language tag must parse");
     i18n_embed::select(loader(), &Localizations, &[id])
         .expect("embedded languages always include the test tag");
 }
@@ -44,7 +43,7 @@ pub fn set_language(tag: &str) {
 fn select_system_language(loader: &FluentLanguageLoader) {
     let raw = ["LC_ALL", "LANGUAGE", "LANG"]
         .iter()
-        .find_map(|k| std::env::var_os(k))
+        .find_map(std::env::var_os)
         .unwrap_or_default()
         .to_string_lossy()
         .replace('_', "-");

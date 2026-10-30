@@ -40,53 +40,50 @@ mod tempfile_guard {
 }
 
 fn write_registry(paths: &Paths) {
-    Registry::update(
-        paths,
-        |r| {
-            r.add(agentdeck_core::registry::AddSpec {
-                id: "claude-main".into(),
-                harness: agentdeck_core::Harness::Claude,
-                display_name: Some("Claude main".into()),
-                home: "/fake/claude".into(),
-                binary: None,
-                no_t3: false,
-            })?;
-            r.add(agentdeck_core::registry::AddSpec {
-                id: "codex-second".into(),
-                harness: agentdeck_core::Harness::Codex,
-                display_name: None,
-                home: "/fake/codex-second".into(),
-                binary: None,
-                no_t3: false,
-            })?;
-            r.add_usage(agentdeck_core::UsageEntry {
-                id: "claude-main".into(),
-                kind: agentdeck_core::UsageKind::Claude,
-                instance: Some("claude-main".into()),
-                display: "Claude main".into(),
-                config_dir: Some("~/.claude".into()),
-                codex_home: None,
-                token_file: None,
-                api_key_env: None,
-                db_file: None,
-                extra: Default::default(),
-            })?;
-            r.add_usage(agentdeck_core::UsageEntry {
-                id: "openrouter-main".into(),
-                kind: agentdeck_core::UsageKind::Openrouter,
-                instance: None,
-                display: "OpenRouter".into(),
-                config_dir: None,
-                codex_home: None,
-                token_file: None,
-                api_key_env: Some("AGENTDECK_TEST_KEY".into()),
-                db_file: None,
-                extra: Default::default(),
-            })?;
-            r.set_enabled("codex-second", false)?;
-            Ok(())
-        },
-    )
+    Registry::update(paths, |r| {
+        r.add(agentdeck_core::registry::AddSpec {
+            id: "claude-main".into(),
+            harness: agentdeck_core::Harness::Claude,
+            display_name: Some("Claude main".into()),
+            home: "/fake/claude".into(),
+            binary: None,
+            no_t3: false,
+        })?;
+        r.add(agentdeck_core::registry::AddSpec {
+            id: "codex-second".into(),
+            harness: agentdeck_core::Harness::Codex,
+            display_name: None,
+            home: "/fake/codex-second".into(),
+            binary: None,
+            no_t3: false,
+        })?;
+        r.add_usage(agentdeck_core::UsageEntry {
+            id: "claude-main".into(),
+            kind: agentdeck_core::UsageKind::Claude,
+            instance: Some("claude-main".into()),
+            display: "Claude main".into(),
+            config_dir: Some("~/.claude".into()),
+            codex_home: None,
+            token_file: None,
+            api_key_env: None,
+            db_file: None,
+            extra: Default::default(),
+        })?;
+        r.add_usage(agentdeck_core::UsageEntry {
+            id: "openrouter-main".into(),
+            kind: agentdeck_core::UsageKind::Openrouter,
+            instance: None,
+            display: "OpenRouter".into(),
+            config_dir: None,
+            codex_home: None,
+            token_file: None,
+            api_key_env: Some("AGENTDECK_TEST_KEY".into()),
+            db_file: None,
+            extra: Default::default(),
+        })?;
+        r.set_enabled("codex-second", false)?;
+        Ok(())
+    })
     .unwrap();
 }
 

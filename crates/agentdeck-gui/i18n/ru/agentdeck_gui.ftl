@@ -1,7 +1,7 @@
 app-title = Agentdeck
 
 nav-instances = Инстансы
-nav-drift = Дрейф
+nav-drift = Расхождения
 nav-plugins = Плагины
 nav-processes = Процессы
 
@@ -30,7 +30,7 @@ account-stale = устаревшие
 account-error = ошибка
 account-waiting = ожидание
 
-drift-title = Дрейф
+drift-title = Расхождения
 plugins-title = Плагины
 processes-title = Процессы
 coming-soon = Появится в следующих юнитах.

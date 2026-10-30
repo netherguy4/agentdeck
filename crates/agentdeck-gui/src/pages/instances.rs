@@ -1,7 +1,7 @@
 //! One row per registry instance: identity, T3 health, quota bars.
 
 use i18n_embed_fl::fl;
-use iced::widget::{column, progress_bar, text, Space};
+use iced::widget::{Space, column, progress_bar, text};
 use iced::{Element, Length};
 
 use crate::app::Message;
@@ -38,9 +38,7 @@ fn quotas_view(u: &UsageQuotas) -> Element<'_, Message> {
                 iced::widget::row![
                     text(label).size(12).width(160),
                     progress_bar(0.0..=100.0, bar.used_percent as f32).length(Length::Fill),
-                    text(format!("{:.0}%", bar.used_percent))
-                        .size(12)
-                        .width(44),
+                    text(format!("{:.0}%", bar.used_percent)).size(12).width(44),
                 ]
                 .spacing(8),
             );
@@ -71,10 +69,7 @@ pub fn view(data: &Data) -> Element<'_, Message> {
                     info.status.as_deref().unwrap_or("—")
                 );
                 if let Some(n) = info.threads {
-                    line.push_str(&format!(
-                        " · {}",
-                        fl!(loader(), "threads-count", count = n)
-                    ));
+                    line.push_str(&format!(" · {}", fl!(loader(), "threads-count", count = n)));
                 }
                 line
             }
