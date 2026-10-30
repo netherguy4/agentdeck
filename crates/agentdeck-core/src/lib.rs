@@ -3,6 +3,7 @@
 pub mod changes;
 pub mod claude;
 pub mod codex;
+pub mod login;
 pub mod paths;
 pub mod pool;
 pub mod registry;

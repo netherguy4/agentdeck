@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod cmd_claude;
 mod cmd_codex;
+mod cmd_login;
 mod cmd_pool;
 mod cmd_t3;
 mod cmd_wrapper;
@@ -45,6 +46,17 @@ enum Cmd {
     Wrapper {
         #[command(subcommand)]
         cmd: cmd_wrapper::WrapperCmd,
+    },
+    /// Run the official login CLI for an instance inside a PTY.
+    Login {
+        /// Registry instance id to log in.
+        id: String,
+        /// Use device-code authorization (codex only).
+        #[arg(long)]
+        device_auth: bool,
+        /// Open the login URL with xdg-open (otherwise only print it).
+        #[arg(long)]
+        open: bool,
     },
 }
 
@@ -119,6 +131,11 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
         Cmd::Wrapper { cmd } => cmd_wrapper::run(&paths, cmd)?,
+        Cmd::Login {
+            id,
+            device_auth,
+            open,
+        } => cmd_login::run(&paths, &id, device_auth, open)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
