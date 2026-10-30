@@ -338,6 +338,13 @@ fn identity_paths(config_dir: &Path) -> Vec<PathBuf> {
     if let Some(parent) = dir.parent() {
         paths.push(parent.join(".claude.json"));
     }
+    // Claude без CLAUDE_CONFIG_DIR пишет только ~/.claude.json, поэтому
+    // ~/.claude/.claude.json мог остаться от старого запуска: верим более свежему.
+    if dir.file_name().is_some_and(|name| name == ".claude") {
+        paths.sort_by_key(|path| {
+            std::cmp::Reverse(fs::metadata(path).and_then(|m| m.modified()).ok())
+        });
+    }
     paths
 }
 
@@ -1115,6 +1122,33 @@ mod tests {
         assert_eq!(rfc3339_to_unix("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(rfc3339_to_unix("2000-03-01T00:00:00Z"), Some(951_868_800));
         assert_eq!(rfc3339_to_unix("2026-01-01T00:00:00Z"), Some(1_767_225_600));
+    }
+
+    #[test]
+    fn default_profile_prefers_the_fresher_claude_json() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-usage-fresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let profile = root.join(".claude");
+        fs::create_dir_all(&profile).unwrap();
+        let account = |org: &str| {
+            format!(r#"{{"oauthAccount":{{"emailAddress":"a@b","organizationType":"{org}"}}}}"#)
+        };
+        let stale = profile.join(".claude.json");
+        fs::write(&stale, account("claude_max")).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::write(root.join(".claude.json"), account("claude_pro")).unwrap();
+
+        assert_eq!(read_identity(&profile).plan.as_deref(), Some("Pro"));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
