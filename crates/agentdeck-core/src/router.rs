@@ -61,8 +61,6 @@ const LEGACY_FILES: &[(&str, &[u8])] = &[
     ),
 ];
 
-const ROSTER_JSON: &str = include_str!("../assets/router/roster.json");
-
 pub const CLAUDE_MATCHER: &str = "^(?:Agent|Workflow)$|.*delegate_task$";
 pub const CODEX_MATCHER: &str = "^(?:collaboration\\.?)?spawn_agent$|^Agent$|.*delegate_task$";
 pub const AGY_MATCHER: &str = "^invoke_subagent$|^start_subagent$|^call_mcp_tool$|.*delegate_task$";
@@ -303,10 +301,6 @@ pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
 /// binary) plus the roster `briefHint` verbatim.
 pub fn router_block(exe: &Path) -> String {
     let route = format!("{} route", exe.display());
-    let hint: String = serde_json::from_str::<Value>(ROSTER_JSON)
-        .ok()
-        .and_then(|v| v.get("briefHint")?.as_str().map(str::to_string))
-        .unwrap_or_default();
     format!(
         "## Delegation routing (agentdeck router)\n\n\
         - Route every `delegate_task`/subagent target first: `{route} \"<goal, inputs, read-only or edits, expected size>\"` \
@@ -316,7 +310,7 @@ pub fn router_block(exe: &Path) -> String {
         refresh after provider/model changes. Pass the complete returned `target` (including `options`) as the `delegate_task` \
         target; append a returned `briefHint` verbatim. Never set `runtimeMode` unless asked.\n\
         - `jevConfidence` < 0.4: compare quality and quota penalties of the top two eligible candidates. `target: null`: \
-        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n\n{hint}\n"
+        split the work or do it yourself. A denied target: use the next `eligible` model in `ranking`.\n"
     )
 }
 
