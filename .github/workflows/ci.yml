@@ -43,8 +43,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - uses: taiki-e/install-action@nextest
+
+      # Test binaries run in parallel; plain cargo test runs them one at a time.
       - name: Rust tests
-        run: cargo test --all-targets --locked
+        run: cargo nextest run --all-targets --locked
 
   msrv:
     name: Build on declared MSRV
