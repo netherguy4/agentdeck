@@ -1204,7 +1204,8 @@ mod tests {
 
     #[test]
     fn skills_parity_with_sync_skills() {
-        let script = PathBuf::from("/home/user/.general/scripts/sync-skills");
+        let script = PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join(".general/scripts/sync-skills");
         if !script.is_file() {
             return; // owner's helper absent (CI): fixture assertions above still hold
         }

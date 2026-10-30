@@ -18,11 +18,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 pub const SOCKET_ENV: &str = "T3_SHELL_MCP_SOCKET";
-/// Same default as the Node launcher.
-pub const DEFAULT_ORIGINAL: &str = "/home/user/.local/bin/claude";
 
 pub fn original_bin() -> String {
-    std::env::var("CLAUDE_SHELL_MCP_ORIGINAL").unwrap_or_else(|_| DEFAULT_ORIGINAL.to_string())
+    std::env::var("CLAUDE_SHELL_MCP_ORIGINAL").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/bin/claude",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
