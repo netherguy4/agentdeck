@@ -206,6 +206,17 @@ fn main() -> anyhow::Result<()> {
     if std::path::Path::new(&argv0).file_name() == Some("agent-process".as_ref()) {
         std::process::exit(agent_process::main(args.collect()));
     }
+    // Installed as a symlink named `claude-t3-shell`, the binary is the T3
+    // Claude launcher proxy (same CLI as `agentdeck route claude-shell`).
+    if std::path::Path::new(&argv0).file_name() == Some("claude-t3-shell".as_ref()) {
+        std::process::exit(agentdeck_router::shell::run(
+            &args
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        ));
+    }
     let cli = Cli::parse();
     // No subcommand opens the GUI; every subcommand keeps its CLI behavior.
     let Some(cmd) = cli.cmd else {
