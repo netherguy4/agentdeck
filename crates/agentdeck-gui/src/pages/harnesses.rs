@@ -117,6 +117,19 @@ fn last_lines(text: &str) -> String {
     lines[lines.len().saturating_sub(4)..].join("\n")
 }
 
+pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
+    state.pending.as_ref().map(|p| {
+        let mut m = crate::overlay::confirm(
+            fl!(loader(), "harness-run-title"),
+            &p.lines,
+            (fl!(loader(), "action-apply"), Some(Msg::Confirm)),
+            (fl!(loader(), "action-cancel"), Msg::Cancel),
+        );
+        m.body.push(st::muted(fl!(loader(), "harness-note")).into());
+        m
+    })
+}
+
 pub fn view(state: &State) -> Element<'_, Msg> {
     let mut col = column![st::title(fl!(loader(), "harness-title"))].spacing(st::SPACE_M);
     for (i, r) in state.rows.iter().enumerate() {
@@ -151,15 +164,6 @@ pub fn view(state: &State) -> Element<'_, Msg> {
             ]
             .align_y(iced::Alignment::Center),
         );
-    }
-    if let Some(p) = &state.pending {
-        col = col.push(st::confirm_panel(
-            fl!(loader(), "harness-run-title"),
-            &p.lines,
-            (fl!(loader(), "action-apply"), Some(Msg::Confirm)),
-            (fl!(loader(), "action-cancel"), Msg::Cancel),
-        ));
-        col = col.push(st::muted(fl!(loader(), "harness-note")));
     }
     if state.busy {
         col = col.push(st::muted(fl!(loader(), "action-working")));

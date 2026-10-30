@@ -859,6 +859,30 @@ fn confirm_label(pending: &Pending) -> String {
     }
 }
 
+pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Message>> {
+    use crate::style as st;
+    let pending = state.pending.as_ref()?;
+    let mut preview = pending.preview.clone();
+    if preview.is_empty() {
+        preview.push(fl!(loader(), "drift-no-drift"));
+    }
+    preview.truncate(30);
+    Some(crate::overlay::Modal {
+        title: fl!(loader(), "drift-preview"),
+        body: preview.into_iter().map(|l| st::body(l).into()).collect(),
+        actions: vec![
+            st::btn(st::Btn::Quiet, fl!(loader(), "drift-cancel"))
+                .on_press(Message::Cancel)
+                .into(),
+            st::btn(st::Btn::Primary, confirm_label(pending))
+                .on_press(Message::Confirm)
+                .into(),
+        ],
+        on_cancel: Message::Cancel,
+        on_submit: Some(Message::Confirm),
+    })
+}
+
 pub fn view(state: &State) -> Element<'_, Message> {
     use crate::style as st;
     let mut col = column![st::title(fl!(loader(), "drift-title"))].spacing(st::SPACE_M);
@@ -879,31 +903,6 @@ pub fn view(state: &State) -> Element<'_, Message> {
         col = col.push(st::muted(fl!(loader(), "instances-loading")));
     }
     let mut first = true;
-    if let Some(pending) = &state.pending {
-        let mut lines: Vec<Element<'_, Message>> = Vec::new();
-        let mut preview = pending.preview.clone();
-        if preview.is_empty() {
-            preview.push(fl!(loader(), "drift-no-drift"));
-        }
-        preview.truncate(30);
-        for line in preview {
-            lines.push(st::body(line).into());
-        }
-        col = col.push(st::panel(
-            fl!(loader(), "drift-preview"),
-            lines,
-            vec![
-                button(st::body(confirm_label(pending)))
-                    .on_press(Message::Confirm)
-                    .into(),
-                button(st::body(fl!(loader(), "drift-cancel")))
-                    .style(button::secondary)
-                    .on_press(Message::Cancel)
-                    .into(),
-            ],
-        ));
-        first = false;
-    }
     for group in &state.snapshot.groups {
         if !first {
             col = col.push(st::divider());

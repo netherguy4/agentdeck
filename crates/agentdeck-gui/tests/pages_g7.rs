@@ -39,7 +39,9 @@ fn snapshot_sized(state: &app::State, stem: &str, height: f32) {
             (860.0, height),
             app::view(state),
         );
-        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        let snapshot = ui
+            .snapshot(&agentdeck_gui::style::theme(true))
+            .expect("headless snapshot");
         assert_snapshot(&snapshot, &format!("{stem}_{lang}"));
     }
     agentdeck_gui::i18n::set_language("en");
@@ -234,7 +236,7 @@ fn shared_page_status_preview_and_apply() {
         let mut ui = iced_test::simulator(app::view(&state));
         ui.find("context7").expect("canonical server name");
     }
-    snapshot_sized(&state, "shared", 420.0);
+    snapshot_sized(&state, "shared", 360.0);
 
     // Skills preview (deterministic; MCP backup paths carry timestamps).
     update(

@@ -286,13 +286,9 @@ fn ask(state: &mut State, ctx: &Ctx, op: anyhow::Result<Op>) {
     });
 }
 
-pub fn view(state: &State) -> Element<'_, Msg> {
-    let mut col = column![st::title(fl!(loader(), "pool-title"))].spacing(st::SPACE_M);
-    if let Some(error) = &state.data.error {
-        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
-    }
-    if let Some(p) = &state.pending {
-        col = col.push(st::confirm_panel(
+pub fn modal(state: &State) -> Option<crate::overlay::Modal<'_, Msg>> {
+    state.pending.as_ref().map(|p| {
+        crate::overlay::confirm(
             fl!(loader(), "pool-preview-title"),
             &p.lines,
             (
@@ -300,7 +296,14 @@ pub fn view(state: &State) -> Element<'_, Msg> {
                 p.op.as_ref().map(|_| Msg::Confirm),
             ),
             (fl!(loader(), "action-cancel"), Msg::Cancel),
-        ));
+        )
+    })
+}
+
+pub fn view(state: &State) -> Element<'_, Msg> {
+    let mut col = column![st::title(fl!(loader(), "pool-title"))].spacing(st::SPACE_M);
+    if let Some(error) = &state.data.error {
+        col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
     if state.data.entries.is_empty() {
         col = col.push(st::muted(fl!(loader(), "pool-empty")));

@@ -7,6 +7,7 @@
 pub mod app;
 pub mod data;
 pub mod i18n;
+pub mod overlay;
 pub mod pages;
 pub mod style;
 
@@ -17,10 +18,13 @@ pub fn run() -> iced::Result {
     iced::application(State::new, app::update, app::view)
         .title(app::title)
         .theme(app::theme)
+        .style(app::style)
         .subscription(app::subscription)
         .window(iced::window::Settings {
             size: iced::Size::new(1100.0, 700.0),
             min_size: Some(iced::Size::new(900.0, 560.0)),
+            // Lets COSMIC glass show through the translucent window style.
+            transparent: true,
             ..iced::window::Settings::default()
         })
         .run()
