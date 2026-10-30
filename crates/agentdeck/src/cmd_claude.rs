@@ -31,6 +31,7 @@ pub fn run(cmd: &ClaudeCmd) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve primary profile: HOME is not set"))?;
     let primary = home.join(".claude");
+    let primary_json = home.join(".claude.json");
     match cmd {
         ClaudeCmd::Sync { id, dry_run } => {
             let inst = reg
@@ -40,7 +41,8 @@ pub fn run(cmd: &ClaudeCmd) -> anyhow::Result<()> {
                 anyhow::bail!("instance {id:?} is not a Claude instance");
             }
             let dir = expand_tilde(&inst.home, &home);
-            let changes = claude::plan_materialize(&primary, &dir, &paths.state_dir)?;
+            let changes =
+                claude::plan_materialize(&primary, &dir, &paths.state_dir, &primary_json)?;
             for c in &changes {
                 println!("{}", claude::describe_change(c));
             }
@@ -63,13 +65,15 @@ pub fn run(cmd: &ClaudeCmd) -> anyhow::Result<()> {
             if *json {
                 let mut out = Vec::new();
                 for inst in &targets {
-                    let drift = claude::check(&primary, &expand_tilde(&inst.home, &home))?;
+                    let drift =
+                        claude::check(&primary, &expand_tilde(&inst.home, &home), &primary_json)?;
                     out.push(serde_json::json!({"id": inst.id, "drift": drift}));
                 }
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 for inst in &targets {
-                    let drift = claude::check(&primary, &expand_tilde(&inst.home, &home))?;
+                    let drift =
+                        claude::check(&primary, &expand_tilde(&inst.home, &home), &primary_json)?;
                     if drift.is_empty() {
                         println!("{}: no drift", inst.id);
                     } else {

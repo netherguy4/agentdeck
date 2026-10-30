@@ -12,6 +12,9 @@ pub enum Change {
         path: PathBuf,
         contents: Vec<u8>,
         old: Option<Vec<u8>>,
+        /// Copy of the pre-write file, made before overwriting (`None` keeps
+        /// the old no-backup behaviour, e.g. registry writes back up elsewhere).
+        backup: Option<PathBuf>,
     },
     Mkdir {
         path: PathBuf,
@@ -33,17 +36,24 @@ impl Change {
                 path,
                 contents,
                 old,
-            } => match old {
-                None => format!(
-                    "write {} (new file, {} bytes)",
-                    path.display(),
-                    contents.len()
-                ),
-                Some(prev) if prev == contents => {
-                    format!("write {} (unchanged)", path.display())
+                backup,
+            } => {
+                let base = match old {
+                    None => format!(
+                        "write {} (new file, {} bytes)",
+                        path.display(),
+                        contents.len()
+                    ),
+                    Some(prev) if prev == contents => {
+                        format!("write {} (unchanged)", path.display())
+                    }
+                    Some(prev) => describe_diff(path, prev, contents),
+                };
+                match backup {
+                    Some(dest) => format!("{base} (backup {})", dest.display()),
+                    None => base,
                 }
-                Some(prev) => describe_diff(path, prev, contents),
-            },
+            }
             Change::Mkdir { path } => format!("mkdir {}", path.display()),
             Change::Symlink { link, target } => {
                 format!("symlink {} -> {}", link.display(), target.display())
@@ -60,15 +70,43 @@ impl Change {
 
     pub fn apply(&self) -> anyhow::Result<()> {
         match self {
-            Change::WriteFile { path, contents, .. } => {
+            Change::WriteFile {
+                path,
+                contents,
+                backup,
+                ..
+            } => {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                // Backup the existing file before overwriting.
+                if let Some(dest) = backup
+                    && fs::symlink_metadata(path).is_ok()
+                {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(path, dest)?;
+                    fs::set_permissions(dest, fs::Permissions::from_mode(0o600))?;
+                }
+                // .claude.json (account state) is always 0600; other existing
+                // real files keep their mode; new files and symlink
+                // replacements get 0600.
+                let keep_mode = path
+                    .file_name()
+                    .is_none_or(|n| n != ".claude.json")
+                    .then(|| fs::symlink_metadata(path).ok())
+                    .flatten()
+                    .filter(|m| !m.file_type().is_symlink())
+                    .map(|m| m.permissions().mode() & 0o777);
                 // Same-dir tmp + rename so a crash never leaves a half file.
                 let tmp = path.with_extension("tmp");
                 fs::write(&tmp, contents)?;
                 fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
                 fs::rename(&tmp, path)?;
+                if let Some(mode) = keep_mode {
+                    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+                }
                 Ok(())
             }
             Change::Mkdir { path } => {
@@ -146,6 +184,7 @@ pub fn plan_write_file(path: PathBuf, old: Option<&[u8]>, new: &[u8]) -> Option<
         path,
         contents: new.to_vec(),
         old: old.map(|b| b.to_vec()),
+        backup: None,
     })
 }
 
