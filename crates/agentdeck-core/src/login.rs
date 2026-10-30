@@ -151,6 +151,15 @@ fn login_command(target: &LoginTarget) -> anyhow::Result<(String, Vec<String>)> 
                 args,
             ))
         }
+        Harness::Opencode => {
+            if target.device_auth {
+                anyhow::bail!("--device-auth is only supported for codex instances");
+            }
+            Ok((
+                target.binary.clone().unwrap_or_else(|| "opencode".into()),
+                vec!["auth".into(), "login".into()],
+            ))
+        }
         other => anyhow::bail!("login is not implemented for {} instances", other.as_str()),
     }
 }
@@ -179,6 +188,16 @@ pub fn start(target: &LoginTarget) -> anyhow::Result<LoginSession> {
             }
         }
         Harness::Codex => extra.push(("CODEX_HOME".to_string(), target.home.display().to_string())),
+        Harness::Opencode => {
+            // Instance home is the data dir; point XDG_DATA_HOME at its parent.
+            let Some(parent) = target.home.parent() else {
+                anyhow::bail!(
+                    "opencode instance {:?} has no parent dir for XDG_DATA_HOME",
+                    target.home
+                );
+            };
+            extra.push(("XDG_DATA_HOME".to_string(), parent.display().to_string()));
+        }
         other => anyhow::bail!("login is not implemented for {} instances", other.as_str()),
     }
     start_with_command(&program, &args, &extra)

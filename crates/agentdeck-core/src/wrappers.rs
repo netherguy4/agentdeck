@@ -42,8 +42,7 @@ pub fn is_primary(inst: &Instance) -> bool {
 }
 
 /// Default wrapper file name (`claude_second` -> `claude@second`), or `None`
-/// for the primary instance. Only claude/codex harnesses are supported (the
-/// opencode/agy login model needs its own adapter first).
+/// for the primary instance. All four harnesses isolate by one env dir var.
 pub fn default_wrapper_name(inst: &Instance) -> anyhow::Result<Option<String>> {
     check_harness(inst)?;
     if is_primary(inst) {
@@ -82,23 +81,16 @@ pub fn resolve_wrapper_name(
     default_wrapper_name(inst)
 }
 
-fn check_harness(inst: &Instance) -> anyhow::Result<()> {
-    match inst.harness {
-        Harness::Claude | Harness::Codex => Ok(()),
-        other => anyhow::bail!(
-            "wrappers for harness {} are not supported yet (instance {:?})",
-            other.as_str(),
-            inst.id
-        ),
-    }
+fn check_harness(_inst: &Instance) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn env_var(inst: &Instance) -> &'static str {
     match inst.harness {
         Harness::Claude => "CLAUDE_CONFIG_DIR",
         Harness::Codex => "CODEX_HOME",
-        // Checked by check_harness before any caller gets here.
-        Harness::Opencode | Harness::Agy => unreachable!(),
+        // Isolated login roots relocate everything underneath (R3).
+        Harness::Opencode | Harness::Agy => "HOME",
     }
 }
 
@@ -496,7 +488,18 @@ mod tests {
             "{script}"
         );
 
-        assert!(script_contents(&inst("o1", Harness::Opencode), &PathBuf::from("/h")).is_err());
+        // Isolated login roots relocate everything underneath (R3).
+        let script = String::from_utf8(
+            script_contents(&inst("o1", Harness::Opencode), &PathBuf::from("/h")).unwrap(),
+        )
+        .unwrap();
+        assert!(script.contains("export HOME='/h'\n"), "{script}");
+        assert!(script.ends_with("exec opencode \"$@\"\n"), "{script}");
+        let script = String::from_utf8(
+            script_contents(&inst("a1", Harness::Agy), &PathBuf::from("/h")).unwrap(),
+        )
+        .unwrap();
+        assert!(script.contains("export HOME='/h'\n"), "{script}");
     }
 
     #[test]

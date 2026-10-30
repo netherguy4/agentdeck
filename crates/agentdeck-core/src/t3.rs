@@ -64,6 +64,16 @@ fn allowed_config_fields(driver: &str) -> Option<&'static [&'static str]> {
             "setupMode",
             "customModels",
         ]),
+        // R4 tables, minus secrets (never written; also rejected by name).
+        "opencode" => Some(&["enabled", "binaryPath", "serverUrl", "customModels"]),
+        "antigravity" => Some(&[
+            "enabled",
+            "authMethod",
+            "gcpProject",
+            "gcpLocation",
+            "binaryPath",
+            "customModels",
+        ]),
         _ => None,
     }
 }
@@ -112,11 +122,8 @@ fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::R
     let driver = match inst.harness {
         Harness::Claude => "claudeAgent",
         Harness::Codex => "codex",
-        other => anyhow::bail!(
-            "instance {:?} uses harness {}: no T3 mapping, left untouched",
-            inst.id,
-            other.as_str()
-        ),
+        Harness::Opencode => "opencode",
+        Harness::Agy => "antigravity",
     };
     let mut config = Map::new();
     match inst.harness {
@@ -136,7 +143,13 @@ fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::R
                 config.insert("binaryPath".into(), Value::String(bin.clone()));
             }
         }
-        _ => unreachable!("bailed above"),
+        // R4 drivers have no home concept; only the binary is managed.
+        // Secrets (serverPassword, apiKey) are never written.
+        Harness::Opencode | Harness::Agy => {
+            if let Some(bin) = &inst.binary {
+                config.insert("binaryPath".into(), Value::String(bin.clone()));
+            }
+        }
     }
     validate_config_fields(driver, &config)?;
     let display_name = if inst.display_name.is_empty() {
@@ -153,7 +166,7 @@ fn desired_envelope(inst: &Instance, main_codex_home: Option<&str>) -> anyhow::R
 }
 
 /// Desired envelopes for every registry instance agentdeck manages in T3
-/// (harness claude/codex with `t3 = true`).
+/// (all four harnesses with `t3 = true`).
 fn desired_map(reg: &Registry) -> anyhow::Result<BTreeMap<String, Value>> {
     let main_codex_home = reg
         .get("codex")
@@ -164,15 +177,10 @@ fn desired_map(reg: &Registry) -> anyhow::Result<BTreeMap<String, Value>> {
         if !inst.t3 {
             continue;
         }
-        match desired_envelope(inst, main_codex_home.as_deref()) {
-            Ok(env) => {
-                out.insert(inst.id.clone(), env);
-            }
-            Err(e) if matches!(inst.harness, Harness::Opencode | Harness::Agy) => {
-                let _ = e; // no mapping yet (M7 owns those harnesses): leave untouched
-            }
-            Err(e) => return Err(e),
-        }
+        out.insert(
+            inst.id.clone(),
+            desired_envelope(inst, main_codex_home.as_deref())?,
+        );
     }
     Ok(out)
 }
@@ -506,6 +514,8 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
         let harness = match driver {
             "claudeAgent" => Harness::Claude,
             "codex" => Harness::Codex,
+            "opencode" => Harness::Opencode,
+            "antigravity" => Harness::Agy,
             _ => continue,
         };
         check_t3_slug(id)?;
@@ -529,7 +539,7 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
                     }
                 }
             }
-            _ => {
+            Harness::Claude => {
                 let h = str_field("homePath");
                 if h.is_empty() {
                     "~/.claude".to_string()
@@ -537,6 +547,8 @@ pub fn import_t3(paths: &Paths, t3_root: &Path, dry_run: bool) -> anyhow::Result
                     h.to_string()
                 }
             }
+            // R4 drivers carry no home: registry home is the login root.
+            Harness::Opencode | Harness::Agy => "~".to_string(),
         };
         let display_name = env
             .get("displayName")
