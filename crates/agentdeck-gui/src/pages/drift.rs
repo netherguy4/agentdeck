@@ -1,0 +1,922 @@
+//! Drift page: per-instance-group drift with Apply / Import / Fix / Re-enable.
+//!
+//! Reads are read-only; every mutating action first shows a preview built
+//! from the [`agentdeck_core::Change`] list (or the redacted T3 plan) and
+//! only runs after an explicit confirm. Long work runs off the UI thread
+//! via `Task::perform`; the page refreshes after any action and on the tick.
+
+use std::path::{Path, PathBuf};
+
+use agentdeck_core::{Harness, Paths, Registry, claude, codex, t3};
+use i18n_embed_fl::fl;
+use iced::widget::{Space, button, column, text};
+use iced::{Element, Length, Task};
+
+use crate::i18n::loader;
+
+/// Explicit roots for every read/write (tests pass temp dirs, never env).
+#[derive(Debug, Clone)]
+pub struct Ctx {
+    pub paths: Paths,
+    pub home: PathBuf,
+    pub t3_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Apply,
+    Import,
+    Fix,
+    Reenable,
+}
+
+#[derive(Debug, Clone)]
+pub struct Action {
+    pub kind: Kind,
+    /// Item key encoding the target (`settings:<k>`, `mcpserver:<s>`,
+    /// `fix:<path>`, `t3:<id>`, `t3import`, …).
+    pub key: String,
+    /// Per-server Import action; the button label resolves in `view` so
+    /// snapshots stay language-independent.
+    pub server: Option<String>,
+}
+
+/// Language-independent note appended to an item's text in `view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Note {
+    NotInRegistry,
+}
+
+/// Language-independent item body, resolved to a localized line in `view`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKey {
+    NoDrift,
+    T3Unavailable,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Item {
+    pub key: String,
+    /// Core `describe()` text (English, like CLI output); notes, keyed lines
+    /// and button labels resolve in `view`.
+    pub text: String,
+    pub text_key: Option<TextKey>,
+    pub actions: Vec<Action>,
+    /// Codex real entry: the Fix confirm names this path.
+    pub decision_path: Option<String>,
+    pub note: Option<Note>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Group {
+    /// Registry id (`t3` for the providerInstances group).
+    pub id: String,
+    /// Literal title (`Claude <id>`); `None` resolves to the T3 group title
+    /// in `view` so snapshots stay language-independent.
+    pub title: Option<String>,
+    pub harness: String,
+    pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub groups: Vec<Group>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub group: String,
+    pub key: String,
+    pub kind: Kind,
+    pub preview: Vec<String>,
+    /// Fix confirm names this path (resolved to a label in `view`).
+    pub confirm_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct State {
+    pub snapshot: Snapshot,
+    pub pending: Option<Pending>,
+    pub busy: Option<String>,
+    pub notices: Vec<String>,
+    /// Codex groups fixed on a T3 instance: Re-enable is offered for these.
+    pub reenable: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    SnapshotLoaded(Snapshot),
+    Act {
+        group: String,
+        key: String,
+        kind: Kind,
+    },
+    PreviewReady(Pending),
+    Confirm,
+    Cancel,
+    Done {
+        notice: String,
+    },
+    ReenableDone {
+        group: String,
+        report: Vec<String>,
+    },
+}
+
+fn expand(value: &str, home: &Path) -> PathBuf {
+    if value == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn codex_main(reg: &Registry, home: &Path) -> PathBuf {
+    let dflt = home.join(".codex");
+    reg.instances
+        .iter()
+        .find(|i| i.harness == Harness::Codex && expand(&i.home, home) == dflt)
+        .map(|_| dflt.clone())
+        .unwrap_or(dflt)
+}
+
+fn apply_button() -> Action {
+    Action {
+        kind: Kind::Apply,
+        key: String::new(),
+        server: None,
+    }
+}
+
+/// Servers present in the secondary `mcpServers` that differ from primary's.
+fn importable_servers(
+    primary: &Option<serde_json::Value>,
+    secondary: &Option<serde_json::Value>,
+) -> Vec<String> {
+    let get = |v: &Option<serde_json::Value>| {
+        v.as_ref()
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let sec = get(secondary);
+    let mut out: Vec<String> = sec
+        .iter()
+        .filter(|s| {
+            primary.as_ref().and_then(|p| p.get(*s)) != secondary.as_ref().and_then(|s2| s2.get(*s))
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+fn claude_group(inst: &agentdeck_core::Instance, ctx: &Ctx) -> Group {
+    let home = expand(&inst.home, &ctx.home);
+    let primary = ctx.home.join(".claude");
+    let primary_json = ctx.home.join(".claude.json");
+    let mut items = Vec::new();
+    match claude::check(&primary, &home, &primary_json) {
+        Err(e) => items.push(Item {
+            key: "error".into(),
+            text: format!("check failed: {e:#}"),
+            ..Item::default()
+        }),
+        Ok(drift) => {
+            for d in &drift {
+                match d {
+                    claude::Drift::SettingsKey { key, .. } => items.push(Item {
+                        key: format!("settings:{key}"),
+                        text: d.describe(),
+                        actions: vec![
+                            Action {
+                                kind: Kind::Apply,
+                                key: format!("settings:{key}"),
+                                server: None,
+                            },
+                            Action {
+                                kind: Kind::Import,
+                                key: format!("settings:{key}"),
+                                server: None,
+                            },
+                        ],
+                        ..Item::default()
+                    }),
+                    claude::Drift::McpServers { primary, secondary } => {
+                        let mut actions = vec![Action {
+                            kind: Kind::Apply,
+                            key: "mcp".into(),
+                            server: None,
+                        }];
+                        for s in importable_servers(primary, secondary) {
+                            actions.push(Action {
+                                kind: Kind::Import,
+                                key: format!("mcpserver:{s}"),
+                                server: Some(s),
+                            });
+                        }
+                        items.push(Item {
+                            key: "mcp".into(),
+                            text: d.describe(),
+                            actions,
+                            ..Item::default()
+                        });
+                    }
+                    _ => items.push(Item {
+                        key: format!("item:{}", items.len()),
+                        text: d.describe(),
+                        actions: match d {
+                            claude::Drift::PrimaryConfigMissing { .. } => vec![],
+                            _ => vec![apply_button()],
+                        },
+                        ..Item::default()
+                    }),
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        items.push(Item {
+            key: "clean".into(),
+            text_key: Some(TextKey::NoDrift),
+            ..Item::default()
+        });
+    }
+    Group {
+        id: inst.id.clone(),
+        title: Some(format!("Claude {}", inst.id)),
+        harness: "claude".into(),
+        items,
+    }
+}
+
+fn codex_group(inst: &agentdeck_core::Instance, ctx: &Ctx, main: &Path) -> Group {
+    let shadow = expand(&inst.home, &ctx.home);
+    let mut items = Vec::new();
+    match codex::check(main, &shadow) {
+        Err(e) => items.push(Item {
+            key: "error".into(),
+            text: format!("check failed: {e:#}"),
+            ..Item::default()
+        }),
+        Ok(drift) => {
+            for d in &drift {
+                match d {
+                    codex::Drift::MissingLink { link, .. }
+                    | codex::Drift::WrongTarget { link, .. } => items.push(Item {
+                        key: format!("link:{}", link.display()),
+                        text: d.describe(),
+                        actions: vec![apply_button()],
+                        ..Item::default()
+                    }),
+                    codex::Drift::RealEntry { path, .. } => items.push(Item {
+                        key: format!("fix:{}", path.display()),
+                        text: d.describe(),
+                        actions: vec![Action {
+                            kind: Kind::Fix,
+                            key: format!("fix:{}", path.display()),
+                            server: None,
+                        }],
+                        decision_path: Some(path.display().to_string()),
+                        ..Item::default()
+                    }),
+                    // Extras are left alone, private links need a fresh login
+                    // (their describe() text already says so), the rest is
+                    // informational.
+                    _ => items.push(Item {
+                        key: format!("item:{}", items.len()),
+                        text: d.describe(),
+                        ..Item::default()
+                    }),
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        items.push(Item {
+            key: "clean".into(),
+            text_key: Some(TextKey::NoDrift),
+            ..Item::default()
+        });
+    }
+    Group {
+        id: inst.id.clone(),
+        title: Some(format!("Codex {}", inst.id)),
+        harness: "codex".into(),
+        items,
+    }
+}
+
+fn t3_group(paths: &Paths, t3_root: Option<&Path>) -> Group {
+    let mut items = Vec::new();
+    let Some(root) = t3_root else {
+        items.push(Item {
+            key: "error".into(),
+            text_key: Some(TextKey::T3Unavailable),
+            ..Item::default()
+        });
+        return Group {
+            id: "t3".into(),
+            title: None,
+            harness: "t3".into(),
+            items,
+        };
+    };
+    match t3::sync_t3(paths, root, true) {
+        Err(e) => items.push(Item {
+            key: "error".into(),
+            text: format!("sync failed: {e:#}"),
+            ..Item::default()
+        }),
+        Ok(entries) => {
+            for e in &entries {
+                if e.action == "unchanged" {
+                    continue;
+                }
+                // Compact single-line redacted JSON: the full envelope would
+                // bury the page; the CLI shows the pretty form.
+                let mut after = serde_json::to_string(&t3::redact(&e.after)).unwrap_or_default();
+                if after.len() > 300 {
+                    after.truncate(300);
+                    after.push('…');
+                }
+                items.push(Item {
+                    key: format!("t3:{}", e.id),
+                    text: format!("{}: {} {}", e.id, e.action, after),
+                    actions: vec![apply_button()],
+                    ..Item::default()
+                });
+            }
+        }
+    }
+    match t3::t3_status(paths, root) {
+        Err(e) => items.push(Item {
+            key: "status-error".into(),
+            text: format!("status failed: {e:#}"),
+            ..Item::default()
+        }),
+        Ok(rows) => {
+            for r in rows.iter().filter(|r| !r.in_registry) {
+                items.push(Item {
+                    key: "t3import".into(),
+                    text: format!("{} (driver={})", r.id, r.driver),
+                    note: Some(Note::NotInRegistry),
+                    actions: vec![Action {
+                        kind: Kind::Import,
+                        key: "t3import".into(),
+                        server: None,
+                    }],
+                    ..Item::default()
+                });
+            }
+        }
+    }
+    if items.is_empty() {
+        items.push(Item {
+            key: "clean".into(),
+            text_key: Some(TextKey::NoDrift),
+            ..Item::default()
+        });
+    }
+    Group {
+        id: "t3".into(),
+        title: None,
+        harness: "t3".into(),
+        items,
+    }
+}
+
+/// Read-only snapshot behind the page. Never fails: gaps become text.
+pub fn snapshot(ctx: &Ctx) -> Snapshot {
+    let reg = match Registry::load(&ctx.paths) {
+        Ok(reg) => reg,
+        Err(e) => {
+            return Snapshot {
+                error: Some(format!("registry: {e:#}")),
+                ..Snapshot::default()
+            };
+        }
+    };
+    let mut groups = Vec::new();
+    for inst in &reg.instances {
+        if inst.harness == Harness::Claude {
+            groups.push(claude_group(inst, ctx));
+        }
+    }
+    let main = codex_main(&reg, &ctx.home);
+    for inst in &reg.instances {
+        if inst.harness == Harness::Codex && expand(&inst.home, &ctx.home) != main {
+            groups.push(codex_group(inst, ctx, &main));
+        }
+    }
+    groups.push(t3_group(&ctx.paths, ctx.t3_root.as_deref()));
+    Snapshot {
+        groups,
+        error: None,
+    }
+}
+
+/// Task entry point: `Task::perform(|| load(ctx), Message::SnapshotLoaded)`.
+pub fn load(ctx: Ctx) -> Message {
+    Message::SnapshotLoaded(snapshot(&ctx))
+}
+
+fn harness_of(groups: &[Group], id: &str) -> String {
+    groups
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| g.harness.clone())
+        .unwrap_or_default()
+}
+
+/// Dry-run the action behind an Apply/Import/Fix button: the preview shown
+/// before the confirm. `key` is the [`Action`] key of the item.
+pub fn preview(ctx: &Ctx, group: &str, key: &str, kind: Kind) -> Result<Pending, String> {
+    let harness = harness_of(&snapshot(ctx).groups, group);
+    match (harness.as_str(), kind, key) {
+        ("claude", Kind::Apply, _) => {
+            let reg = Registry::load(&ctx.paths).map_err(|e| format!("registry: {e:#}"))?;
+            let inst = reg
+                .get(group)
+                .ok_or_else(|| format!("unknown instance {group:?}"))?;
+            let changes = claude::plan_materialize(
+                &ctx.home.join(".claude"),
+                &expand(&inst.home, &ctx.home),
+                &ctx.paths.state_dir,
+                &ctx.home.join(".claude.json"),
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview: changes.iter().map(claude::describe_change).collect(),
+                confirm_path: None,
+            })
+        }
+        ("claude", Kind::Import, key) => {
+            let reg = Registry::load(&ctx.paths).map_err(|e| format!("registry: {e:#}"))?;
+            let inst = reg
+                .get(group)
+                .ok_or_else(|| format!("unknown instance {group:?}"))?;
+            let home = expand(&inst.home, &ctx.home);
+            let change = if let Some(k) = key.strip_prefix("settings:") {
+                claude::import_settings_key(
+                    &ctx.home.join(".claude"),
+                    &home,
+                    &ctx.paths.state_dir,
+                    k,
+                )
+                .map_err(|e| format!("{e:#}"))?
+            } else if let Some(s) = key.strip_prefix("mcpserver:") {
+                claude::import_mcp_server(
+                    &ctx.home.join(".claude.json"),
+                    &home,
+                    &ctx.paths.state_dir,
+                    s,
+                )
+                .map_err(|e| format!("{e:#}"))?
+            } else {
+                return Err(format!("nothing importable for {key:?}"));
+            };
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview: change
+                    .as_ref()
+                    .map(claude::describe_change)
+                    .into_iter()
+                    .collect(),
+                confirm_path: None,
+            })
+        }
+        ("codex", Kind::Apply, _) => {
+            let reg = Registry::load(&ctx.paths).map_err(|e| format!("registry: {e:#}"))?;
+            let inst = reg
+                .get(group)
+                .ok_or_else(|| format!("unknown instance {group:?}"))?;
+            let changes = codex::plan_materialize(
+                &codex_main(&reg, &ctx.home),
+                &expand(&inst.home, &ctx.home),
+                &ctx.paths.state_dir,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview: changes.iter().map(|c| c.describe()).collect(),
+                confirm_path: None,
+            })
+        }
+        ("codex", Kind::Fix, key) => {
+            let path = key
+                .strip_prefix("fix:")
+                .ok_or_else(|| format!("nothing fixable for {key:?}"))?;
+            let reg = Registry::load(&ctx.paths).map_err(|e| format!("registry: {e:#}"))?;
+            let inst = reg
+                .get(group)
+                .ok_or_else(|| format!("unknown instance {group:?}"))?;
+            let plan = codex::fix(
+                &codex_main(&reg, &ctx.home),
+                &expand(&inst.home, &ctx.home),
+                &ctx.paths.state_dir,
+                true,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            let mut preview: Vec<String> = plan.changes.iter().map(|c| c.describe()).collect();
+            preview.extend(plan.deferred.iter().cloned());
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview,
+                confirm_path: Some(path.to_string()),
+            })
+        }
+        ("t3", Kind::Apply, _) => {
+            let root = ctx
+                .t3_root
+                .clone()
+                .ok_or_else(|| "T3 unavailable".to_string())?;
+            let entries = t3::sync_t3(&ctx.paths, &root, true).map_err(|e| format!("{e:#}"))?;
+            let preview = entries
+                .iter()
+                .filter(|e| e.action != "unchanged")
+                .map(|e| {
+                    format!(
+                        "{}: {}\n{}",
+                        e.id,
+                        e.action,
+                        serde_json::to_string_pretty(&t3::redact(&e.after)).unwrap_or_default()
+                    )
+                })
+                .collect();
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview,
+                confirm_path: None,
+            })
+        }
+        ("t3", Kind::Import, _) => {
+            let root = ctx
+                .t3_root
+                .clone()
+                .ok_or_else(|| "T3 unavailable".to_string())?;
+            let found = t3::import_t3(&ctx.paths, &root, true).map_err(|e| format!("{e:#}"))?;
+            Ok(Pending {
+                group: group.into(),
+                key: key.into(),
+                kind,
+                preview: found
+                    .iter()
+                    .map(|f| format!("{} {} {} t3=true", f.id, f.harness.as_str(), f.home))
+                    .collect(),
+                confirm_path: None,
+            })
+        }
+        _ => Err("action not applicable here".to_string()),
+    }
+}
+
+/// Run a confirmed preview. Returns the one-line notice for the page.
+pub fn apply(ctx: &Ctx, pending: &Pending) -> String {
+    let fail = |e: anyhow::Error| format!("failed: {e:#}");
+    match (pending.kind, pending.key.as_str()) {
+        (Kind::Apply, _) | (Kind::Import, _) | (Kind::Fix, _) => {
+            let reg = match Registry::load(&ctx.paths) {
+                Ok(r) => r,
+                Err(e) => return fail(e),
+            };
+            let out: anyhow::Result<String> =
+                (|| match harness_of(&snapshot(ctx).groups, &pending.group).as_str() {
+                    "claude" => {
+                        let inst = reg.get(&pending.group).ok_or_else(|| {
+                            anyhow::anyhow!("unknown instance {:?}", pending.group)
+                        })?;
+                        let home = expand(&inst.home, &ctx.home);
+                        match pending.kind {
+                            Kind::Import if pending.key.starts_with("settings:") => {
+                                let k = &pending.key["settings:".len()..];
+                                match claude::import_settings_key(
+                                    &ctx.home.join(".claude"),
+                                    &home,
+                                    &ctx.paths.state_dir,
+                                    k,
+                                )? {
+                                    Some(c) => {
+                                        agentdeck_core::apply_changes(std::slice::from_ref(&c))?;
+                                        Ok(format!("imported {k:?} into primary"))
+                                    }
+                                    None => Ok("already in sync".into()),
+                                }
+                            }
+                            Kind::Import => {
+                                let s = pending.key.strip_prefix("mcpserver:").unwrap_or("");
+                                match claude::import_mcp_server(
+                                    &ctx.home.join(".claude.json"),
+                                    &home,
+                                    &ctx.paths.state_dir,
+                                    s,
+                                )? {
+                                    Some(c) => {
+                                        agentdeck_core::apply_changes(std::slice::from_ref(&c))?;
+                                        Ok(format!("imported mcpServer {s:?} into primary"))
+                                    }
+                                    None => Ok("already in sync".into()),
+                                }
+                            }
+                            _ => {
+                                let changes = claude::plan_materialize(
+                                    &ctx.home.join(".claude"),
+                                    &home,
+                                    &ctx.paths.state_dir,
+                                    &ctx.home.join(".claude.json"),
+                                )?;
+                                agentdeck_core::apply_changes(&changes)?;
+                                Ok(format!("synced {}", pending.group))
+                            }
+                        }
+                    }
+                    "codex" => {
+                        let inst = reg.get(&pending.group).ok_or_else(|| {
+                            anyhow::anyhow!("unknown instance {:?}", pending.group)
+                        })?;
+                        let shadow = expand(&inst.home, &ctx.home);
+                        if pending.kind == Kind::Fix {
+                            let plan = codex::fix(
+                                &codex_main(&reg, &ctx.home),
+                                &shadow,
+                                &ctx.paths.state_dir,
+                                true,
+                            )?;
+                            agentdeck_core::apply_changes(&plan.changes)?;
+                            Ok(format!(
+                                "fixed {} ({} deferred)",
+                                pending.group,
+                                plan.deferred.len()
+                            ))
+                        } else {
+                            let changes = codex::plan_materialize(
+                                &codex_main(&reg, &ctx.home),
+                                &shadow,
+                                &ctx.paths.state_dir,
+                            )?;
+                            agentdeck_core::apply_changes(&changes)?;
+                            Ok(format!("synced {}", pending.group))
+                        }
+                    }
+                    "t3" => {
+                        let root = ctx
+                            .t3_root
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("T3 unavailable"))?;
+                        if pending.kind == Kind::Import {
+                            let found = t3::import_t3(&ctx.paths, &root, false)?;
+                            Ok(format!("imported {} instance(s)", found.len()))
+                        } else {
+                            let entries = t3::sync_t3(&ctx.paths, &root, false)?;
+                            let n = entries.iter().filter(|e| e.action != "unchanged").count();
+                            Ok(format!("synced {n} instance(s)"))
+                        }
+                    }
+                    _ => Err(anyhow::anyhow!("action not applicable here")),
+                })();
+            out.unwrap_or_else(fail)
+        }
+        (Kind::Reenable, _) => "use the Re-enable button".into(),
+    }
+}
+
+/// Run the false→observe→true toggle for a T3 instance id.
+fn run_reenable(ctx: &Ctx, id: &str) -> Vec<String> {
+    let Some(root) = ctx.t3_root.clone() else {
+        return vec!["failed: T3 unavailable".into()];
+    };
+    match t3::reenable(
+        &ctx.paths,
+        &root,
+        id,
+        &t3::ReenableOpts {
+            timeout_secs: 30,
+            force: false,
+            dry_run: false,
+        },
+    ) {
+        Ok(report) => {
+            let mut out = report.events;
+            out.push(report.final_line);
+            out
+        }
+        Err(e) => vec![format!("failed: {e:#}")],
+    }
+}
+
+pub fn update(state: &mut State, ctx: Ctx, message: Message) -> Task<Message> {
+    match message {
+        Message::SnapshotLoaded(snapshot) => {
+            state.snapshot = snapshot;
+            Task::none()
+        }
+        Message::Act { group, key, kind } => {
+            if kind == Kind::Reenable {
+                state.busy = Some(group.clone());
+                return Task::perform(
+                    async move {
+                        let report = run_reenable(&ctx, &group);
+                        Message::ReenableDone { group, report }
+                    },
+                    |m| m,
+                );
+            }
+            state.busy = Some(format!("{group} {key}"));
+            Task::perform(
+                async move {
+                    match preview(&ctx, &group, &key, kind) {
+                        Ok(pending) => Message::PreviewReady(pending),
+                        Err(error) => Message::Done {
+                            notice: format!("failed: {error}"),
+                        },
+                    }
+                },
+                |m| m,
+            )
+        }
+        Message::PreviewReady(pending) => {
+            state.pending = Some(pending);
+            state.busy = None;
+            Task::none()
+        }
+        Message::Confirm => {
+            let Some(pending) = state.pending.clone() else {
+                return Task::none();
+            };
+            state.pending = None;
+            state.busy = Some(format!("{} {}", pending.group, pending.key));
+            Task::perform(
+                async move {
+                    let notice = apply(&ctx, &pending);
+                    Message::Done { notice }
+                },
+                |m| m,
+            )
+        }
+        Message::Cancel => {
+            state.pending = None;
+            Task::none()
+        }
+        Message::Done { notice } => {
+            // A Codex fix on a T3 instance unlocks the Re-enable offer.
+            if notice.starts_with("fixed ")
+                && let Ok(reg) = Registry::load(&ctx.paths)
+                && let Some(id) = notice
+                    .strip_prefix("fixed ")
+                    .and_then(|s| s.split_whitespace().next())
+                && reg.get(id).is_some_and(|i| i.t3)
+                && !state.reenable.contains(&id.to_string())
+            {
+                state.reenable.push(id.to_string());
+            }
+            state.notices.push(notice);
+            while state.notices.len() > 4 {
+                state.notices.remove(0);
+            }
+            state.pending = None;
+            state.busy = None;
+            Task::perform(async move { load(ctx) }, |m| m)
+        }
+        Message::ReenableDone { group, report } => {
+            state.busy = None;
+            state.notices.extend(report);
+            while state.notices.len() > 4 {
+                state.notices.remove(0);
+            }
+            state.reenable.retain(|id| *id != group);
+            Task::perform(async move { load(ctx) }, |m| m)
+        }
+    }
+}
+
+/// Button label for an action, resolved here (not in the snapshot) so the
+/// page follows a language switch without reloading.
+fn action_label(action: &Action) -> String {
+    match (&action.kind, &action.server) {
+        (Kind::Import, Some(server)) => fl!(loader(), "drift-import-server", server = server),
+        (Kind::Import, None) => fl!(loader(), "drift-import"),
+        (Kind::Fix, _) => fl!(loader(), "drift-fix"),
+        (Kind::Reenable, _) => fl!(loader(), "drift-reenable"),
+        (Kind::Apply, _) => fl!(loader(), "drift-apply"),
+    }
+}
+
+fn action_buttons<'a>(group: &str, item: &'a Item) -> Vec<Element<'a, Message>> {
+    item.actions
+        .iter()
+        .map(|a| {
+            button(text(action_label(a)).size(12))
+                .on_press(Message::Act {
+                    group: group.to_string(),
+                    key: a.key.clone(),
+                    kind: a.kind,
+                })
+                .into()
+        })
+        .collect()
+}
+
+/// Item body: keyed lines and notes resolve here so snapshots stay
+/// language-independent.
+fn item_text(item: &Item) -> String {
+    if let Some(key) = &item.text_key {
+        return match key {
+            TextKey::NoDrift => fl!(loader(), "drift-no-drift"),
+            TextKey::T3Unavailable => fl!(loader(), "t3-unavailable"),
+        };
+    }
+    match &item.note {
+        Some(Note::NotInRegistry) => {
+            format!("{}: {}", item.text, fl!(loader(), "drift-not-in-registry"))
+        }
+        None => item.text.clone(),
+    }
+}
+
+/// Confirm button label: the Fix confirm names the path being replaced.
+fn confirm_label(pending: &Pending) -> String {
+    match &pending.confirm_path {
+        Some(path) => fl!(loader(), "drift-confirm-replace", path = path),
+        None => fl!(loader(), "drift-confirm"),
+    }
+}
+
+pub fn view(state: &State) -> Element<'_, Message> {
+    let mut col = column![text(fl!(loader(), "drift-title")).size(22)].spacing(12);
+    if let Some(error) = &state.snapshot.error {
+        col = col.push(text(fl!(loader(), "load-error", what = error)).size(13));
+    }
+    for notice in &state.notices {
+        col = col.push(text(notice).size(12));
+    }
+    if let Some(busy) = &state.busy {
+        col = col.push(text(format!("{} {busy}", fl!(loader(), "drift-working"))).size(12));
+    }
+    if let Some(pending) = &state.pending {
+        let mut preview = column![text(fl!(loader(), "drift-preview")).size(14)].spacing(4);
+        let mut lines = pending.preview.clone();
+        if lines.is_empty() {
+            lines.push(fl!(loader(), "drift-no-drift"));
+        }
+        lines.truncate(30);
+        for line in lines {
+            preview = preview.push(text(line).size(12));
+        }
+        preview = preview.push(
+            iced::widget::row![
+                button(text(confirm_label(pending)).size(12)).on_press(Message::Confirm),
+                button(text(fl!(loader(), "drift-cancel")).size(12))
+                    .style(button::secondary)
+                    .on_press(Message::Cancel),
+            ]
+            .spacing(8),
+        );
+        col = col.push(preview);
+        col = col.push(Space::new().height(Length::Fixed(8.0)));
+    }
+    for group in &state.snapshot.groups {
+        let title = group
+            .title
+            .clone()
+            .unwrap_or_else(|| fl!(loader(), "drift-group-t3"));
+        let mut card = column![text(title).size(16)].spacing(4);
+        // Re-enable is offered only after a Codex fix on a T3 instance.
+        if group.harness == "codex" && state.reenable.contains(&group.id) {
+            card = card.push(
+                button(text(fl!(loader(), "drift-reenable")).size(12)).on_press(Message::Act {
+                    group: group.id.clone(),
+                    key: String::new(),
+                    kind: Kind::Reenable,
+                }),
+            );
+        }
+        for item in &group.items {
+            card = card.push(text(item_text(item)).size(12));
+            let buttons = action_buttons(&group.id, item);
+            if !buttons.is_empty() {
+                card = card.push(
+                    buttons
+                        .into_iter()
+                        .fold(iced::widget::row![].spacing(8), |r, b| r.push(b)),
+                );
+            }
+        }
+        col = col.push(card);
+        col = col.push(Space::new().height(Length::Fixed(8.0)));
+    }
+    col.into()
+}

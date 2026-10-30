@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use agentdeck_core::{Paths, Registry};
-use agentdeck_gui::{app, data};
+use agentdeck_gui::{app, data, pages::drift};
 
 const SNAPSHOTS: &str = "tests/snapshots";
 
@@ -162,7 +162,6 @@ fn load_with_fixtures(
 /// `AGENTDECK_T3_DIR` is process-global: tests that point it at fixtures
 /// hold this lock for their whole body so parallel tests cannot race.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     // A poisoned lock means a sibling test panicked: keep going so every
     // failure prints instead of cascading into PoisonError noise.
@@ -246,7 +245,7 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         assert!(bytes > 1_024, "golden {} looks empty", goldens[0].display());
     }
 
-    // Sidebar navigation: click Drift, the placeholder replaces Instances.
+    // Sidebar navigation: click Drift, the Drift page replaces Instances.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths, data);
     let mut ui = iced_test::simulator(app::view(&state));
@@ -256,6 +255,310 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     }
     assert!(matches!(state.page(), agentdeck_gui::Page::Drift));
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.find("Coming in a later unit.")
-        .expect("drift placeholder body");
+    ui.find("Drift").expect("drift page title");
+}
+
+/// Drift fixture: fake HOME + registry + T3 dir with real drift in every
+/// group (nothing touches the real user tree; `Ctx` carries temp roots).
+fn write_drift_fixtures(tag: &str) -> (drift::Ctx, tempfile_guard::Guard) {
+    let (paths, dir, guard) = fixture_paths(tag);
+    let home = dir.join("home");
+    // Primary Claude profile.
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        "{\"mcpServers\":{\"srv\":{\"command\":\"x\"}}}",
+    )
+    .unwrap();
+    // Secondary with settings + mcp drift (no symlinks: link drift too).
+    let second = home.join(".claude-second");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("settings.json"), "{\"theme\":\"light\"}\n").unwrap();
+    std::fs::write(
+        second.join(".claude.json"),
+        "{\"mcpServers\":{\"srv\":{\"command\":\"x\"},\"extra\":{\"command\":\"y\"}}}",
+    )
+    .unwrap();
+    // Codex main + shadow with a real entry where a link belongs.
+    let main = home.join(".codex");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::write(main.join("config.toml"), "x = 1\n").unwrap();
+    let shadow = home.join(".codex-shadow");
+    std::fs::create_dir_all(&shadow).unwrap();
+    std::fs::write(shadow.join("config.toml"), "mine").unwrap();
+    // Registry: claude + primary/secondary codex homes.
+    Registry::update(&paths, |r| {
+        r.add(agentdeck_core::registry::AddSpec {
+            id: "claude-a".into(),
+            harness: agentdeck_core::Harness::Claude,
+            display_name: None,
+            home: second.to_string_lossy().into_owned(),
+            binary: None,
+            no_t3: false,
+        })?;
+        r.add(agentdeck_core::registry::AddSpec {
+            id: "codex".into(),
+            harness: agentdeck_core::Harness::Codex,
+            display_name: None,
+            home: "~/.codex".into(),
+            binary: None,
+            no_t3: false,
+        })?;
+        r.add(agentdeck_core::registry::AddSpec {
+            id: "codex-s".into(),
+            harness: agentdeck_core::Harness::Codex,
+            display_name: None,
+            home: shadow.to_string_lossy().into_owned(),
+            binary: None,
+            no_t3: false,
+        })?;
+        Ok(())
+    })
+    .unwrap();
+    // T3: registry instance out of sync + one instance missing from registry.
+    let t3 = dir.join("t3");
+    std::fs::create_dir_all(t3.join("userdata")).unwrap();
+    std::fs::create_dir_all(t3.join("caches")).unwrap();
+    std::fs::write(
+        t3.join("userdata/settings.json"),
+        r#"{"providerInstances": {
+            "claude-a": {"driver": "claudeAgent", "enabled": true,
+                "config": {"homePath": "/elsewhere"}},
+            "codex-extra": {"driver": "codex", "enabled": true,
+                "config": {"homePath": "/x", "shadowHomePath": "/y"}}
+        }}"#,
+    )
+    .unwrap();
+    let ctx = drift::Ctx {
+        paths,
+        home,
+        t3_root: Some(t3),
+    };
+    (ctx, guard)
+}
+
+fn drift_group<'a>(snap: &'a drift::Snapshot, id: &str) -> &'a drift::Group {
+    snap.groups.iter().find(|g| g.id == id).expect(id)
+}
+
+/// Trim a rich drift fixture down to a compact deterministic page: one item
+/// per kind. Temp paths are normalized by the caller.
+fn tidy_for_shot(ctx: &drift::Ctx) {
+    let primary = ctx.home.join(".claude");
+    let second = ctx.home.join(".claude-second");
+    for name in ["skills", "agents", "plugins", "CLAUDE.md"] {
+        let link = second.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(primary.join(name), &link).unwrap();
+    }
+    std::fs::write(second.join("settings.json"), "{\"theme\":\"light\"}\n").unwrap();
+    std::fs::copy(ctx.home.join(".claude.json"), second.join(".claude.json")).unwrap();
+    // Sync the shadow, then plant a single real entry.
+    let main = ctx.home.join(".codex");
+    let shadow = ctx.home.join(".codex-shadow");
+    let changes =
+        agentdeck_core::codex::plan_materialize(&main, &shadow, &ctx.paths.state_dir).unwrap();
+    agentdeck_core::apply_changes(&changes).unwrap();
+    std::fs::remove_file(shadow.join("config.toml")).unwrap();
+    std::fs::write(shadow.join("config.toml"), "mine").unwrap();
+    // Apply the T3 sync so the golden keeps a single T3 row (the importable
+    // instance); the file drift above stays for the Claude/Codex groups.
+    let t3_root = ctx.t3_root.clone().unwrap();
+    agentdeck_core::t3::sync_t3(&ctx.paths, &t3_root, false).unwrap();
+}
+
+/// Rendered text holds temp paths (run-specific); normalize them away.
+fn normalize_shot(state: &mut drift::State, root: &str) {
+    for group in &mut state.snapshot.groups {
+        for item in &mut group.items {
+            item.text = item.text.replace(root, "<tmp>");
+            if let Some(p) = item.decision_path.take() {
+                item.decision_path = Some(p.replace(root, "<tmp>"));
+            }
+            for a in &mut item.actions {
+                a.key = a.key.replace(root, "<tmp>");
+            }
+        }
+    }
+}
+
+#[test]
+fn drift_snapshot_groups_actions_preview_apply() {
+    let _env = lock_env();
+    let (ctx, _guard) = write_drift_fixtures("drift-act");
+    let snap = drift::snapshot(&ctx);
+    assert!(snap.error.is_none(), "{:?}", snap.error);
+
+    // Claude: symlink + settings + mcp drift, Apply and Import offered.
+    let claude = drift_group(&snap, "claude-a");
+    assert!(claude.items.iter().any(|i| {
+        i.actions
+            .iter()
+            .any(|a| a.kind == drift::Kind::Import && a.key == "settings:theme")
+    }));
+    assert!(claude.items.iter().any(|i| {
+        i.actions
+            .iter()
+            .any(|a| a.kind == drift::Kind::Import && a.key == "mcpserver:extra")
+    }));
+    // Redacted UI text never leaks env/header values (fixture has none, but
+    // the marker must be there for the mcp diff).
+    let mcp = claude
+        .items
+        .iter()
+        .find(|i| i.key == "mcp")
+        .expect("mcp item");
+    assert!(
+        mcp.text.contains("<redacted>") || mcp.text.contains("extra"),
+        "{}",
+        mcp.text
+    );
+
+    // Codex: real entry needs a decision; the fix confirm names the path.
+    let codex = drift_group(&snap, "codex-s");
+    let real = codex
+        .items
+        .iter()
+        .find(|i| i.decision_path.is_some())
+        .expect("real entry item");
+    let fix = real
+        .actions
+        .iter()
+        .find(|a| a.kind == drift::Kind::Fix)
+        .expect("fix");
+    let pending = drift::preview(&ctx, "codex-s", &fix.key, drift::Kind::Fix).expect("preview");
+    assert_eq!(
+        pending.confirm_path.as_deref(),
+        real.decision_path.as_deref(),
+        "the Fix confirm names the path"
+    );
+    assert!(!pending.preview.is_empty());
+
+    // Import a Claude settings key through the page: preview then apply.
+    let pending =
+        drift::preview(&ctx, "claude-a", "settings:theme", drift::Kind::Import).expect("preview");
+    assert!(!pending.preview.is_empty(), "change-list preview");
+    let notice = drift::apply(&ctx, &pending);
+    assert!(notice.contains("imported"), "{notice}");
+    // The key no longer drifts afterwards.
+    let snap = drift::snapshot(&ctx);
+    let claude = drift_group(&snap, "claude-a");
+    assert!(
+        claude
+            .items
+            .iter()
+            .all(|i| !i.actions.iter().any(|a| a.key == "settings:theme")),
+        "theme imported, no Import left"
+    );
+
+    // T3 group: sync Apply for the managed instance, Import for the missing one.
+    let t3 = drift_group(&snap, "t3");
+    assert!(
+        t3.items
+            .iter()
+            .any(|i| i.actions.iter().any(|a| a.kind == drift::Kind::Apply))
+    );
+    assert!(
+        t3.items
+            .iter()
+            .any(|i| i.actions.iter().any(|a| a.kind == drift::Kind::Import))
+    );
+    let pending = drift::preview(&ctx, "t3", "t3import", drift::Kind::Import).expect("preview");
+    assert!(
+        pending.preview.iter().any(|l| l.contains("codex-extra")),
+        "{pending:?}"
+    );
+    let notice = drift::apply(&ctx, &pending);
+    assert!(notice.contains("imported 1"), "{notice}");
+    assert!(
+        Registry::load(&ctx.paths)
+            .unwrap()
+            .get("codex-extra")
+            .is_some()
+    );
+}
+
+#[test]
+fn drift_fix_then_reenable_offer_and_snapshots() {
+    let _env = lock_env();
+    let (ctx, _guard) = write_drift_fixtures("drift-fix");
+    // Fix the shadow through the page (backup+replace after the path confirm).
+    let snap = drift::snapshot(&ctx);
+    let codex = drift_group(&snap, "codex-s");
+    let real = codex
+        .items
+        .iter()
+        .find(|i| i.decision_path.is_some())
+        .expect("real");
+    let fix = real
+        .actions
+        .iter()
+        .find(|a| a.kind == drift::Kind::Fix)
+        .expect("fix")
+        .clone();
+    let pending = drift::preview(&ctx, "codex-s", &fix.key, drift::Kind::Fix).expect("preview");
+    let notice = drift::apply(&ctx, &pending);
+    assert!(notice.starts_with("fixed "), "{notice}");
+    // Simulate update()'s bookkeeping: a fix on a T3 instance offers Re-enable.
+    let mut state = drift::State::default();
+    state.reenable.push("codex-s".into());
+    state.snapshot = drift::snapshot(&ctx);
+    assert!(
+        drift_group(&state.snapshot, "codex-s")
+            .items
+            .iter()
+            .all(|i| i.decision_path.is_none()),
+        "real entry linked now"
+    );
+    // Lean deterministic page for the golden snapshots.
+    tidy_for_shot(&ctx);
+    state.snapshot = drift::snapshot(&ctx);
+    state.reenable.clear();
+    let root = ctx.home.parent().unwrap().to_string_lossy().into_owned();
+    normalize_shot(&mut state, &root);
+    // update()'s Done bookkeeping offers Re-enable after a fix on a T3 instance.
+    let mut st = drift::State::default();
+    let _task = drift::update(
+        &mut st,
+        ctx.clone(),
+        drift::Message::Done {
+            notice: "fixed codex-s (0 deferred)".into(),
+        },
+    );
+    assert!(st.reenable.contains(&"codex-s".to_string()));
+
+    // Headless EN/RU snapshots of the page with fixture drift.
+    std::fs::create_dir_all(SNAPSHOTS).unwrap();
+    for (lang, stem) in [("en", "drift_en"), ("ru", "drift_ru")] {
+        agentdeck_gui::i18n::set_language(lang);
+        let mut ui = iced_test::simulator(drift::view(&state));
+        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        assert!(
+            snapshot
+                .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
+                .expect("snapshot compare/write"),
+            "snapshot {stem} changed"
+        );
+        let goldens: Vec<_> = std::fs::read_dir(SNAPSHOTS)
+            .expect("snapshots dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with(stem))
+                    && p.extension().and_then(|e| e.to_str()) == Some("png")
+            })
+            .collect();
+        assert_eq!(goldens.len(), 1, "one golden per stem: {goldens:?}");
+        let bytes = std::fs::metadata(&goldens[0]).expect("golden png").len();
+        assert!(bytes > 1_024, "golden {} looks empty", goldens[0].display());
+        assert!(
+            bytes < 100_000,
+            "golden {} over the 100KB budget",
+            goldens[0].display()
+        );
+    }
+    agentdeck_gui::i18n::set_language("en");
 }

@@ -413,6 +413,93 @@ fn opt_json(v: &Option<Value>) -> String {
         .unwrap_or_else(|| "(absent)".into())
 }
 
+/// Copy one `settings.json` key from the secondary home into the primary
+/// profile (backup, other keys and their order kept); a later `sync`
+/// propagates it to every secondary. Errors when the secondary lacks the
+/// key. `Ok(None)` means the primary already holds that value.
+pub fn import_settings_key(
+    primary: &Path,
+    home: &Path,
+    state_dir: &Path,
+    key: &str,
+) -> anyhow::Result<Option<Change>> {
+    if key.is_empty() {
+        anyhow::bail!("settings key must not be empty");
+    }
+    let (pri_bytes, pri) = read_json_file(&primary.join("settings.json"))?;
+    let (_, sec) = read_json_file(&home.join("settings.json"))?;
+    let Some(pri_obj) = pri.as_object() else {
+        anyhow::bail!("primary settings.json is not a JSON object");
+    };
+    let Some(sec_obj) = sec.as_object() else {
+        anyhow::bail!("secondary settings.json is not a JSON object");
+    };
+    let Some(value) = sec_obj.get(key).cloned() else {
+        anyhow::bail!("secondary settings.json has no key {key:?}");
+    };
+    // Clone-then-insert keeps every existing key and its order (serde_json
+    // keeps insertion order with preserve_order); new keys append at the end.
+    let mut merged = pri_obj.clone();
+    if merged.get(key) == Some(&value) {
+        return Ok(None);
+    }
+    merged.insert(key.to_string(), value);
+    Ok(plan_write_file(
+        primary.join("settings.json"),
+        pri_bytes.as_deref(),
+        &to_pretty(&merged)?,
+    )
+    .map(|c| with_backup(state_dir, c)))
+}
+
+/// Copy one `mcpServers` entry from the secondary `.claude.json` into the
+/// primary one (backup, other servers kept); a later `sync` propagates it.
+/// `Ok(None)` means the primary already holds that entry.
+pub fn import_mcp_server(
+    primary_json: &Path,
+    home: &Path,
+    state_dir: &Path,
+    server: &str,
+) -> anyhow::Result<Option<Change>> {
+    if server.is_empty() {
+        anyhow::bail!("mcp server name must not be empty");
+    }
+    if fs::symlink_metadata(primary_json).is_err() {
+        anyhow::bail!(
+            "primary {} missing, cannot import an mcpServer into it",
+            primary_json.display()
+        );
+    }
+    let (pri_bytes, pri) = read_json_file(primary_json)?;
+    let (_, sec) = read_json_file(&home.join(".claude.json"))?;
+    let Some(pri_obj) = pri.as_object() else {
+        anyhow::bail!("primary .claude.json is not a JSON object");
+    };
+    let value = sec
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(server))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("secondary .claude.json has no mcpServer {server:?}"))?;
+    let mut merged = pri_obj.clone();
+    let entry = merged
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(servers) = entry.as_object_mut() else {
+        anyhow::bail!("primary .claude.json mcpServers is not an object");
+    };
+    if servers.get(server) == Some(&value) {
+        return Ok(None);
+    }
+    servers.insert(server.to_string(), value);
+    Ok(plan_write_file(
+        primary_json.to_path_buf(),
+        pri_bytes.as_deref(),
+        &to_pretty(&merged)?,
+    )
+    .map(|c| with_backup(state_dir, c)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +838,83 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn import_settings_key_into_primary_then_propagates() {
+        let fx = fixture();
+        // Secondary-only key plus a changed shared key.
+        fs::create_dir_all(&fx.home).unwrap();
+        fs::write(
+            fx.home.join("settings.json"),
+            "{\"theme\":\"light\",\"mine\":1}\n",
+        )
+        .unwrap();
+        let change = import_settings_key(&fx.primary, &fx.home, &fx.state, "mine")
+            .unwrap()
+            .expect("secondary-only key imports");
+        assert!(matches!(
+            change,
+            Change::WriteFile { ref path, ref backup, .. }
+            if path == &fx.primary.join("settings.json") && backup.is_some()
+        ));
+        apply_changes(&[change]).unwrap();
+        let raw = fs::read_to_string(fx.primary.join("settings.json")).unwrap();
+        // Key order kept: existing keys stay first, the import appends.
+        assert!(raw.find("\"theme\"").unwrap() < raw.find("\"mine\"").unwrap());
+        assert_eq!(json_of(&fx.primary.join("settings.json"))["mine"], 1);
+        // Idempotent, and a later sync no longer reports this key as drift.
+        assert!(
+            import_settings_key(&fx.primary, &fx.home, &fx.state, "mine")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            check(&fx.primary, &fx.home, &fx.primary_json)
+                .unwrap()
+                .iter()
+                .all(|d| !matches!(d, Drift::SettingsKey { key, .. } if key == "mine"))
+        );
+        // Unknown keys and empty keys are errors, never writes.
+        assert!(import_settings_key(&fx.primary, &fx.home, &fx.state, "nope").is_err());
+        assert!(import_settings_key(&fx.primary, &fx.home, &fx.state, "").is_err());
+    }
+
+    #[test]
+    fn import_mcp_server_keeps_other_servers() {
+        let fx = fixture();
+        apply_changes(
+            &plan_materialize(&fx.primary, &fx.home, &fx.state, &fx.primary_json).unwrap(),
+        )
+        .unwrap();
+        // Secondary gains a server the primary lacks.
+        let mut sec: Value = json_of(&fx.home.join(".claude.json"));
+        sec["mcpServers"]["extra"] = serde_json::json!({"command": "x"});
+        fs::write(
+            fx.home.join(".claude.json"),
+            serde_json::to_vec_pretty(&sec).unwrap(),
+        )
+        .unwrap();
+        let change = import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "extra")
+            .unwrap()
+            .expect("new server imports");
+        assert!(matches!(
+            change,
+            Change::WriteFile { ref backup, .. } if backup.is_some()
+        ));
+        apply_changes(&[change]).unwrap();
+        let pri = json_of(&fx.primary_json);
+        assert_eq!(
+            pri["mcpServers"]["extra"],
+            serde_json::json!({"command": "x"})
+        );
+        assert!(pri["mcpServers"].get("srv").is_some(), "old server kept");
+        assert!(
+            import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "extra")
+                .unwrap()
+                .is_none()
+        );
+        assert!(import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "nope").is_err());
+        assert!(import_mcp_server(&fx.primary_json, &fx.home, &fx.state, "").is_err());
     }
 }

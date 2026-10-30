@@ -1,4 +1,4 @@
-//! `agentdeck claude sync|check`: materialize and drift-check secondary Claude
+//! `agentdeck claude sync|check|import`: materialize and drift-check secondary
 //! accounts from the primary profile. `instance add` stays registry-only.
 
 use std::path::{Path, PathBuf};
@@ -21,6 +21,20 @@ pub enum ClaudeCmd {
         id: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Import a harness-side value into the primary profile (a later sync
+    /// propagates it to every secondary).
+    Import {
+        /// Registry instance id whose home is the secondary account.
+        id: String,
+        /// A settings.json key to copy from the secondary into the primary.
+        #[arg(long, conflicts_with = "mcp")]
+        key: Option<String>,
+        /// An mcpServers entry to copy from the secondary into the primary.
+        #[arg(long)]
+        mcp: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -51,6 +65,39 @@ pub fn run(cmd: &ClaudeCmd) -> anyhow::Result<()> {
             } else {
                 agentdeck_core::apply_changes(&changes)?;
                 println!("synced {id}");
+            }
+        }
+        ClaudeCmd::Import {
+            id,
+            key,
+            mcp,
+            dry_run,
+        } => {
+            let inst = reg
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("unknown instance id {id:?}"))?;
+            if inst.harness != Harness::Claude {
+                anyhow::bail!("instance {id:?} is not a Claude instance");
+            }
+            let dir = expand_tilde(&inst.home, &home);
+            let change = match (key, mcp) {
+                (Some(k), None) => {
+                    claude::import_settings_key(&primary, &dir, &paths.state_dir, k)?
+                }
+                (None, Some(s)) => {
+                    claude::import_mcp_server(&primary_json, &dir, &paths.state_dir, s)?
+                }
+                _ => anyhow::bail!("pass exactly one of --key or --mcp"),
+            };
+            match &change {
+                Some(c) => println!("{}", claude::describe_change(c)),
+                None => println!("{id}: already in sync"),
+            }
+            if *dry_run {
+                println!("dry-run: {id} unchanged");
+            } else if let Some(c) = change {
+                agentdeck_core::apply_changes(std::slice::from_ref(&c))?;
+                println!("imported into primary from {id}");
             }
         }
         ClaudeCmd::Check { id, json } => {

@@ -1,7 +1,8 @@
 //! agentdeck GUI shell (iced 0.14): sidebar with Instances, Drift, Plugins and
-//! Processes pages. Instances is live in this unit; the rest are placeholders.
-//! All data reads are read-only; refresh ticks re-read files off the UI
-//! thread via `Task::perform`. Never opens a window in tests: see tests/.
+//! Processes pages. Drift shows per-instance-group drift with Apply / Import /
+//! Fix / Re-enable actions behind a preview-then-confirm flow. All data reads
+//! are read-only; refresh ticks and actions run off the UI thread via
+//! `Task::perform`. Never opens a window in tests: see tests/.
 
 pub mod app;
 pub mod data;

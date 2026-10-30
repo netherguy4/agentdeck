@@ -8,6 +8,7 @@ use iced::{Element, Length, Subscription, Task, Theme};
 
 use crate::data::{self, Data};
 use crate::i18n::loader;
+use crate::pages::drift::{self, Ctx as DriftCtx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
@@ -34,11 +35,23 @@ pub enum Message {
     Tick,
     Loaded(Data),
     SelectPage(Page),
+    Drift(drift::Message),
+}
+
+fn drift_ctx(paths: &agentdeck_core::Paths) -> DriftCtx {
+    DriftCtx {
+        paths: paths.clone(),
+        home: std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default(),
+        t3_root: agentdeck_core::t3::t3_root().ok(),
+    }
 }
 
 pub struct State {
     page: Page,
     data: Data,
+    drift: drift::State,
     paths: Option<agentdeck_core::Paths>,
 }
 
@@ -51,6 +64,7 @@ impl State {
             Self {
                 page: Page::Instances,
                 data: Data::default(),
+                drift: drift::State::default(),
                 paths,
             },
             match first {
@@ -65,6 +79,7 @@ impl State {
         Self {
             page: Page::Instances,
             data,
+            drift: drift::State::default(),
             paths: Some(paths),
         }
     }
@@ -81,13 +96,31 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::Tick => match state.paths.clone() {
-            Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+            Some(paths) => {
+                let drift_paths = paths.clone();
+                Task::batch([
+                    Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                    Task::perform(
+                        async move {
+                            let ctx = drift_ctx(&drift_paths);
+                            drift::load(ctx)
+                        },
+                        Message::Drift,
+                    ),
+                ])
+            }
             None => Task::none(),
         },
         Message::Loaded(data) => {
             state.data = data;
             Task::none()
         }
+        Message::Drift(inner) => match state.paths.clone() {
+            Some(paths) => {
+                drift::update(&mut state.drift, drift_ctx(&paths), inner).map(Message::Drift)
+            }
+            None => Task::none(),
+        },
     }
 }
 
@@ -115,7 +148,7 @@ fn sidebar(state: &State) -> Element<'_, Message> {
 pub fn view(state: &State) -> Element<'_, Message> {
     let content: Element<'_, Message> = match state.page {
         Page::Instances => crate::pages::instances::view(&state.data),
-        Page::Drift => crate::pages::other::drift(),
+        Page::Drift => crate::pages::drift::view(&state.drift).map(Message::Drift),
         Page::Plugins => crate::pages::other::plugins(),
         Page::Processes => crate::pages::other::processes(),
     };
