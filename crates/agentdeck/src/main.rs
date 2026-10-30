@@ -16,7 +16,7 @@ mod cmd_wrapper;
 #[command(name = "agentdeck", version, about = "Manage harness instances")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +148,10 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(agent_process::main(args.collect()));
     }
     let cli = Cli::parse();
+    // No subcommand opens the GUI; every subcommand keeps its CLI behavior.
+    let Some(cmd) = cli.cmd else {
+        return run_gui();
+    };
     let paths = Paths::from_env()?;
     // Providers write cooldowns/snapshots via util::persistent_state_dir();
     // point it at the new tree before anything runs. Unset, everything keeps
@@ -157,7 +161,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    match runtime.block_on(async_main(&paths, cli.cmd)) {
+    match runtime.block_on(async_main(&paths, cmd)) {
         Ok(()) => Ok(()),
         Err(error) => {
             // Single-writer lock and old-service refusal need stable exit codes.
@@ -177,6 +181,26 @@ fn main() -> anyhow::Result<()> {
             }
             Err(error)
         }
+    }
+}
+
+fn run_gui() -> anyhow::Result<()> {
+    // A headless shell has no window backend: fail with a clear error instead
+    // of letting winit panic inside iced.
+    let has_display = ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()));
+    if !has_display {
+        anyhow::bail!(
+            "cannot open the GUI: no display (neither WAYLAND_DISPLAY nor DISPLAY is set); \
+             run in a desktop session or use a subcommand, see `agentdeck --help`"
+        );
+    }
+    // Display vars set but unreachable (or any other startup panic): still a
+    // clean error, never a panic.
+    match std::panic::catch_unwind(agentdeck_gui::run) {
+        Ok(inner) => inner.map_err(|error| anyhow::anyhow!("cannot open the GUI: {error}")),
+        Err(_) => anyhow::bail!("cannot open the GUI: the window backend failed to start"),
     }
 }
 

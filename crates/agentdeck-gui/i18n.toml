@@ -1,0 +1,10 @@
+# (Required) The primary fallback language (for which all strings must be
+# present) when using the fluent system.
+fallback_language = "en"
+
+#  Use the fluent localization system.
+[fluent]
+# (Required) The path to the assets directory.
+# The paths inside the assets directory are structured like so:
+# `assets_dir/{language}/{domain}.ftl`
+assets_dir = "i18n"

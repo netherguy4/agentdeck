@@ -1,0 +1,24 @@
+[package]
+name = "agentdeck-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop GUI shell for agentdeck (iced)"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/netherguy4/agentdeck"
+rust-version = "1.93"
+
+[dependencies]
+agentdeck-core = { path = "../agentdeck-core" }
+agentdeck-usage = { path = "../agentdeck-usage" }
+anyhow = "1.0"
+dirs = "6.0"
+iced = { version = "0.14", features = ["tokio"] }
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8"
+serde_json = "1.0"
+unic-langid = "0.9"
+
+[dev-dependencies]
+iced_test = "0.14"
+serde_json = "1.0"

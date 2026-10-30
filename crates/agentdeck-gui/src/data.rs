@@ -1,0 +1,150 @@
+//! Read-only snapshot behind the Instances page: registry instances, T3 health
+//! and quota bars from the usage state file. A missing state file is "no
+//! data", never an error; nothing here writes.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use agentdeck_core::{Paths, Registry, t3};
+use agentdeck_usage::model::{self, AppState};
+
+/// Canonical usage state file, then the old ai-usage path the daemon still
+/// compat-writes (a missing file means "no data", not an error).
+fn state_file_candidates(paths: &Paths) -> Vec<PathBuf> {
+    vec![
+        paths.state_dir.join("usage").join("state.json"),
+        agentdeck_usage::util::legacy_persistent_state_dir().join("state.json"),
+    ]
+}
+
+fn read_state(path: &std::path::Path) -> Option<AppState> {
+    let raw = std::fs::read(path).ok()?;
+    let state: AppState = serde_json::from_slice(&raw).ok()?;
+    (state.schema_version == model::SCHEMA_VERSION).then_some(state)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct T3Info {
+    pub status: Option<String>,
+    pub threads: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuotaBar {
+    pub label: String,
+    pub used_percent: f64,
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageQuotas {
+    pub usage_id: String,
+    pub display: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub bars: Vec<QuotaBar>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstanceRow {
+    pub id: String,
+    pub display_name: String,
+    pub harness: String,
+    pub enabled: bool,
+    pub t3: Option<T3Info>,
+    pub quotas: Vec<UsageQuotas>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Data {
+    pub instances: Vec<InstanceRow>,
+    pub standalone: Vec<UsageQuotas>,
+    /// Registry-level failure (unreadable file); per-source gaps stay silent.
+    pub error: Option<String>,
+}
+
+fn quotas_for(
+    usage_id: &str,
+    display: &str,
+    kind: &str,
+    accounts: &[model::AccountState],
+) -> UsageQuotas {
+    let account = accounts
+        .iter()
+        .find(|a| a.id == usage_id && a.provider == kind);
+    UsageQuotas {
+        usage_id: usage_id.to_string(),
+        display: display.to_string(),
+        status: account.map(|a| a.status.clone()).unwrap_or_default(),
+        error: account.and_then(|a| a.error.clone()),
+        bars: account
+            .map(|a| {
+                a.windows
+                    .iter()
+                    .map(|w| QuotaBar {
+                        label: w.label.clone(),
+                        used_percent: w.used_percent,
+                        scope: w.scope.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Load everything the Instances page shows. Never fails: gaps become dashes.
+pub fn load(paths: &Paths) -> Data {
+    let registry = match Registry::load(paths) {
+        Ok(registry) => registry,
+        Err(error) => {
+            return Data {
+                error: Some(format!("registry: {error:#}")),
+                ..Data::default()
+            };
+        }
+    };
+    let t3_rows: HashMap<String, (Option<String>, Option<u64>)> = t3::t3_root()
+        .ok()
+        .and_then(|root| t3::t3_status(paths, &root).ok())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| (r.id, (r.cache.map(|c| c.status), r.threads)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let accounts: Vec<model::AccountState> = state_file_candidates(paths)
+        .iter()
+        .find_map(|path| read_state(path))
+        .map(|s| s.accounts)
+        .unwrap_or_default();
+
+    let mut data = Data::default();
+    for inst in &registry.instances {
+        let quotas = registry
+            .usage
+            .iter()
+            .filter(|u| u.instance.as_deref() == Some(inst.id.as_str()))
+            .map(|u| quotas_for(&u.id, &u.display, u.kind.as_str(), &accounts))
+            .collect();
+        data.instances.push(InstanceRow {
+            id: inst.id.clone(),
+            display_name: inst.display_name.clone(),
+            harness: inst.harness.as_str().to_string(),
+            enabled: inst.enabled,
+            t3: t3_rows
+                .get(&inst.id)
+                .map(|(status, threads)| T3Info {
+                    status: status.clone(),
+                    threads: *threads,
+                }),
+            quotas,
+        });
+    }
+    data.standalone = registry
+        .usage
+        .iter()
+        .filter(|u| u.instance.is_none())
+        .map(|u| quotas_for(&u.id, &u.display, u.kind.as_str(), &accounts))
+        .collect();
+    data
+}

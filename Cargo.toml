@@ -10,7 +10,7 @@ rust-version = "1.93"
 [workspace]
 members = [".", "crates/*"]
 # libcosmic is heavy: the applet builds in its own CI job, not in the default gates.
-default-members = [".", "crates/agentdeck", "crates/agentdeck-core", "crates/agentdeck-usage", "crates/agent-process"]
+default-members = [".", "crates/agentdeck", "crates/agentdeck-core", "crates/agentdeck-gui", "crates/agentdeck-usage", "crates/agent-process"]
 resolver = "2"
 
 [dependencies]
