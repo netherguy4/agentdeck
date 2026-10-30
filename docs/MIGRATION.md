@@ -51,7 +51,7 @@ OWNER: replace the `current` command with the `desired` one at each `location`.
 ## 4. OWNER cutover: switch polling
 
 ```sh
-systemctl --user stop ai-usage.service
+systemctl --user disable --now ai-usage.service   # still enabled, both would poll after a reboot
 systemctl --user enable --now agentdeck-daemon.service
 agentdeck usage doctor   # new updated_at fresh for all sources
 ```
@@ -62,15 +62,14 @@ still writes the old state paths.
 ## 5. Rollback (before step 6)
 
 ```sh
-systemctl --user stop agentdeck-daemon.service
-systemctl --user start ai-usage.service   # old tree was copied, never moved
+systemctl --user disable --now agentdeck-daemon.service
+systemctl --user enable --now ai-usage.service   # old tree was copied, never moved
 # put the old hook commands back if step 3 was applied
 ```
 
 ## 6. OWNER retirement (soak >= 1 week, then all by hand)
 
 ```sh
-systemctl --user disable ai-usage.service
 rm ~/.local/bin/ai-usage*
 # remove the GNOME extension dir, then relogin (Wayland cannot unload it live)
 rm ~/.config/ai-usage/config.toml ~/.config/ai-usage/secrets.env
