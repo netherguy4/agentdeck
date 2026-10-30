@@ -10,15 +10,7 @@ use std::{
 };
 
 // Reuse the backend's schema so provider changes remain compatible with both desktops.
-#[allow(dead_code)]
-#[path = "../../crates/agentdeck-usage/src/model.rs"]
-mod model;
-mod util {
-    pub fn unix_now() -> i64 {
-        super::now()
-    }
-}
-use model::{AccountState, AppState, QuotaWindow};
+use agentdeck_usage::model::{self, AccountState, AppState, QuotaWindow};
 
 static AUTOSIZE: LazyLock<widget::Id> = LazyLock::new(widget::Id::unique);
 
@@ -172,22 +164,26 @@ fn masked_email(email: &str) -> String {
 fn provider_icon(provider: &str) -> widget::icon::Handle {
     let bytes: &'static [u8] = match provider {
         "codex" => {
-            include_bytes!("../../extension/ai-usage@netherguy4/icons/ai-usage-codex-symbolic.svg")
+            include_bytes!(
+                "../../../extension/ai-usage@netherguy4/icons/ai-usage-codex-symbolic.svg"
+            )
         }
         "claude" => {
-            include_bytes!("../../extension/ai-usage@netherguy4/icons/ai-usage-claude-symbolic.svg")
+            include_bytes!(
+                "../../../extension/ai-usage@netherguy4/icons/ai-usage-claude-symbolic.svg"
+            )
         }
         "antigravity" => include_bytes!(
-            "../../extension/ai-usage@netherguy4/icons/ai-usage-antigravity-symbolic.svg"
+            "../../../extension/ai-usage@netherguy4/icons/ai-usage-antigravity-symbolic.svg"
         ),
         "deepseek" => include_bytes!(
-            "../../extension/ai-usage@netherguy4/icons/ai-usage-deepseek-symbolic.svg"
+            "../../../extension/ai-usage@netherguy4/icons/ai-usage-deepseek-symbolic.svg"
         ),
         "openrouter" => include_bytes!(
-            "../../extension/ai-usage@netherguy4/icons/ai-usage-openrouter-symbolic.svg"
+            "../../../extension/ai-usage@netherguy4/icons/ai-usage-openrouter-symbolic.svg"
         ),
         "opencode-go" => include_bytes!(
-            "../../extension/ai-usage@netherguy4/icons/ai-usage-opencode-go-symbolic.svg"
+            "../../../extension/ai-usage@netherguy4/icons/ai-usage-opencode-go-symbolic.svg"
         ),
         _ => return widget::icon::from_name("dialog-information-symbolic").into(),
     };
