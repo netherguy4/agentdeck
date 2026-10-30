@@ -2,6 +2,7 @@ use agentdeck_core::{AddSpec, Harness, Paths, t3};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod cmd_claude;
+mod cmd_login;
 mod cmd_pool;
 mod cmd_t3;
 
@@ -33,6 +34,17 @@ enum Cmd {
     T3 {
         #[command(subcommand)]
         cmd: cmd_t3::T3Cmd,
+    },
+    /// Run the official login CLI for an instance inside a PTY.
+    Login {
+        /// Registry instance id to log in.
+        id: String,
+        /// Use device-code authorization (codex only).
+        #[arg(long)]
+        device_auth: bool,
+        /// Open the login URL with xdg-open (otherwise only print it).
+        #[arg(long)]
+        open: bool,
     },
 }
 
@@ -106,6 +118,11 @@ fn main() -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
+        Cmd::Login {
+            id,
+            device_auth,
+            open,
+        } => cmd_login::run(&paths, &id, device_auth, open)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
