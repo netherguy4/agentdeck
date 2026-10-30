@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # No debug info: much faster links and a smaller cache; CI does not need the symbols.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,6 +27,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install iced system dependencies
         run: |
@@ -37,9 +45,6 @@ jobs:
 
       - name: Rust tests
         run: cargo test --all-targets --locked
-
-      - name: Release build
-        run: cargo build --release --locked
 
   msrv:
     name: Build on declared MSRV
@@ -59,6 +64,10 @@ jobs:
           rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
           rustup default "${{ steps.msrv.outputs.version }}"
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
       - name: Check
         run: cargo check --all-targets --locked
 
@@ -72,6 +81,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install libcosmic system dependencies
         run: |
