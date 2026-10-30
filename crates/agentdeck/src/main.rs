@@ -96,6 +96,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_router::RouterCmd,
     },
+    /// Route a delegation target through the router (port of route.mjs).
+    Route {
+        /// Passthrough router args: [--source S] [--check] [--catalog]
+        /// [--validate-target PROVIDER MODEL] ["<task brief>" | -].
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Enable or disable built-in plugins (agent-process, ai-usage, router).
     Plugin {
         #[command(subcommand)]
@@ -258,6 +265,9 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
         Cmd::Router { cmd } => cmd_router::run(paths, cmd)?,
+        Cmd::Route { args } => {
+            std::process::exit(agentdeck_router::route::run(args).await);
+        }
         Cmd::Ps(args) => cmd_ps::run(args)?,
         Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Plugin { cmd } => cmd_plugin::run(paths, cmd)?,

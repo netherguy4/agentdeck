@@ -10,6 +10,7 @@ rust-version = "1.93"
 [dependencies]
 agent-process = { path = "../agent-process" }
 agentdeck-core = { path = "../agentdeck-core" }
+agentdeck-router = { path = "../agentdeck-router" }
 agentdeck-gui = { path = "../agentdeck-gui" }
 agentdeck-usage = { path = "../agentdeck-usage" }
 anyhow = "1.0"
