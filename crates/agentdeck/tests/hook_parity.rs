@@ -1,0 +1,583 @@
+//! Differential test: the Rust `agentdeck route hook` must print byte-identical
+//! stdout (and exit codes) to the Node `hook.mjs` on the same fixtures with
+//! Jev mocked and the route answers driven by the same mock. Covers
+//! allow/deny/hand-back across harnesses. No real API calls, no real key
+//! file. Skips with a note when Node is absent.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+fn workspace_root() -> PathBuf {
+    let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    d.pop();
+    d.pop();
+    d
+}
+
+fn node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn shared_hint() -> String {
+    let roster: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            workspace_root().join("crates/agentdeck-core/assets/router/roster.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    roster["briefHint"].as_str().unwrap().to_string()
+}
+
+struct Fixture {
+    dir: PathBuf,
+    mock_jev: PathBuf,
+}
+
+const SOL: (&str, &str) = ("codex", "gpt-6.1-sol");
+const OPUS: (&str, &str) = ("claudeAgent", "claude-opus-5-5");
+
+impl Fixture {
+    fn new(
+        pool: &[(&str, &str)],
+        jev: &serde_json::Value,
+        usage: Option<serde_json::Value>,
+    ) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-hook-parity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for rel in [
+            ".t3/userdata",
+            ".local/state/ai-usage",
+            ".local/state/model-route",
+            "rt-node",
+            "rt-rust",
+        ] {
+            std::fs::create_dir_all(dir.join(rel)).unwrap();
+        }
+        std::fs::copy(
+            workspace_root().join("crates/agentdeck-core/assets/router/catalog.fixture.json"),
+            dir.join(".local/state/model-route/catalog.json"),
+        )
+        .unwrap();
+        std::fs::write(dir.join(".t3/userdata/settings.json"), "{}").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = usage.unwrap_or_else(|| serde_json::json!({"accounts": [
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 60, "duration_mins": 10080, "resets_at": now + 6 * 86400 + 1800},
+                {"key": "session", "label": "5h", "remaining_percent": 20, "duration_mins": 300, "resets_at": now + 2 * 3600}]},
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [{"key": "weekly", "label": "Week", "remaining_percent": 80, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+        ]}));
+        std::fs::write(
+            dir.join(".local/state/ai-usage/state.json"),
+            serde_json::to_string(&usage).unwrap(),
+        )
+        .unwrap();
+        let pool_json: Vec<_> = pool
+            .iter()
+            .map(|(p, m)| serde_json::json!({"providerInstanceId": p, "model": m, "enabled": true}))
+            .collect();
+        let router = serde_json::json!({"version": 1, "pool": pool_json,
+            "accounts": {
+                "claude": {"instances": ["claudeAgent"], "usageProvider": "claude", "usageId": "claude-main"},
+                "codex": {"instances": ["codex", "codex_second"], "usageProvider": "codex", "usageId": "codex-main"}},
+            "usageStatePath": dir.join(".local/state/ai-usage/state.json")});
+        std::fs::write(
+            dir.join("router.json"),
+            serde_json::to_string(&router).unwrap(),
+        )
+        .unwrap();
+        let mock_jev = dir.join("mock.json");
+        std::fs::write(&mock_jev, serde_json::to_string(jev).unwrap()).unwrap();
+        // Preloads fetch with the same Jev answers for route.mjs children.
+        std::fs::write(
+            dir.join("mock-fetch.mjs"),
+            "globalThis.fetch = async () => ({ ok: true, json: async () => JSON.parse(process.env.MOCK_JEV_JSON) });\n",
+        )
+        .unwrap();
+        // Runs hook.mjs in-process with a stubbed route spawn (same Jev mock).
+        std::fs::write(
+            dir.join("wrap-hook.mjs"),
+            r#"import fs from 'node:fs';
+import os from 'node:os';
+import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+os.homedir = () => process.cwd();
+const realExec = cp.execFileSync;
+cp.execFileSync = (file, argv, opts) => {
+  if (String(file).endsWith('route.mjs'))
+    return realExec(process.execPath, ['--import', process.env.MOCK_FETCH, file, ...argv], { ...opts });
+  return realExec(file, argv, opts);
+};
+syncBuiltinESMExports();
+process.argv = [process.execPath, 'hook.mjs', ...JSON.parse(process.env.HOOK_ARGS)];
+await import(process.env.HOOK_SRC);
+"#,
+        )
+        .unwrap();
+        Self { dir, mock_jev }
+    }
+
+    fn base_env(&self, runtime: &str) -> Vec<(String, String)> {
+        vec![
+            ("HOME".into(), self.dir.to_string_lossy().into_owned()),
+            (
+                "XDG_STATE_HOME".into(),
+                self.dir.join(".local/state").to_string_lossy().into_owned(),
+            ),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                self.dir.join(runtime).to_string_lossy().into_owned(),
+            ),
+            (
+                "MODEL_ROUTE_ROUTER_JSON".into(),
+                self.dir.join("router.json").to_string_lossy().into_owned(),
+            ),
+            ("JEV_OPENROUTER_API_KEY".into(), "test".into()),
+        ]
+    }
+
+    fn transcript(&self, name: &str, lines: &[&str]) -> String {
+        let p = self.dir.join(name);
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn sqlite_nested_child(&self) {
+        // One app-owned delegated child: session child-session is nested.
+        // Built with node:sqlite (the suite requires node anyway).
+        let db = self.dir.join(".t3/userdata/statev2.sqlite");
+        let status = Command::new("node")
+            .arg("--input-type=module")
+            .arg("-e")
+            .arg(format!(
+                "import {{ DatabaseSync }} from 'node:sqlite'; \
+                const db = new DatabaseSync('{}'); \
+                db.exec(`CREATE TABLE orchestration_v2_projection_subagents (subagent_id TEXT, child_thread_id TEXT); \
+                CREATE TABLE orchestration_v2_projection_provider_threads (provider_thread_id TEXT, thread_id TEXT, payload_json TEXT); \
+                INSERT INTO orchestration_v2_projection_subagents VALUES ('node:child', 'thread:child'); \
+                INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt', 'thread:child', '{{\"nativeThreadRef\":{{\"nativeId\":\"child-session\"}}}}');`); \
+                db.close();",
+                db.to_string_lossy()
+            ))
+            .status()
+            .expect("node for sqlite fixture");
+        assert!(status.success());
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn level(score: f64, fit: f64) -> serde_json::Value {
+    serde_json::json!({"score": score, "confidence": 0.9,
+        "probabilities": {"0": 0, "1": 1.0 - fit, "2": fit - 0.2, "3": 0.2}})
+}
+
+fn answers_for(
+    pairs: &[(&str, serde_json::Value)],
+    size: f64,
+    difficulty: f64,
+) -> serde_json::Value {
+    let mut answers = serde_json::Map::new();
+    answers.insert(
+        "size".into(),
+        serde_json::json!({"score": size, "confidence": 0.9}),
+    );
+    answers.insert(
+        "difficulty".into(),
+        serde_json::json!({"score": difficulty, "confidence": 0.9}),
+    );
+    for (key, v) in pairs {
+        answers.insert(key.to_string(), v.clone());
+    }
+    serde_json::json!({"answers": answers})
+}
+
+fn healthy_jev() -> serde_json::Value {
+    answers_for(
+        &[
+            ("codex_gpt_6_1_sol", level(2.9, 0.95)),
+            ("claudeagent_claude_opus_5_5", level(2.4, 0.95)),
+        ],
+        1.0,
+        1.0,
+    )
+}
+
+fn run_node(fx: &Fixture, harness: &str, stdin_text: &str) -> (i32, Vec<u8>, Vec<u8>) {
+    let route = workspace_root().join("crates/agentdeck-core/assets/router/hook.mjs");
+    let mut cmd = Command::new("node");
+    cmd.arg(fx.dir.join("wrap-hook.mjs"))
+        .current_dir(&fx.dir)
+        .envs(fx.base_env("rt-node"));
+    cmd.env(
+        "HOOK_ARGS",
+        serde_json::to_string(&["--harness", harness]).unwrap(),
+    );
+    cmd.env("HOOK_SRC", route.to_str().unwrap());
+    cmd.env(
+        "MOCK_FETCH",
+        fx.dir.join("mock-fetch.mjs").to_str().unwrap(),
+    );
+    cmd.env(
+        "MOCK_JEV_JSON",
+        std::fs::read_to_string(&fx.mock_jev).unwrap(),
+    );
+    for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "MODEL_ROUTE_HOOK_DEBUG"] {
+        cmd.env_remove(v);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn node hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("node hook output");
+    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
+}
+
+fn run_rust(fx: &Fixture, harness: &str, stdin_text: &str) -> (i32, Vec<u8>, Vec<u8>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentdeck"));
+    cmd.args(["route", "hook", "--harness", harness])
+        .current_dir(&fx.dir)
+        .envs(fx.base_env("rt-rust"));
+    cmd.env("AGENTDECK_ROUTE_MOCK_JEV", &fx.mock_jev);
+    for v in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "MODEL_ROUTE_HOOK_DEBUG"] {
+        cmd.env_remove(v);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn agentdeck hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("agentdeck hook output");
+    (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
+}
+
+fn decisions(dir: &Path) -> Vec<serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(dir.join(".local/state/model-route/decisions.jsonl"))
+    else {
+        return vec![];
+    };
+    text.lines()
+        .filter_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()
+                .map(|mut v| {
+                    // Timestamps always differ; everything else must match.
+                    v["t"] = serde_json::Value::from("");
+                    v
+                })
+        })
+        .collect()
+}
+
+fn check_case(name: &str, fx: &Fixture, harness: &str, input: &serde_json::Value) {
+    let stdin_text = serde_json::to_string(input).unwrap();
+    let (nc, nout, _) = run_node(fx, harness, &stdin_text);
+    let node_records = decisions(&fx.dir);
+    let (rc, rout, rerr) = run_rust(fx, harness, &stdin_text);
+    assert_eq!(
+        nc,
+        rc,
+        "{name}: exit codes differ (node {nc}, rust {rc}): {}",
+        String::from_utf8_lossy(&rerr)
+    );
+    assert_eq!(
+        nout,
+        rout,
+        "{name}: stdout differs:\nnode: {}\nrust: {}",
+        String::from_utf8_lossy(&nout),
+        String::from_utf8_lossy(&rout)
+    );
+    // One fixture dir, one record per run: the tail after the Node record is
+    // the Rust record and must match it.
+    let all = decisions(&fx.dir);
+    assert_eq!(
+        node_records,
+        &all[..node_records.len()],
+        "{name}: node record not stable"
+    );
+    assert_eq!(
+        node_records,
+        all[node_records.len()..],
+        "{name}: decisions.jsonl differs"
+    );
+}
+
+fn delegate_input(
+    tool: &str,
+    task: &str,
+    target: serde_json::Value,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut input = serde_json::json!({"tool_name": tool,
+        "tool_input": {"task": task, "target": target}, "inT3": true});
+    for (k, v) in extra.as_object().cloned().unwrap_or_default() {
+        input[k] = v;
+    }
+    input
+}
+
+#[test]
+fn hook_parity_with_node() {
+    if !node_available() {
+        eprintln!("SKIP: node is absent, cannot differentially test the hook");
+        return;
+    }
+    let hint = shared_hint();
+    let sol = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
+        "options": {"reasoningEffort": "medium"}});
+    let hinted = |base: &str| format!("{base}\n\n{hint}");
+
+    // 1. Shell delegate with the required hint: allow.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input(
+            "delegate_task",
+            &hinted("Fix the typo"),
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        check_case("allow-delegate-shell", &fx, "shell", &input);
+    }
+    // 2. Same without the hint: deny:hint.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input(
+            "delegate_task",
+            "Fix the typo",
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        check_case("deny-hint-shell", &fx, "shell", &input);
+    }
+    // 3. Delegate without a target: deny:invalid-delegate (no route call).
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = serde_json::json!({"tool_name": "delegate_task",
+            "tool_input": {"task": "Fix the typo"}, "inT3": true});
+        input["source"] = "codex".into();
+        check_case("deny-invalid-shell", &fx, "shell", &input);
+    }
+    // 4. Shell source outside the live catalog: deny:shell-source.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = delegate_input(
+            "delegate_task",
+            "Fix the typo",
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "spoofed".into();
+        check_case("deny-shell-source", &fx, "shell", &input);
+    }
+    // 5. Unrelated tool passes through silently.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let mut input = serde_json::json!({"tool_name": "update_plan",
+            "tool_input": {"task": "x"}, "inT3": true});
+        input["source"] = "codex".into();
+        check_case("passthrough-shell", &fx, "shell", &input);
+    }
+    // 6. OpenCode native subagent: deny with a hand-back to delegate_task.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let input = serde_json::json!({"tool_name": "subagent",
+            "tool_input": {"message": "Do the thing"}, "session_id": "root", "inT3": true});
+        check_case("deny-native-opencode", &fx, "opencode", &input);
+    }
+    // 7. OpenCode delegate with the hint: allow.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let input = delegate_input(
+            "delegate_task",
+            &hinted("Fix the typo"),
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        check_case("allow-delegate-opencode", &fx, "opencode", &input);
+    }
+    // 8. Workflow entry point: always deny (one route cannot validate it).
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let input = serde_json::json!({"tool_name": "Workflow",
+            "tool_input": {"script": "agent('x')"}, "session_id": "root", "inT3": true});
+        check_case("deny-workflow-opencode", &fx, "opencode", &input);
+    }
+    // 9. No adequate model with quota: deny:no-target.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 0.05, "duration_mins": 10080, "resets_at": now + 30 * 3600},
+                {"key": "session", "label": "5h", "remaining_percent": 0, "duration_mins": 300, "resets_at": now + 3600}]},
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [{"key": "weekly", "label": "Week", "remaining_percent": 0.05, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+        ]});
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), Some(usage));
+        let input = serde_json::json!({"tool_name": "subagent",
+            "tool_input": {"message": "Do the thing"}, "session_id": "root", "inT3": true});
+        check_case("deny-no-target-opencode", &fx, "opencode", &input);
+    }
+    // 10. User-chosen quota-denied model with a naming transcript: allow.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 60, "duration_mins": 10080, "resets_at": now + 6 * 86400 + 1800},
+                {"key": "session", "label": "5h", "remaining_percent": 20, "duration_mins": 300, "resets_at": now + 2 * 3600}]},
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [{"key": "weekly", "label": "Week", "remaining_percent": 0.05, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+        ]});
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), Some(usage));
+        let t = fx.transcript(
+            "transcript.jsonl",
+            &[r#"{"type":"user","message":{"role":"user","content":"use sol for the audit"}}"#],
+        );
+        let mut input = delegate_input(
+            "delegate_task",
+            "[route:user-choice] Audit the auth flow",
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        input["transcript_path"] = t.into();
+        check_case("allow-user-choice", &fx, "shell", &input);
+    }
+    // 11. Same without a naming transcript: deny:user-choice.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64() as i64;
+        let usage = serde_json::json!({"accounts": [
+            {"provider": "claude", "id": "claude-main", "plan": "Max 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [
+                {"key": "weekly_all", "label": "Week", "remaining_percent": 60, "duration_mins": 10080, "resets_at": now + 6 * 86400 + 1800},
+                {"key": "session", "label": "5h", "remaining_percent": 20, "duration_mins": 300, "resets_at": now + 2 * 3600}]},
+            {"provider": "codex", "id": "codex-main", "plan": "Pro 5x", "status": "ok", "updated_at": now, "balances": [],
+             "windows": [{"key": "weekly", "label": "Week", "remaining_percent": 0.05, "duration_mins": 10080, "resets_at": now + 3 * 86400}]},
+        ]});
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), Some(usage));
+        let t = fx.transcript(
+            "transcript.jsonl",
+            &[r#"{"type":"user","message":{"role":"user","content":"make it cheaper"}}"#],
+        );
+        let mut input = delegate_input(
+            "delegate_task",
+            "[route:user-choice] Audit the auth flow",
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        input["transcript_path"] = t.into();
+        check_case("deny-user-choice", &fx, "shell", &input);
+    }
+    // 12. Valid target with a foreign reasoning knob: deny:reasoning.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let bad = serde_json::json!({"providerInstanceId": "codex", "model": "gpt-6.1-sol",
+            "options": {"effort": "medium"}});
+        let mut input = delegate_input(
+            "delegate_task",
+            &hinted("Fix the typo"),
+            bad,
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        check_case("deny-reasoning", &fx, "shell", &input);
+    }
+    // 13. Review role on a no-review family: deny even with the hint.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let argon = serde_json::json!({"providerInstanceId": "antigravity", "model": "gemini-4-argon-medium"});
+        let mut input = delegate_input(
+            "delegate_task",
+            &hinted("Audit the auth flow"),
+            argon,
+            serde_json::json!({"role": "review"}),
+        );
+        input["source"] = "antigravity".into();
+        check_case("deny-review-role", &fx, "shell", &input);
+    }
+    // 14. Malformed stdin: fail closed.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        let (nc, nout, _) = run_node(&fx, "shell", "{");
+        let (rc, rout, _) = run_rust(&fx, "shell", "{");
+        assert_eq!(nc, rc, "malformed: exit codes differ");
+        assert_eq!(
+            nout,
+            rout,
+            "malformed: stdout differs:\nnode: {}\nrust: {}",
+            String::from_utf8_lossy(&nout),
+            String::from_utf8_lossy(&rout)
+        );
+        assert!(
+            rout.starts_with(b"{\"decision\":\"deny\""),
+            "must deny: {rout:?}"
+        );
+    }
+    // 15. Delegated child session: nested delegation is disabled.
+    {
+        let fx = Fixture::new(&[SOL, OPUS], &healthy_jev(), None);
+        fx.sqlite_nested_child();
+        let input = serde_json::json!({"tool_name": "subagent",
+            "tool_input": {"message": "Do the thing"}, "session_id": "child-session",
+            "threadId": "thread:child", "inT3": true});
+        check_case("deny-nested-opencode", &fx, "opencode", &input);
+    }
+    // 16. Low Jev confidence is visible but still allows.
+    {
+        let mut jev = healthy_jev();
+        jev["answers"]["size"] = serde_json::json!({"score": 1.0, "confidence": 0.3});
+        let fx = Fixture::new(&[SOL, OPUS], &jev, None);
+        let mut input = delegate_input(
+            "delegate_task",
+            &hinted("Fix the typo"),
+            sol.clone(),
+            serde_json::json!({}),
+        );
+        input["source"] = "codex".into();
+        check_case("allow-low-confidence", &fx, "shell", &input);
+    }
+}

@@ -91,15 +91,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cmd_service::ServiceCmd,
     },
-    /// Refresh the embedded router copy and its generated router.json.
+    /// Refresh the generated router.json for the router plugin.
     Router {
         #[command(subcommand)]
         cmd: cmd_router::RouterCmd,
     },
-    /// Route a delegation target through the router (port of route.mjs).
+    /// Route a delegation target through the router (port of route.mjs),
+    /// or run the pre-tool hook (port of hook.mjs: `route hook --harness …`).
     Route {
         /// Passthrough router args: [--source S] [--check] [--catalog]
-        /// [--validate-target PROVIDER MODEL] ["<task brief>" | -].
+        /// [--validate-target PROVIDER MODEL] ["<task brief>" | -],
+        /// or [hook --harness <claude|codex|agy|opencode|shell>] (hook JSON on stdin).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },

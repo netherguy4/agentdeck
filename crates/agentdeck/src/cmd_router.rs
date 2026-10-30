@@ -1,5 +1,5 @@
-//! `agentdeck router json`: refresh the extracted router copy and the
-//! generated `router.json`.
+//! `agentdeck router json`: refresh the generated `router.json` (the router
+//! itself runs from the binary; no files are extracted).
 
 use agentdeck_core::Paths;
 use agentdeck_core::router;

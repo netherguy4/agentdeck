@@ -400,21 +400,20 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
         name: PLUGIN_ROUTER,
         enabled: plugin_enabled(&reg, PLUGIN_ROUTER),
         available: router_available(),
-        detail: router_detail(paths, home),
+        detail: router_detail(paths, home, exe),
     });
     out
 }
 
-fn router_detail(paths: &Paths, home: &Path) -> Vec<String> {
+fn router_detail(paths: &Paths, home: &Path, exe: &Path) -> Vec<String> {
     use crate::router as r;
-    let dir = r::router_dir(paths);
-    let installed = if dir.join("route.mjs").exists() {
+    let installed = if r::router_json_path(paths).exists() {
         "files: installed"
     } else {
         "files: missing"
     }
     .to_string();
-    let present = r::hooks_present(home, paths);
+    let present = r::hooks_present(home, exe);
     let hooks = format!(
         "hooks: {}/4 targets",
         present.iter().filter(|p| **p).count()
@@ -451,6 +450,7 @@ fn plan_enable_router(
     paths: &Paths,
     home: &Path,
     files: &[PathBuf],
+    exe: &Path,
 ) -> anyhow::Result<Vec<Change>> {
     if !router_available() {
         anyhow::bail!("router needs T3 present (no T3 root found)");
@@ -460,11 +460,12 @@ fn plan_enable_router(
     changes.extend(crate::router::plan_hooks_enable(
         home,
         paths,
+        exe,
         &paths.state_dir,
     )?);
     changes.extend(crate::router::plan_router_marker(
         files,
-        Some(&crate::router::router_block(paths)),
+        Some(&crate::router::router_block(exe)),
         &paths.state_dir,
     )?);
     Ok(changes)
@@ -476,11 +477,12 @@ fn plan_disable_router(
     paths: &Paths,
     home: &Path,
     files: &[PathBuf],
+    exe: &Path,
 ) -> anyhow::Result<Vec<Change>> {
     if !router_available() {
         anyhow::bail!("router needs T3 present (no T3 root found)");
     }
-    let mut changes = crate::router::plan_hooks_disable(home, paths, &paths.state_dir)?;
+    let mut changes = crate::router::plan_hooks_disable(home, paths, exe, &paths.state_dir)?;
     changes.extend(crate::router::plan_remove_router_files(paths));
     changes.extend(crate::router::plan_router_marker(
         files,
@@ -537,7 +539,7 @@ pub fn plan_enable(
             plan_enable_agent_process(home, files, exe, replace, &paths.state_dir)?
         }
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
-        PLUGIN_ROUTER => plan_enable_router(paths, home, files)?,
+        PLUGIN_ROUTER => plan_enable_router(paths, home, files, exe)?,
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -571,7 +573,7 @@ pub fn plan_disable(
     let mut changes = match name {
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
-        PLUGIN_ROUTER => plan_disable_router(paths, home, files)?,
+        PLUGIN_ROUTER => plan_disable_router(paths, home, files, exe)?,
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -874,12 +876,22 @@ mod tests {
             .unwrap();
         assert!(first_router < first_other, "files come before hooks/marker");
         apply_all(&paths, PLUGIN_ROUTER, true, &changes).unwrap();
-        assert!(dir.join("route.mjs").exists());
         assert!(dir.join("router.json").exists());
         let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
-        assert!(settings.contains("hook.mjs --harness claude"));
+        assert!(
+            settings.contains("route hook --harness claude"),
+            "{settings}"
+        );
+        assert!(!settings.contains(".mjs"), "{settings}");
+        let plugin =
+            fs::read_to_string(home.join(".config/opencode/plugin/model-route.ts")).unwrap();
+        assert!(
+            plugin.contains(r#"["route", "hook", "--harness", "opencode"]"#),
+            "{plugin}"
+        );
         let text = fs::read_to_string(&files[0]).unwrap();
         assert!(text.contains("<!-- model-route:begin -->"));
+        assert!(text.contains("route \"<goal"), "{text}");
         assert!(
             plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, false)
                 .unwrap()
@@ -897,8 +909,9 @@ mod tests {
         assert!(first_hook < first_remove, "hooks go before files");
         apply_all(&paths, PLUGIN_ROUTER, false, &changes).unwrap();
         let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+        assert!(!settings.contains("route hook"));
         assert!(!settings.contains("hook.mjs"));
-        assert!(!dir.join("route.mjs").exists());
+        assert!(!home.join(".config/opencode/plugin/model-route.ts").exists());
         assert!(dir.join("router.json").exists(), "data is kept");
         assert_eq!(fs::read(&files[0]).unwrap(), b"handwritten\n");
         unsafe {

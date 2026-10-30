@@ -2,6 +2,7 @@
 //! `load.mjs`, `reasoning.mjs`). It reads the same generated `router.json`,
 //! talks to Jev the same way, and prints byte-compatible JSON.
 
+pub mod hook;
 pub mod load;
 pub mod policy;
 pub mod reasoning;

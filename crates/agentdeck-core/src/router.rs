@@ -1,10 +1,11 @@
-//! Agentdeck copy of the model-route Node router: embedded assets, the
-//! `router.json` generator (pool + account maps), hook registration and the
-//! instruction marker block.
+//! Agentdeck copy of the model-route Node router: the `router.json`
+//! generator (pool + account maps), hook registration and the instruction
+//! marker block. The router itself runs from this binary (`agentdeck route`,
+//! `agentdeck route hook`), so no `.mjs` files are extracted at runtime: the
+//! assets stay in the repo as parity-test fixtures.
 //!
-//! Everything lands in `<state_dir>/router/` (`router.json` next to the
-//! extracted files). The old standalone copy in
-//! `~/.general/scripts/model-route` is never touched.
+//! Everything lands in `<state_dir>/router/` (just `router.json`). The old
+//! standalone copy in `~/.general/scripts/model-route` is never touched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -25,8 +26,15 @@ pub const USAGE_STATE_PATH: &str = "~/.local/state/ai-usage/state.json";
 /// Marker name for the instruction block; the plugin name stays `router`.
 pub const ROUTER_MARKER: &str = "model-route";
 
-/// Runtime files extracted next to `router.json` (tests stay in the repo).
-const FILES: &[(&str, &[u8])] = &[
+/// Runtime files extracted next to `router.json`. The ported router
+/// (`route`, `hook`) runs from the binary, so nothing is extracted any more:
+/// every `.mjs` asset stays in the repo only as the parity-test fixture.
+/// `router.json` is generated data and is kept.
+const FILES: &[(&str, &[u8])] = &[];
+
+/// Previously extracted files: enable wrote them, disable/upgrade removes
+/// the ones still matching the embedded bytes.
+const LEGACY_FILES: &[(&str, &[u8])] = &[
     ("route.mjs", include_bytes!("../assets/router/route.mjs")),
     ("policy.mjs", include_bytes!("../assets/router/policy.mjs")),
     ("hook.mjs", include_bytes!("../assets/router/hook.mjs")),
@@ -67,13 +75,10 @@ pub fn router_json_path(paths: &Paths) -> PathBuf {
     router_dir(paths).join("router.json")
 }
 
-pub fn hook_path(paths: &Paths) -> PathBuf {
-    router_dir(paths).join("hook.mjs")
-}
-
 /// Command string registered in harness hooks (hooks fail closed on error).
-pub fn hook_command(paths: &Paths, harness: &str) -> String {
-    format!("{} --harness {harness}", hook_path(paths).display())
+/// The hook runs from this binary, so no Node is needed at runtime.
+pub fn hook_command(exe: &Path, harness: &str) -> String {
+    format!("{} route hook --harness {harness}", exe.display())
 }
 
 pub fn claude_settings(home: &Path) -> PathBuf {
@@ -273,12 +278,12 @@ pub fn plan_router_files(paths: &Paths, reg: &Registry) -> anyhow::Result<Vec<Ch
     Ok(changes)
 }
 
-/// Plan removing the extracted files (only ones matching the embedded
-/// bytes). `router.json` is data and is kept.
+/// Plan removing previously extracted files (only ones matching the
+/// embedded bytes). `router.json` is data and is kept.
 pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
     let dir = router_dir(paths);
     let mut changes = Vec::new();
-    for (name, bytes) in FILES {
+    for (name, bytes) in LEGACY_FILES {
         let path = dir.join(name);
         if let Ok(old) = std::fs::read(&path)
             && old.as_slice() == *bytes
@@ -289,10 +294,10 @@ pub fn plan_remove_router_files(paths: &Paths) -> Vec<Change> {
     changes
 }
 
-/// Instruction body: the Delegation routing section (route path points at the
-/// extracted copy) plus the roster `briefHint` verbatim.
-pub fn router_block(paths: &Paths) -> String {
-    let route = router_dir(paths).join("route.mjs").display().to_string();
+/// Instruction body: the Delegation routing section (routed through this
+/// binary) plus the roster `briefHint` verbatim.
+pub fn router_block(exe: &Path) -> String {
+    let route = format!("{} route", exe.display());
     let hint: String = serde_json::from_str::<Value>(ROSTER_JSON)
         .ok()
         .and_then(|v| v.get("briefHint")?.as_str().map(str::to_string))
@@ -474,6 +479,58 @@ import { Error as ToolError } from "@opencode/plugin/promise/tool"
 import { spawn } from "node:child_process"
 
 // Same routing as the Claude/Codex/agy pre-tool hooks: each subagent call goes through
+// the agentdeck binary, which may deny it with a ready delegate_task target.
+const BINARY = "{BINARY}"
+// T3 starts the shared `opencode serve --service` from its AppImage; servers started elsewhere are not routed.
+const inT3 = /t3_code/i.test(process.env.APPIMAGE ?? "")
+
+// Async on purpose: a sync child would stall the whole shared server while the router answers.
+function runHook(payload: unknown): Promise<{ decision: string; reason?: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(BINARY, ["route", "hook", "--harness", "opencode"], { timeout: 58_000 })
+    let out = ""
+    child.stdout.on("data", (d) => (out += d))
+    const failed = { decision: "deny", reason: "model-route failed or timed out; delegation was blocked." }
+    child.on("error", () => resolve(failed))
+    child.stdin.on("error", () => resolve(failed))
+    child.on("close", (code) => {
+      if (code !== 0) return resolve(failed)
+      try {
+        const result = JSON.parse(out)
+        resolve(result.decision === "allow" || result.decision === "deny" ? result : failed)
+      } catch {
+        resolve(failed)
+      }
+    })
+    child.stdin.end(JSON.stringify(payload))
+  })
+}
+
+export default Plugin.define({
+  id: "model-route",
+  setup: async (ctx) => {
+    if (!inT3) return
+    await ctx.tool.hook("execute.before", async (call) => {
+      if (call.tool !== "subagent" && !/delegate_task$/.test(call.tool)) return
+      const out = await runHook({ tool_name: call.tool === "subagent" ? "subagent" : "delegate_task", tool_input: call.input,
+        session_id: call.sessionID, inT3: true })
+      if (out.decision === "deny") throw new ToolError({ message: out.reason ?? "Denied by model-route" })
+    })
+  },
+})
+"#;
+
+fn opencode_plugin_text(exe: &Path) -> String {
+    OPENCODE_PLUGIN_TEMPLATE.replace("{BINARY}", &exe.display().to_string())
+}
+
+/// The pre-port plugin file (spawned the extracted `hook.mjs`): recognized
+/// so enable upgrades it and disable removes it instead of bailing.
+const OPENCODE_PLUGIN_TEMPLATE_LEGACY: &str = r#"import { Plugin } from "@opencode/plugin"
+import { Error as ToolError } from "@opencode/plugin/promise/tool"
+import { spawn } from "node:child_process"
+
+// Same routing as the Claude/Codex/agy pre-tool hooks: each subagent call goes through
 // the agentdeck router copy, which may deny it with a ready delegate_task target.
 const HOOK = "{HOOK}"
 // T3 starts the shared `opencode serve --service` from its AppImage; servers started elsewhere are not routed.
@@ -515,8 +572,21 @@ export default Plugin.define({
 })
 "#;
 
-fn opencode_plugin_text(hook: &Path) -> String {
-    OPENCODE_PLUGIN_TEMPLATE.replace("{HOOK}", &hook.display().to_string())
+fn opencode_plugin_text_legacy(paths: &Paths) -> String {
+    OPENCODE_PLUGIN_TEMPLATE_LEGACY.replace(
+        "{HOOK}",
+        &router_dir(paths).join("hook.mjs").display().to_string(),
+    )
+}
+
+/// The pre-port hook command (extracted `hook.mjs`): enable replaces it and
+/// disable removes it, so a stale entry never fails closed after the port.
+/// The standalone `~/.general` copy lives elsewhere and stays untouched.
+fn legacy_hook_command(paths: &Paths, harness: &str) -> String {
+    format!(
+        "{} --harness {harness}",
+        router_dir(paths).join("hook.mjs").display()
+    )
 }
 
 /// Plan hook registration (files only; the old standalone copy stays
@@ -524,6 +594,7 @@ fn opencode_plugin_text(hook: &Path) -> String {
 pub fn plan_hooks_enable(
     home: &Path,
     paths: &Paths,
+    exe: &Path,
     state_dir: &Path,
 ) -> anyhow::Result<Vec<Change>> {
     let mut changes = Vec::new();
@@ -537,7 +608,8 @@ pub fn plan_hooks_enable(
                 .entry("hooks")
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(hooks)?)?;
-            insert_hook(list, CLAUDE_MATCHER, &hook_command(paths, "claude"))
+            remove_hook(list, CLAUDE_MATCHER, &legacy_hook_command(paths, "claude"));
+            insert_hook(list, CLAUDE_MATCHER, &hook_command(exe, "claude"))
         };
         if changed {
             changes.extend(write_json_change(path, old, &v, state_dir));
@@ -553,7 +625,8 @@ pub fn plan_hooks_enable(
                 .entry("hooks")
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(hooks)?)?;
-            insert_hook(list, CODEX_MATCHER, &hook_command(paths, "codex"))
+            remove_hook(list, CODEX_MATCHER, &legacy_hook_command(paths, "codex"));
+            insert_hook(list, CODEX_MATCHER, &hook_command(exe, "codex"))
         };
         if changed {
             changes.extend(write_json_change(path, old, &v, state_dir));
@@ -569,7 +642,8 @@ pub fn plan_hooks_enable(
                 .entry("model-route")
                 .or_insert_with(|| Value::Object(Map::new()));
             let list = pretool_array(object(plugin)?)?;
-            insert_hook(list, AGY_MATCHER, &hook_command(paths, "agy"))
+            remove_hook(list, AGY_MATCHER, &legacy_hook_command(paths, "agy"));
+            insert_hook(list, AGY_MATCHER, &hook_command(exe, "agy"))
         };
         if changed {
             changes.extend(write_json_change(path, old, &v, state_dir));
@@ -594,13 +668,15 @@ pub fn plan_hooks_enable(
             changes.extend(write_json_change(path, old, &v, state_dir));
         }
     }
-    // OpenCode plugin file.
+    // OpenCode plugin file (upgrades the pre-port file in place).
     {
         let path = opencode_plugin(home);
-        let text = opencode_plugin_text(&hook_path(paths));
+        let text = opencode_plugin_text(exe);
         let old = std::fs::read(&path).ok();
         if old.as_deref() != Some(text.as_bytes()) {
-            if old.is_some() {
+            if old.is_some()
+                && old.as_deref() != Some(opencode_plugin_text_legacy(paths).as_bytes())
+            {
                 anyhow::bail!(
                     "{} exists and was not written by agentdeck; remove it by hand",
                     path.display()
@@ -616,6 +692,7 @@ pub fn plan_hooks_enable(
 pub fn plan_hooks_disable(
     home: &Path,
     paths: &Paths,
+    exe: &Path,
     state_dir: &Path,
 ) -> anyhow::Result<Vec<Change>> {
     let mut changes = Vec::new();
@@ -631,7 +708,10 @@ pub fn plan_hooks_disable(
             .and_then(|root| root.get_mut("hooks"))
             .and_then(as_obj)
             .and_then(|hooks| pretool_array(hooks).ok())
-            .is_some_and(|list| remove_hook(list, matcher, &hook_command(paths, harness)));
+            .is_some_and(|list| {
+                remove_hook(list, matcher, &hook_command(exe, harness))
+                    | remove_hook(list, matcher, &legacy_hook_command(paths, harness))
+            });
         if changed {
             changes.extend(write_json_change(path, Some(old), &v, state_dir));
         }
@@ -643,7 +723,10 @@ pub fn plan_hooks_disable(
                 .and_then(|root| root.get_mut("model-route"))
                 .and_then(as_obj)
                 .and_then(|plugin| pretool_array(plugin).ok())
-                .is_some_and(|list| remove_hook(list, AGY_MATCHER, &hook_command(paths, "agy")));
+                .is_some_and(|list| {
+                    remove_hook(list, AGY_MATCHER, &hook_command(exe, "agy"))
+                        | remove_hook(list, AGY_MATCHER, &legacy_hook_command(paths, "agy"))
+                });
             if changed {
                 changes.extend(write_json_change(path, Some(old), &v, state_dir));
             }
@@ -662,7 +745,8 @@ pub fn plan_hooks_disable(
     {
         let path = opencode_plugin(home);
         if let Ok(old) = std::fs::read(&path)
-            && old == opencode_plugin_text(&hook_path(paths)).as_bytes()
+            && (old == opencode_plugin_text(exe).as_bytes()
+                || old == opencode_plugin_text_legacy(paths).as_bytes())
         {
             changes.push(Change::Remove { path });
         }
@@ -671,7 +755,7 @@ pub fn plan_hooks_disable(
 }
 
 /// Read-only hook presence for status output.
-pub fn hooks_present(home: &Path, paths: &Paths) -> [bool; 4] {
+pub fn hooks_present(home: &Path, exe: &Path) -> [bool; 4] {
     fn has(path: &Path, pointer: &str, matcher: &str, command: &str) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
@@ -696,22 +780,22 @@ pub fn hooks_present(home: &Path, paths: &Paths) -> [bool; 4] {
             &claude_settings(home),
             "/hooks/PreToolUse",
             CLAUDE_MATCHER,
-            &hook_command(paths, "claude"),
+            &hook_command(exe, "claude"),
         ),
         has(
             &codex_hooks(home),
             "/hooks/PreToolUse",
             CODEX_MATCHER,
-            &hook_command(paths, "codex"),
+            &hook_command(exe, "codex"),
         ),
         has(
             &agy_hooks(home),
             "/model-route/PreToolUse",
             AGY_MATCHER,
-            &hook_command(paths, "agy"),
+            &hook_command(exe, "agy"),
         ),
         std::fs::read_to_string(opencode_plugin(home))
-            .is_ok_and(|t| t == opencode_plugin_text(&hook_path(paths))),
+            .is_ok_and(|t| t == opencode_plugin_text(exe)),
     ]
 }
 
@@ -795,8 +879,8 @@ mod tests {
         .unwrap();
         let reg = Registry::load(&paths).unwrap();
         let changes = plan_router_files(&paths, &reg).unwrap();
-        // 9 files + router.json.
-        assert_eq!(changes.len(), 10);
+        // Only router.json; the .mjs assets stay in the repo as fixtures.
+        assert_eq!(changes.len(), 1);
         crate::changes::apply_changes(&changes).unwrap();
         let text = std::fs::read_to_string(router_json_path(&paths)).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();

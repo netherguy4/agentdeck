@@ -996,6 +996,9 @@ pub async fn run(argv: Vec<String>) -> i32 {
 }
 
 async fn run_inner(argv: Vec<String>) -> anyhow::Result<i32> {
+    if argv.first().is_some_and(|a| a == "hook") {
+        return Ok(crate::hook::run(&argv[1..]));
+    }
     let env = Env::from_env()?;
     if argv.len() == 1 && argv[0] == "--catalog" {
         let mut stdin = String::new();

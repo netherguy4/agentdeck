@@ -220,7 +220,7 @@ fn chrono_now_iso() -> String {
 pub fn read_catalog(state_home: &std::path::Path) -> anyhow::Result<Value> {
     let err = || {
         anyhow::anyhow!(
-            "refresh model options: pass orchestrator_capabilities structuredContent to route.mjs --catalog on stdin"
+            "refresh model options: pass orchestrator_capabilities structuredContent to agentdeck route --catalog on stdin"
         )
     };
     let text = std::fs::read_to_string(catalog_file(state_home)).map_err(|_| err())?;
@@ -378,19 +378,20 @@ pub fn reasoning_target(
     }
 }
 
-fn target_entries(target: &Value) -> Option<Vec<(String, Value)>> {
+fn target_entries(target: &Value) -> anyhow::Result<Vec<(String, Value)>> {
+    // Mirrors the .mjs exactly: missing, null or wrongly typed `options`
+    // throws (the hook fails closed) instead of validating.
     match target.get("options") {
-        None => Some(vec![]),
-        Some(Value::Object(m)) => Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-        Some(Value::Array(a)) => a
+        Some(Value::Object(m)) => Ok(m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        Some(Value::Array(a)) => Ok(a
             .iter()
-            .map(|e| Some((e.get("id")?.as_str()?.to_string(), e.get("value")?.clone())))
-            .collect(),
-        _ => None,
+            .filter_map(|e| Some((e.get("id")?.as_str()?.to_string(), e.get("value")?.clone())))
+            .collect()),
+        _ => Err(anyhow::anyhow!("invalid target options")),
     }
 }
 
-pub fn validate_reasoning(catalog: &Value, target: &Value) -> Option<String> {
+pub fn validate_reasoning(catalog: &Value, target: &Value) -> anyhow::Result<Option<String>> {
     let provider = target
         .get("providerInstanceId")
         .and_then(Value::as_str)
@@ -399,10 +400,9 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> Option<String> {
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let d = match reasoning_descriptor(catalog, provider, model) {
-        Ok(d) => d,
-        Err(e) => return Some(e.to_string()),
-    };
+    // Throws (like the .mjs) when the model is not in the catalog: the hook
+    // fails closed instead of reporting a reasoning denial.
+    let d = reasoning_descriptor(catalog, provider, model)?;
     let entries = target_entries(target)?;
     if entries.iter().any(|(id, _)| id.is_empty()) || {
         let mut ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
@@ -410,25 +410,27 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> Option<String> {
         ids.dedup();
         ids.len() != entries.len()
     } {
-        return Some("invalid or duplicate target option IDs".into());
+        return Ok(Some("invalid or duplicate target option IDs".into()));
     }
     if entries.iter().any(|(id, _)| {
         IDS.contains(&id.as_str())
             && Some(id.as_str()) != d.as_ref().and_then(|x| x.get("id")).and_then(Value::as_str)
     }) {
-        return Some("reasoning option belongs to another harness".into());
+        return Ok(Some("reasoning option belongs to another harness".into()));
     }
-    let d = d?;
+    let Some(d) = d else { return Ok(None) };
     let did = d.get("id").and_then(Value::as_str).unwrap_or_default();
     let e = entries.iter().find(|(id, _)| id == did);
     let Some((_, value)) = e else {
-        return Some(format!(
+        return Ok(Some(format!(
             "explicit target.options.{did} is required; omitted options can lose reasoning across providers/models"
-        ));
+        )));
     };
     if d.get("type").and_then(Value::as_str) == Some("boolean") {
         if !value.is_boolean() {
-            return Some(format!("unsupported target.options.{did} for this model"));
+            return Ok(Some(format!(
+                "unsupported target.options.{did} for this model"
+            )));
         }
     } else if value.as_str().is_none_or(|s| {
         !d.get("options").and_then(Value::as_array).is_some_and(|o| {
@@ -436,7 +438,9 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> Option<String> {
                 .any(|x| x.get("id").and_then(Value::as_str) == Some(s))
         })
     }) {
-        return Some(format!("unsupported target.options.{did} for this model"));
+        return Ok(Some(format!(
+            "unsupported target.options.{did} for this model"
+        )));
     }
     let value = normalize_option_value("", value);
     if let Some(floor) = min_effort(model)
@@ -446,9 +450,88 @@ pub fn validate_reasoning(catalog: &Value, target: &Value) -> Option<String> {
         )
         && pos < min
     {
-        return Some(format!(
+        return Ok(Some(format!(
             "target.options.{did} {value} is below this model family's minimum {floor}"
-        ));
+        )));
     }
-    None
+    Ok(None)
+}
+
+/// Port of `repairReasoning`: keep unrelated options, restore the catalog
+/// knob from the explicit value when it validates, else from `recommended`
+/// (the router's own target). Throws like the .mjs when the model is unknown
+/// or `recommended` has no usable knob, so the hook fails closed.
+pub fn repair_reasoning(
+    catalog: &Value,
+    target: &Value,
+    recommended: &Value,
+) -> anyhow::Result<Value> {
+    let provider = target
+        .get("providerInstanceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let model = target
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let d = reasoning_descriptor(catalog, provider, model)?;
+    let entries = target_entries(target)?;
+    let unrelated: Vec<(String, Value)> = entries
+        .iter()
+        .filter(|(id, _)| !IDS.contains(&id.as_str()))
+        .cloned()
+        .collect();
+    let array = target.get("options").is_some_and(|o| o.is_array());
+    let mut out = target
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("invalid target"))?;
+    let fixed = |pairs: Vec<(String, Value)>| {
+        if array {
+            Value::Array(
+                pairs
+                    .into_iter()
+                    .map(|(id, value)| serde_json::json!({"id": id, "value": value}))
+                    .collect(),
+            )
+        } else {
+            Value::Object(pairs.into_iter().collect())
+        }
+    };
+    let Some(d) = d else {
+        out.insert("options".into(), fixed(unrelated));
+        return Ok(Value::Object(out));
+    };
+    let did = d.get("id").and_then(Value::as_str).unwrap_or_default();
+    let explicit: Vec<&(String, Value)> = entries.iter().filter(|(id, _)| id == did).collect();
+    let value = if explicit.len() == 1 {
+        let mut probe = out.clone();
+        probe.insert(
+            "options".into(),
+            Value::Object(
+                [(did.to_string(), explicit[0].1.clone())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        if validate_reasoning(catalog, &Value::Object(probe))?.is_none() {
+            explicit[0].1.clone()
+        } else {
+            recommended
+                .get("options")
+                .and_then(|o| o.get(did))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no usable reasoning option"))?
+        }
+    } else {
+        recommended
+            .get("options")
+            .and_then(|o| o.get(did))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no usable reasoning option"))?
+    };
+    let mut corrected = unrelated;
+    corrected.push((did.to_string(), value));
+    out.insert("options".into(), fixed(corrected));
+    Ok(Value::Object(out))
 }
