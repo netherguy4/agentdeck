@@ -77,6 +77,12 @@ impl HarnessArg {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Installed as a symlink named `agent-process`, the binary is that tool (identical CLI).
+    let mut args = std::env::args_os();
+    let argv0 = args.next().unwrap_or_default();
+    if std::path::Path::new(&argv0).file_name() == Some("agent-process".as_ref()) {
+        std::process::exit(agent_process::main(args.collect()));
+    }
     let cli = Cli::parse();
     let paths = Paths::from_env()?;
     let Cmd::Instance { cmd } = cli.cmd;
