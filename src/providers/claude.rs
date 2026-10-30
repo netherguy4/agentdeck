@@ -1,7 +1,8 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -17,22 +18,22 @@ pub const DEFAULT_STALE_SECONDS: i64 = 900;
 /// Официальный endpoint, который опрашивает сам Claude Code.
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
+// Значения из OAuth-клиента Claude Code; clientId профиля имеет приоритет.
+const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Минимум между удачными запросами к endpoint лимитов.
-///
-/// Endpoint отвечает 429 задолго до общего интервала обновления: на живом
-/// аккаунте опрос раз в 120 с держал его в отказе постоянно. Пять минут — 1.7%
-/// пятичасового окна, для показа этого более чем достаточно.
+/// Two-minute polling caused 429s; five minutes passed live checks.
 const MIN_POLL_SECONDS: i64 = 300;
 
-/// Пауза после 429: 5 → 10 → 20 → 40 → 60 минут. Бюджет endpoint делится с
+/// Пауза после 429: 10 → 20 → 40 → 60 минут. Бюджет endpoint делится с
 /// самим Claude Code, поэтому фиксированного интервала мало — нужен отход.
 /// Потолок в час: дальше отходить незачем, недельное окно столько не меняется.
+const BACKOFF_BASE_SECONDS: i64 = 600;
 const BACKOFF_MAX_SECONDS: i64 = 3_600;
 
 /// Пауза после прочих ошибок: сеть или истёкший токен чинятся сами, долбить их
 /// смысла нет, но и отходить надолго не за что.
-const RETRY_SECONDS: i64 = 60;
+const RETRY_SECONDS: i64 = crate::config::MIN_REFRESH_SECONDS as i64;
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -40,6 +41,7 @@ fn client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("ai-usage/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("не удалось создать HTTP-клиент")
@@ -277,6 +279,12 @@ struct OauthCredentials {
     access_token: String,
     #[serde(rename = "expiresAt")]
     expires_at: Option<i64>,
+    #[serde(rename = "refreshToken")]
+    refresh_token: Option<String>,
+    #[serde(rename = "clientId")]
+    client_id: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -312,7 +320,8 @@ pub fn read_identity(config_dir: &Path) -> Identity {
         ]
         .iter()
         .filter_map(|field| account.and_then(|account| account.get(*field)))
-        .find_map(Value::as_str)
+        .filter_map(Value::as_str)
+        .find(|tier| !is_generic_tier(tier))
         .map(plan_label);
 
         if email.is_some() || plan.is_some() {
@@ -334,6 +343,16 @@ fn identity_paths(config_dir: &Path) -> Vec<PathBuf> {
 
 fn plan_label(raw: &str) -> String {
     crate::util::humanize_plan(raw)
+}
+
+/// `default_claude_ai` — заглушка вместо тарифа: её пишут и подписке Pro, и
+/// бесплатной. Такой tier тарифа не называет, поэтому уступает
+/// `organizationType`, где лежит настоящий 'claude_pro'.
+fn is_generic_tier(raw: &str) -> bool {
+    matches!(
+        crate::util::humanize_plan(raw).as_str(),
+        "" | "Ai" | "Default" | "Free"
+    )
 }
 
 /// Кеш использования, который Claude Code сам сохраняет в `.claude.json`.
@@ -361,9 +380,12 @@ fn cached_usage(config_dir: &Path) -> Option<(Vec<QuotaWindow>, i64)> {
 
 /// Наш собственный кеш ответа endpoint.
 ///
-/// Живёт в runtime-каталоге рядом со `state.json` и переживает перезапуск
-/// сервиса: без него каждый рестарт начинал бы с пустой паузы и сразу же ловил
-/// 429. Здесь же хранится момент следующей попытки.
+/// Переживает и перезапуск сервиса, и перезагрузку: без него каждый рестарт
+/// начинал бы с пустой паузы и сразу же ловил 429. Здесь же хранится момент
+/// следующей попытки.
+///
+/// Вне tmpfs он лежит намеренно: сеть при старте может быть ещё недоступна,
+/// а `cachedUsageUtilization` в `.claude.json` может отсутствовать вовсе.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct UsageCache {
     #[serde(default)]
@@ -371,9 +393,53 @@ struct UsageCache {
     #[serde(default)]
     next_attempt_at: i64,
     #[serde(default)]
+    last_attempt_at: Option<i64>,
+    #[serde(default)]
     failures: u32,
     #[serde(default)]
     windows: Vec<QuotaWindow>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    expired_token_at: Option<i64>,
+}
+
+impl UsageCache {
+    fn recover_clock(&mut self, now: i64) -> bool {
+        let attempted_at = self.last_attempt_at.unwrap_or(self.fetched_at);
+        let max_pause = if self.failures > 0 {
+            backoff_seconds(self.failures)
+        } else if self.error.is_none() {
+            MIN_POLL_SECONDS
+        } else {
+            BACKOFF_MAX_SECONDS
+        };
+        if attempted_at <= now && self.next_attempt_at.saturating_sub(now) <= max_pause {
+            return false;
+        }
+
+        // A backward wall-clock step must not extend a persisted pause by hours.
+        // Legacy caches lack the last attempt; conservatively retain the full
+        // applicable cooldown. Keep fetched_at unchanged so quota stays stale.
+        let pause = self
+            .next_attempt_at
+            .saturating_sub(attempted_at)
+            .clamp(0, max_pause);
+        self.next_attempt_at = now.saturating_add(pause);
+        self.last_attempt_at = Some(now);
+        true
+    }
+
+    fn should_attempt(&self, config_dir: &Path, now: i64) -> bool {
+        now >= self.next_attempt_at
+            || self.expired_token_at.is_some_and(|expired_at| {
+                read_token(config_dir)
+                    .and_then(|token| token.expires_at)
+                    .is_some_and(|expires_at| {
+                        expires_at != expired_at && expires_at / 1000 > now + 60
+                    })
+            })
+    }
 }
 
 fn usage_cache_path(id: &str) -> PathBuf {
@@ -389,7 +455,7 @@ fn usage_cache_path(id: &str) -> PathBuf {
             }
         })
         .collect();
-    crate::util::runtime_dir().join(format!("claude-usage-{safe}.json"))
+    crate::util::persistent_state_dir().join(format!("claude-usage-{safe}.json"))
 }
 
 fn read_usage_cache(path: &Path) -> UsageCache {
@@ -426,7 +492,11 @@ pub fn credentials_status(config_dir: &Path) -> (bool, String) {
     match credentials.expires_at {
         Some(expires_at) if expires_at / 1000 <= crate::util::unix_now() => (
             false,
-            "токен истёк — запусти Claude Code, он обновит его сам".to_owned(),
+            if credentials.refresh_token.is_some() {
+                "токен истёк — сервис продлит его автоматически".to_owned()
+            } else {
+                "токен истёк — выполни вход: claude auth login".to_owned()
+            },
         ),
         Some(expires_at) => {
             let hours = (expires_at / 1000 - crate::util::unix_now()) / 3600;
@@ -466,30 +536,44 @@ pub async fn fetch(
 
     let cache_path = usage_cache_path(id);
     let mut cache = read_usage_cache(&cache_path);
+    if cache.recover_clock(now) {
+        write_usage_cache(&cache_path, &cache);
+    }
 
     // Пока не вышла пауза — в сеть не идём вовсе. Лишний запрос не просто
     // бесполезен: он продлевает отказ endpoint и для нас, и для Claude Code.
-    let mut failure = None;
-    if now >= cache.next_attempt_at {
+    // Продлённый Claude Code токен снимает только паузу после его истечения;
+    // успешный опрос и 429 по-прежнему выдерживают весь свой интервал.
+    let mut failure = cache.error.clone();
+    if cache.should_attempt(config_dir, now) {
         match live_usage(config_dir, now).await {
             Ok(windows) => {
                 cache = UsageCache {
                     fetched_at: now,
                     next_attempt_at: now + MIN_POLL_SECONDS,
+                    last_attempt_at: Some(now),
                     failures: 0,
                     windows: windows.clone(),
+                    ..UsageCache::default()
                 };
                 write_usage_cache(&cache_path, &cache);
                 return Ok(state("ok", windows, None, now));
             }
             Err(error) => {
-                cache.failures = cache.failures.saturating_add(1);
+                cache.last_attempt_at = Some(now);
+                cache.failures = if error.rate_limited {
+                    cache.failures.saturating_add(1)
+                } else {
+                    0
+                };
                 cache.next_attempt_at = now
                     + if error.rate_limited {
                         backoff_seconds(cache.failures)
                     } else {
-                        RETRY_SECONDS
+                        error.retry_seconds
                     };
+                cache.expired_token_at = error.expired_token_at;
+                cache.error = Some(error.message.clone());
                 write_usage_cache(&cache_path, &cache);
                 failure = Some(error.message);
             }
@@ -498,13 +582,25 @@ pub async fn fetch(
 
     // Запроса не было или он не удался — показываем самое свежее из того, что
     // уже есть: наш собственный ответ endpoint либо кеш Claude Code.
+    // Claude Code may update its cache while the live request is in flight.
+    let now = crate::util::unix_now();
     let own = (!cache.windows.is_empty()).then(|| (cache.windows.clone(), cache.fetched_at));
-    let Some((windows, fetched_at)) = choose_fallback(own, cached_usage(config_dir), now) else {
+    let Some((windows, fetched_at)) =
+        choose_fallback(own, cached_usage(config_dir), now, stale_seconds)
+    else {
         let reason = failure.unwrap_or_else(|| "Лимиты Claude ещё не получены".to_owned());
         return Ok(state("waiting", Vec::new(), Some(reason), now));
     };
 
     let age = now.saturating_sub(fetched_at);
+    if age < 0 {
+        let reason = "время кеша Claude находится в будущем; ожидаем свежие лимиты";
+        let reason = match failure {
+            Some(failure) => format!("{failure}; {reason}"),
+            None => reason.to_owned(),
+        };
+        return Ok(state("stale", windows, Some(reason), fetched_at));
+    }
     if windows.is_empty() {
         let reason =
             failure.unwrap_or_else(|| format!("данные Claude устарели на {}", humanize_age(age)));
@@ -528,29 +624,31 @@ pub async fn fetch(
 /// Claude Code обновляет свой только при запуске, но после долгого простоя
 /// сервиса именно он и окажется новее.
 ///
-/// Окна, чей период уже закончился, отбрасываются: показывать использование
-/// прошлого периода — врать, а считать его сброшенным — гадать. Пустой список
-/// на выходе означает «данные есть, но все протухли», и это не то же самое, что
-/// «данных нет вовсе».
+/// Fresh cached responses follow the live path: the UI treats elapsed reset
+/// times as a full window. Only stale sources lose elapsed windows, since
+/// their current usage is unknown. An empty result still carries its age.
+/// Future timestamps are stale and cannot displace a source on this clock.
 fn choose_fallback(
     own: Option<(Vec<QuotaWindow>, i64)>,
     claude_code: Option<(Vec<QuotaWindow>, i64)>,
     now: i64,
+    stale_seconds: i64,
 ) -> Option<(Vec<QuotaWindow>, i64)> {
     let (windows, fetched_at) = [own, claude_code]
         .into_iter()
         .flatten()
-        .max_by_key(|(_, fetched_at)| *fetched_at)?;
+        .max_by_key(|(_, fetched_at)| (*fetched_at <= now, *fetched_at))?;
+    let fresh = (0..=stale_seconds).contains(&now.saturating_sub(fetched_at));
     let current = windows
         .into_iter()
-        .filter(|window| window.resets_at.is_none_or(|resets_at| resets_at > now))
+        .filter(|window| fresh || window.resets_at.is_none_or(|resets_at| resets_at > now))
         .collect();
     Some((current, fetched_at))
 }
 
 fn backoff_seconds(failures: u32) -> i64 {
     let shift = failures.saturating_sub(1).min(8);
-    (MIN_POLL_SECONDS.saturating_mul(1 << shift)).min(BACKOFF_MAX_SECONDS)
+    (BACKOFF_BASE_SECONDS.saturating_mul(1 << shift)).min(BACKOFF_MAX_SECONDS)
 }
 
 pub(crate) fn humanize_age(seconds: i64) -> String {
@@ -567,6 +665,8 @@ pub(crate) fn humanize_age(seconds: i64) -> String {
 struct LiveError {
     message: String,
     rate_limited: bool,
+    expired_token_at: Option<i64>,
+    retry_seconds: i64,
 }
 
 impl LiveError {
@@ -574,22 +674,278 @@ impl LiveError {
         Self {
             message: message.into(),
             rate_limited: false,
+            expired_token_at: None,
+            retry_seconds: RETRY_SECONDS,
         }
     }
+}
+
+// Claude Code использует mkdir-lock: новый внутри профиля, затем старый
+// рядом с canonical path. Те же 60 с stale и 5 с heartbeat позволяют обоим
+// клиентам обновлять один профиль, в том числе после аварийной перезагрузки.
+struct RefreshLock {
+    path: PathBuf,
+    file: fs::File,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+impl RefreshLock {
+    fn acquire(path: PathBuf) -> Result<Self, LiveError> {
+        for attempt in 0..2 {
+            match fs::create_dir(&path) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::symlink_metadata(&path)
+                        .ok()
+                        .filter(|meta| meta.is_dir())
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(60));
+                    if attempt == 0 && stale && fs::remove_dir(&path).is_ok() {
+                        continue;
+                    }
+                    return Err(LiveError::plain(
+                        "Claude Code уже обновляет токен; повторим попытку",
+                    ));
+                }
+                Err(_) => return Err(LiveError::plain("Не удалось заблокировать профиль Claude")),
+            }
+        }
+        let file = fs::File::open(&path)
+            .map_err(|_| LiveError::plain("Не удалось открыть блокировку Claude"))?;
+        let heartbeat_file = file
+            .try_clone()
+            .map_err(|_| LiveError::plain("Не удалось удержать блокировку Claude"))?;
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if heartbeat_file
+                    .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            path,
+            file,
+            heartbeat,
+        })
+    }
+
+    fn is_owned(&self) -> bool {
+        match (self.file.metadata(), fs::symlink_metadata(&self.path)) {
+            (Ok(held), Ok(current)) => held.dev() == current.dev() && held.ino() == current.ino(),
+            _ => false,
+        }
+    }
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        self.heartbeat.abort();
+        if self.is_owned() {
+            let _ = fs::remove_dir(&self.path);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshedToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+    scope: Option<String>,
+    refresh_token_expires_in: Option<i64>,
+}
+
+static ACTIVE_REFRESHES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+pub async fn finish_refreshes() -> Result<()> {
+    let _finished = tokio::time::timeout(Duration::from_secs(20), ACTIVE_REFRESHES.write())
+        .await
+        .context("Не удалось дождаться сохранения авторизации Claude")?;
+    Ok(())
+}
+
+async fn refresh_credentials(
+    config_dir: &Path,
+    token_url: &str,
+) -> Result<OauthCredentials, LiveError> {
+    let dir = config_dir.to_owned();
+    let url = token_url.to_owned();
+    let guard = ACTIVE_REFRESHES.read().await;
+    // Ротация должна сохранить токен даже при отмене внешнего fetch
+    // по PROVIDER_DEADLINE. Сам HTTP-запрос ограничен 15 секундами.
+    tokio::spawn(async move {
+        let _guard = guard;
+        refresh_credentials_locked(&dir, &url).await
+    })
+    .await
+    .map_err(|_| LiveError::plain("Не удалось обновить авторизацию Claude"))?
+}
+
+async fn refresh_credentials_locked(
+    config_dir: &Path,
+    token_url: &str,
+) -> Result<OauthCredentials, LiveError> {
+    let dir = fs::canonicalize(crate::util::expand_home(config_dir))
+        .map_err(|_| LiveError::plain("Не удалось открыть профиль Claude"))?;
+    let locks = [
+        RefreshLock::acquire(dir.join(".oauth_refresh.lock"))?,
+        RefreshLock::acquire(PathBuf::from(format!("{}.lock", dir.display())))?,
+    ];
+    let path = dir.join(".credentials.json");
+    if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return Err(LiveError::plain(
+            "Файл авторизации Claude должен быть обычным файлом",
+        ));
+    }
+    let read = || -> Result<Value, LiveError> {
+        fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .ok_or_else(|| LiveError::plain("Не удалось прочитать профиль Claude"))
+    };
+    let mut stored = read()?;
+    let credentials: OauthCredentials = serde_json::from_value(stored["claudeAiOauth"].clone())
+        .map_err(|_| LiveError::plain("Выполни вход: claude auth login"))?;
+    if credentials
+        .expires_at
+        .is_none_or(|at| at / 1000 > crate::util::unix_now() + 60)
+    {
+        return Ok(credentials);
+    }
+    let refresh_token = credentials
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| LiveError::plain("Токен Claude истёк — выполни вход: claude auth login"))?;
+    if credentials.scopes.is_empty() {
+        return Err(LiveError {
+            retry_seconds: BACKOFF_MAX_SECONDS,
+            ..LiveError::plain("Вход Claude неполон — выполни вход: claude auth login")
+        });
+    }
+    let mut body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": credentials.client_id.as_deref().unwrap_or(CLIENT_ID),
+    });
+    body["scope"] = credentials.scopes.join(" ").into();
+    if !locks.iter().all(RefreshLock::is_owned) {
+        return Err(LiveError::plain("Блокировка профиля Claude изменилась"));
+    }
+    let response = client()
+        .post(token_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| LiveError::plain("Не удалось продлить токен Claude: Anthropic недоступен"))?;
+    if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(LiveError {
+                message: "Anthropic ограничил частоту обновления токена".to_owned(),
+                rate_limited: true,
+                expired_token_at: None,
+                retry_seconds: RETRY_SECONDS,
+            });
+        }
+        return Err(LiveError {
+            retry_seconds: if response.status().is_client_error() {
+                BACKOFF_MAX_SECONDS
+            } else {
+                RETRY_SECONDS
+            },
+            ..LiveError::plain(match response.status().as_u16() {
+                400 | 401 | 403 => "Вход Claude истёк — выполни вход: claude auth login".to_owned(),
+                status => format!("Не удалось продлить токен Claude: HTTP {status}"),
+            })
+        });
+    }
+    let renewed: RefreshedToken = response
+        .json()
+        .await
+        .map_err(|_| LiveError::plain("Некорректный ответ обновления токена Claude"))?;
+    let now_ms = crate::util::unix_now() * 1000;
+    let expires_at = renewed
+        .expires_in
+        .checked_mul(1000)
+        .and_then(|ttl| now_ms.checked_add(ttl));
+    if renewed.access_token.is_empty()
+        || renewed.expires_in <= 0
+        || expires_at.is_none()
+        || renewed.refresh_token.as_deref() == Some("")
+    {
+        return Err(LiveError::plain("Anthropic не вернул рабочий токен Claude"));
+    }
+
+    // Старые версии CLI и ручной logout могут менять файл без этих locks.
+    // Перечитываем весь JSON, чтобы сохранить их поля и не восстановить вход
+    // поверх выхода пользователя из аккаунта.
+    let current = read()?;
+    if !locks.iter().all(RefreshLock::is_owned)
+        || current["claudeAiOauth"]["accessToken"] != stored["claudeAiOauth"]["accessToken"]
+        || current["claudeAiOauth"]["refreshToken"] != stored["claudeAiOauth"]["refreshToken"]
+    {
+        return Err(LiveError::plain(
+            "Авторизация Claude изменилась во время обновления",
+        ));
+    }
+    stored = current;
+    let oauth = stored["claudeAiOauth"]
+        .as_object_mut()
+        .ok_or_else(|| LiveError::plain("Выполни вход: claude auth login"))?;
+    oauth.insert("accessToken".to_owned(), renewed.access_token.into());
+    oauth.insert("expiresAt".to_owned(), expires_at.unwrap().into());
+    if let Some(token) = renewed.refresh_token {
+        oauth.insert("refreshToken".to_owned(), token.into());
+    }
+    if let Some(scope) = renewed.scope {
+        oauth.insert(
+            "scopes".to_owned(),
+            scope.split_whitespace().collect::<Vec<_>>().into(),
+        );
+    }
+    if let Some(at) = renewed
+        .refresh_token_expires_in
+        .and_then(|ttl| ttl.checked_mul(1000))
+        .and_then(|ttl| now_ms.checked_add(ttl))
+    {
+        oauth.insert("refreshTokenExpiresAt".to_owned(), at.into());
+    } else {
+        oauth.remove("refreshTokenExpiresAt");
+    }
+    let bytes = serde_json::to_vec(&stored)
+        .map_err(|_| LiveError::plain("Не удалось подготовить профиль Claude"))?;
+    crate::util::atomic_write_mode(&path, &bytes, Some(0o600))
+        .map_err(|_| LiveError::plain("Не удалось сохранить продлённый токен Claude"))?;
+    fs::File::open(&dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| LiveError::plain("Не удалось синхронизировать авторизацию Claude"))?;
+    serde_json::from_value(stored["claudeAiOauth"].clone())
+        .map_err(|_| LiveError::plain("Не удалось прочитать продлённый токен Claude"))
 }
 
 /// Запрашивает актуальные лимиты у Anthropic. Ошибка означает «нужен запасной
 /// источник», а не отказ провайдера.
 async fn live_usage(config_dir: &Path, now: i64) -> Result<Vec<QuotaWindow>, LiveError> {
-    let Some(credentials) = read_token(config_dir) else {
+    let Some(mut credentials) = read_token(config_dir) else {
         return Err(LiveError::plain("Выполни вход: claude"));
     };
     if let Some(expires_at) = credentials.expires_at {
         // expiresAt в миллисекундах; запас в минуту, чтобы не ловить гонку.
         if expires_at / 1000 <= now + 60 {
-            return Err(LiveError::plain(
-                "Токен Claude истёк — запусти Claude Code, он обновит его сам",
-            ));
+            credentials =
+                refresh_credentials(config_dir, TOKEN_URL)
+                    .await
+                    .map_err(|mut error| {
+                        if !error.rate_limited {
+                            error.expired_token_at = Some(expires_at);
+                        }
+                        error
+                    })?;
         }
     }
 
@@ -607,6 +963,8 @@ async fn live_usage(config_dir: &Path, now: i64) -> Result<Vec<QuotaWindow>, Liv
         return Err(LiveError {
             message: "Anthropic ограничил частоту запросов".to_owned(),
             rate_limited: true,
+            expired_token_at: None,
+            retry_seconds: RETRY_SECONDS,
         });
     }
     if !status.is_success() {
@@ -785,6 +1143,27 @@ mod tests {
     }
 
     #[test]
+    fn a_generic_tier_falls_back_to_the_organization_type() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-usage-generic-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let profile = dir.join(".claude");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(
+            dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"u@example.com",
+                "organizationType":"claude_pro",
+                "organizationRateLimitTier":"default_claude_ai"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(read_identity(&profile).plan.as_deref(), Some("Pro"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_member_tier_wins_over_the_organization_tier() {
         let dir = std::env::temp_dir().join(format!(
             "ai-usage-member-{}-{:?}",
@@ -856,10 +1235,10 @@ mod tests {
 
     #[test]
     fn the_pause_after_a_rate_limit_grows_and_stops_growing() {
-        assert_eq!(backoff_seconds(1), MIN_POLL_SECONDS);
-        assert_eq!(backoff_seconds(2), 2 * MIN_POLL_SECONDS);
-        assert_eq!(backoff_seconds(3), 4 * MIN_POLL_SECONDS);
-        assert_eq!(backoff_seconds(4), 8 * MIN_POLL_SECONDS);
+        assert_eq!(backoff_seconds(1), 600);
+        assert_eq!(backoff_seconds(2), 1_200);
+        assert_eq!(backoff_seconds(3), 2_400);
+        assert_eq!(backoff_seconds(4), BACKOFF_MAX_SECONDS);
         assert_eq!(backoff_seconds(5), BACKOFF_MAX_SECONDS);
         // Счётчик отказов растёт, пока endpoint молчит; час — потолок, и сдвиг
         // на 30 позиций не должен обнулять его переполнением.
@@ -876,14 +1255,82 @@ mod tests {
             Some((mine.clone(), 500)),
             Some((theirs.clone(), 900)),
             1_000,
+            DEFAULT_STALE_SECONDS,
         )
         .unwrap();
         assert_eq!(at, 900);
         assert_eq!(windows[0].used_percent, 90.0);
 
-        let (windows, at) = choose_fallback(Some((mine, 900)), Some((theirs, 500)), 1_000).unwrap();
+        let (windows, at) = choose_fallback(
+            Some((mine, 900)),
+            Some((theirs, 500)),
+            1_000,
+            DEFAULT_STALE_SECONDS,
+        )
+        .unwrap();
         assert_eq!(at, 900);
         assert_eq!(windows[0].used_percent, 10.0);
+    }
+
+    #[test]
+    fn a_backward_clock_step_recovers_once_without_freshening_quota() {
+        let now = 1_000;
+        let future = vec![
+            window("session", 97.0, Some(now - 1)),
+            window("weekly_all", 62.0, Some(20_000)),
+        ];
+        for legacy in [false, true] {
+            for (failures, pause) in [(0, 300), (1, 600), (2, 1_200), (4, 3_600)] {
+                let mut cache = UsageCache {
+                    fetched_at: 10_000,
+                    next_attempt_at: 10_000 + pause,
+                    last_attempt_at: (!legacy).then_some(10_000),
+                    failures,
+                    windows: future.clone(),
+                    error: (failures > 0).then(|| "429".to_owned()),
+                    ..UsageCache::default()
+                };
+                assert!(cache.recover_clock(now));
+                assert_eq!(cache.next_attempt_at, now + pause);
+                assert_eq!(cache.fetched_at, 10_000);
+                assert_eq!(cache.windows[0].used_percent, 97.0);
+                let mut cache: UsageCache =
+                    serde_json::from_str(&serde_json::to_string(&cache).unwrap()).unwrap();
+                assert!(!cache.recover_clock(now));
+                assert!(!cache.recover_clock(now + pause - 1));
+                assert!(!cache.should_attempt(Path::new("/nonexistent/profile"), now + pause - 1));
+                assert!(cache.should_attempt(Path::new("/nonexistent/profile"), now + pause));
+            }
+        }
+        let mut legacy_retry = UsageCache {
+            fetched_at: now - 100,
+            next_attempt_at: 10_000,
+            failures: 2,
+            error: Some("429".to_owned()),
+            ..UsageCache::default()
+        };
+        assert!(legacy_retry.recover_clock(now));
+        assert_eq!(legacy_retry.next_attempt_at, now + 1_200);
+        assert!(!legacy_retry.recover_clock(now + 1));
+
+        let current = vec![window("session", 20.0, Some(2_000))];
+        for future_is_own in [false, true] {
+            let future_source = Some((future.clone(), 10_000));
+            let current_source = Some((current.clone(), now - 1));
+            let (own, cli) = if future_is_own {
+                (future_source, current_source)
+            } else {
+                (current_source, future_source)
+            };
+            let (chosen, at) = choose_fallback(own, cli, now, DEFAULT_STALE_SECONDS).unwrap();
+            assert_eq!(at, now - 1);
+            assert_eq!(chosen[0].used_percent, 20.0);
+        }
+        let (stale, at) =
+            choose_fallback(Some((future, 10_000)), None, now, DEFAULT_STALE_SECONDS).unwrap();
+        assert_eq!(at, 10_000);
+        assert_eq!(keys(&stale), ["weekly_all"]);
+        assert_eq!(stale[0].used_percent, 62.0);
     }
 
     #[test]
@@ -894,19 +1341,48 @@ mod tests {
             window("no_reset", 5.0, None),
         ];
 
-        let (current, _) = choose_fallback(Some((windows, 100)), None, 1_000).unwrap();
+        let (current, _) =
+            choose_fallback(Some((windows, 99)), None, 1_000, DEFAULT_STALE_SECONDS).unwrap();
         assert_eq!(keys(&current), ["weekly_all", "no_reset"]);
+    }
+
+    #[test]
+    fn a_fresh_cached_response_keeps_a_session_after_its_reset() {
+        let windows = vec![
+            window("session", 79.0, Some(900)),
+            window("weekly_all", 96.0, Some(5_000)),
+        ];
+        for from_cli in [false, true] {
+            for (now, fresh) in [(1_099, true), (1_100, true), (1_101, false)] {
+                let source = Some((windows.clone(), 1_000));
+                let (current, at) = if from_cli {
+                    choose_fallback(None, source, now, 100)
+                } else {
+                    choose_fallback(source, None, now, 100)
+                }
+                .unwrap();
+                assert_eq!(at, 1_000);
+                if fresh {
+                    assert_eq!(keys(&current), ["session", "weekly_all"]);
+                    assert_eq!(current[0].used_percent, 79.0);
+                    assert_eq!(current[0].resets_at, Some(900));
+                } else {
+                    assert_eq!(keys(&current), ["weekly_all"]);
+                }
+            }
+        }
     }
 
     #[test]
     fn every_window_expired_is_not_the_same_as_no_data() {
         let windows = vec![window("session", 97.0, Some(900))];
-        let (current, at) = choose_fallback(Some((windows, 100)), None, 1_000).unwrap();
+        let (current, at) =
+            choose_fallback(Some((windows, 99)), None, 1_000, DEFAULT_STALE_SECONDS).unwrap();
         assert!(current.is_empty(), "истёкшее окно показывать нечего");
-        assert_eq!(at, 100, "возраст данных при этом известен");
+        assert_eq!(at, 99, "возраст данных при этом известен");
 
         assert!(
-            choose_fallback(None, None, 1_000).is_none(),
+            choose_fallback(None, None, 1_000, DEFAULT_STALE_SECONDS).is_none(),
             "источников нет вовсе — это другое состояние"
         );
     }
@@ -926,8 +1402,14 @@ mod tests {
             next_attempt_at: 1_785_000_300,
             failures: 2,
             windows: vec![window("session", 42.0, Some(1_785_010_000))],
+            ..UsageCache::default()
         };
         write_usage_cache(&path, &cache);
+
+        assert!(
+            !usage_cache_path("claude-main").starts_with(crate::util::runtime_dir()),
+            "кеш на tmpfs теряется при перезагрузке, а токен к тому моменту протух"
+        );
 
         let read = read_usage_cache(&path);
         assert_eq!(read.fetched_at, 1_785_000_000);
@@ -963,9 +1445,12 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_file_name_cannot_escape_the_runtime_directory() {
+    fn the_cache_file_name_cannot_escape_its_directory() {
         let path = usage_cache_path("../../etc/passwd");
-        assert_eq!(path.parent(), Some(crate::util::runtime_dir().as_path()));
+        assert_eq!(
+            path.parent(),
+            Some(crate::util::persistent_state_dir().as_path())
+        );
         assert_eq!(
             path.file_name().unwrap(),
             "claude-usage-______etc_passwd.json"
@@ -979,5 +1464,263 @@ mod tests {
         assert!(identity.plan.is_none());
         assert!(cached_usage(Path::new("/nonexistent/profile")).is_none());
         assert!(read_token(Path::new("/nonexistent/profile")).is_none());
+    }
+
+    #[tokio::test]
+    async fn renewed_credentials_skip_only_the_expired_token_retry_pause() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai-usage-expiry-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let credentials = dir.join(".credentials.json");
+        let write_credentials = |expires_at| {
+            fs::write(
+                &credentials,
+                serde_json::json!({
+                    "claudeAiOauth": {"accessToken": "test-token", "expiresAt": expires_at}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let now = 1_000;
+        write_credentials(900_000);
+        let error = live_usage(&dir, now).await.err().unwrap();
+        assert!(!error.rate_limited);
+        assert_eq!(error.expired_token_at, Some(900_000));
+
+        let path = dir.join("usage.json");
+        let cache = UsageCache {
+            next_attempt_at: now + RETRY_SECONDS,
+            expired_token_at: error.expired_token_at,
+            error: Some(error.message),
+            ..UsageCache::default()
+        };
+        write_usage_cache(&path, &cache);
+        let mut cache = read_usage_cache(&path);
+        assert!(cache.error.as_ref().unwrap().contains("Токен Claude истёк"));
+        assert!(!cache.should_attempt(&dir, now));
+        assert!(cache.should_attempt(&dir, now + RETRY_SECONDS));
+
+        cache.next_attempt_at = now + BACKOFF_MAX_SECONDS;
+        assert!(!cache.should_attempt(&dir, now + RETRY_SECONDS));
+
+        write_credentials(1_030_000);
+        assert!(
+            !cache.should_attempt(&dir, now),
+            "почти истёкший токен не годится"
+        );
+        write_credentials(2_000_000);
+        assert!(
+            cache.should_attempt(&dir, now),
+            "Claude Code уже продлил токен"
+        );
+
+        cache.expired_token_at = None;
+        assert!(
+            !cache.should_attempt(&dir, now),
+            "пауза опроса или 429 остаётся"
+        );
+        cache.expired_token_at = Some(900_000);
+        fs::remove_file(credentials).unwrap();
+        assert!(
+            !cache.should_attempt(&dir, now),
+            "выход из аккаунта не снимает паузу"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_refresh_rotates_safely_and_survives_a_cancelled_poll() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("ai-usage-refresh-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.json");
+        let before = serde_json::json!({
+            "otherProvider": {"keep": "original"},
+            "claudeAiOauth": {
+                "accessToken": "old-access", "refreshToken": "old-refresh",
+                "expiresAt": 0, "subscriptionType": "max", "rateLimitTier": "max_5x",
+                "clientId": "profile-client", "scopes": ["user:profile", "user:inference"],
+                "unknownFutureField": true
+            }
+        });
+        fs::write(&path, before.to_string()).unwrap();
+        let lock_path = dir.join(".oauth_refresh.lock");
+        let legacy_path = PathBuf::from(format!("{}.lock", dir.display()));
+        for lock in [&lock_path, &legacy_path] {
+            fs::create_dir(lock).unwrap();
+            fs::File::open(lock)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(61)),
+                )
+                .unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (posted, received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server_path = path.clone();
+        let server = tokio::spawn(async move {
+            let mut posted = Some(posted);
+            let mut released = Some(released);
+            for attempt in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let payload = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break serde_json::from_slice::<Value>(
+                                &request[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                assert_eq!(payload["grant_type"], "refresh_token");
+                assert_eq!(payload["client_id"], "profile-client");
+                assert_eq!(payload["scope"], "user:profile user:inference");
+                let (status, body) = if attempt == 0 {
+                    assert_eq!(payload["refresh_token"], "old-refresh");
+                    posted.take().unwrap().send(()).unwrap();
+                    released.take().unwrap().await.unwrap();
+                    (
+                        "200 OK",
+                        r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":28800,"scope":"user:profile user:inference","refresh_token_expires_in":2592000}"#,
+                    )
+                } else if attempt == 1 {
+                    assert_eq!(payload["refresh_token"], "new-refresh");
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"invalid_grant","secret":"must-not-leak"}"#,
+                    )
+                } else if attempt == 2 {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"private-token","expires_in":"private-token"}"#,
+                    )
+                } else {
+                    let mut logged_out: Value =
+                        serde_json::from_slice(&fs::read(&server_path).unwrap()).unwrap();
+                    logged_out.as_object_mut().unwrap().remove("claudeAiOauth");
+                    fs::write(&server_path, logged_out.to_string()).unwrap();
+                    (
+                        "200 OK",
+                        r#"{"access_token":"discarded","refresh_token":"discarded","expires_in":28800}"#,
+                    )
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let task_dir = dir.clone();
+        let task_url = url.clone();
+        let waiter = tokio::spawn(async move { refresh_credentials(&task_dir, &task_url).await });
+        tokio::time::timeout(Duration::from_secs(3), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lock_path.is_dir() && legacy_path.is_dir());
+        let contended = refresh_credentials(&dir, &url).await.err().unwrap();
+        assert!(contended.message.contains("уже обновляет"));
+        waiter.abort();
+        assert!(waiter.await.err().unwrap().is_cancelled());
+        let mut edited = before.clone();
+        edited["otherProvider"]["keep"] = "edited-while-refreshing".into();
+        fs::write(&path, edited.to_string()).unwrap();
+        let mut draining = tokio::spawn(finish_refreshes());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut draining)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while lock_path.exists() || legacy_path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), draining)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["claudeAiOauth"]["accessToken"], "new-access");
+        assert_eq!(after["claudeAiOauth"]["refreshToken"], "new-refresh");
+        assert_eq!(after["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(after["claudeAiOauth"]["unknownFutureField"], true);
+        assert_eq!(after["otherProvider"]["keep"], "edited-while-refreshing");
+        assert!(
+            after["claudeAiOauth"]["expiresAt"].as_i64().unwrap() > crate::util::unix_now() * 1000
+        );
+        assert!(
+            after["claudeAiOauth"]["refreshTokenExpiresAt"]
+                .as_i64()
+                .unwrap()
+                > crate::util::unix_now() * 1000
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Уже продлённый другим клиентом токен не требует второго POST.
+        assert_eq!(
+            refresh_credentials(&dir, &url)
+                .await
+                .ok()
+                .unwrap()
+                .access_token,
+            "new-access"
+        );
+        let mut expired = after;
+        expired["claudeAiOauth"]["expiresAt"] = 0.into();
+        fs::write(&path, expired.to_string()).unwrap();
+        let rejected = refresh_credentials(&dir, &url).await.err().unwrap();
+        assert!(rejected.message.contains("claude auth login"));
+        assert_eq!(rejected.retry_seconds, BACKOFF_MAX_SECONDS);
+        assert!(!rejected.message.contains("must-not-leak"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expired
+        );
+        let malformed = refresh_credentials(&dir, &url).await.err().unwrap();
+        assert!(!malformed.message.contains("private-token"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            expired
+        );
+        let logged_out = refresh_credentials(&dir, &url).await.err().unwrap();
+        assert!(logged_out.message.contains("изменилась"));
+        assert!(read_token(&dir).is_none());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap()["otherProvider"],
+            expired["otherProvider"]
+        );
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!lock_path.exists() && !legacy_path.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

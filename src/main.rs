@@ -1,4 +1,5 @@
 mod config;
+mod history;
 mod model;
 mod providers;
 mod setup;
@@ -6,7 +7,7 @@ mod util;
 
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::Duration;
 
@@ -113,10 +114,23 @@ enum AddCommand {
         #[arg(long)]
         api_key_stdin: bool,
     },
-    /// Google Antigravity / agy account fed by its official status-line JSON.
+    /// OpenRouter API key. The key itself is read from stdin.
+    Openrouter {
+        #[command(flatten)]
+        common: CommonArgs,
+        #[arg(long, default_value = "https://openrouter.ai/api/v1")]
+        base_url: String,
+        /// Read the API key from stdin instead of prompting.
+        #[arg(long)]
+        api_key_stdin: bool,
+    },
+    /// Google Antigravity / agy account fed by direct Google API or official status-line JSON.
     Antigravity {
         #[command(flatten)]
         common: CommonArgs,
+        /// Path to acp_token.json. If omitted, auto-discovered from T3 Code or Gemini locations.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
         /// Create a small wrapper script for the agy /statusline command.
         #[arg(long)]
         hook: bool,
@@ -150,7 +164,7 @@ enum ConfigCommand {
 async fn main() -> Result<()> {
     util::load_secrets_env()?;
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Commands::Daemon) {
+    let result = match cli.command.unwrap_or(Commands::Daemon) {
         Commands::Daemon => daemon().await,
         Commands::Once => once().await,
         Commands::Setup => setup::run(),
@@ -161,7 +175,9 @@ async fn main() -> Result<()> {
         Commands::ClaudeHook { account } => claude_hook(&account),
         Commands::AgyHook { account } => agy_hook(&account),
         Commands::RestoreClaudeHooks => setup::restore_claude_hooks(),
-    }
+    };
+    providers::claude::finish_refreshes().await?;
+    result
 }
 
 fn account(command: AccountCommand) -> Result<()> {
@@ -189,6 +205,12 @@ fn account(command: AccountCommand) -> Result<()> {
                         ..
                     } => format!("{}, bucket {limit_id}", codex_home.display()),
                     AccountConfig::Deepseek { api_key_env, .. } => api_key_env.clone(),
+                    AccountConfig::Openrouter { api_key_env, .. } => api_key_env.clone(),
+                    AccountConfig::OpencodeGo { db_file, .. } => db_file
+                        .clone()
+                        .unwrap_or_else(providers::opencode_go::default_db_file)
+                        .display()
+                        .to_string(),
                     AccountConfig::Antigravity { id, .. } => {
                         providers::antigravity::snapshot_path(id)
                             .display()
@@ -378,7 +400,37 @@ fn build_account(command: AddCommand) -> Result<Added> {
                 base_url,
             }))
         }
-        AddCommand::Antigravity { common, hook } => {
+        AddCommand::Openrouter {
+            common,
+            base_url,
+            api_key_stdin,
+        } => {
+            util::validate_id(&common.id)?;
+            let key = if api_key_stdin {
+                let mut buffer = String::new();
+                std::io::stdin().read_to_string(&mut buffer)?;
+                buffer.trim().to_owned()
+            } else {
+                rpassword::prompt_password("API key (ввод скрыт): ")?
+            };
+            if key.is_empty() {
+                bail!("API key не может быть пустым");
+            }
+
+            let api_key_env = util::env_name_for_provider_and_id("openrouter", &common.id);
+            setup::save_secret(&api_key_env, &key)?;
+            Ok(Added::plain(AccountConfig::Openrouter {
+                name: common.name.unwrap_or_else(|| common.id.clone()),
+                id: common.id,
+                api_key_env,
+                base_url,
+            }))
+        }
+        AddCommand::Antigravity {
+            common,
+            token_file,
+            hook,
+        } => {
             util::validate_id(&common.id)?;
             Ok(Added {
                 account: AccountConfig::Antigravity {
@@ -386,6 +438,7 @@ fn build_account(command: AddCommand) -> Result<Added> {
                     // `plan_tier`, и заголовок меню читался бы дважды.
                     name: common.name.unwrap_or_else(|| "Antigravity".to_owned()),
                     id: common.id,
+                    token_file,
                 },
                 install_hook: hook,
             })
@@ -443,24 +496,45 @@ fn init() -> Result<()> {
 }
 
 async fn daemon() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut consecutive_failures: u32 = 0;
+    let mut last_history = None;
     loop {
         let config = config::load()?;
         let state = refresh(&config).await;
         write_state(&state)?;
         log_cycle(&state);
+        // Журнал вторичен: его сбой не должен останавливать обновление панели.
+        if let Err(error) = history::append(&history::history_file(), &state, &mut last_history) {
+            eprintln!("Не удалось дописать history.jsonl: {error}");
+        }
+
+        let has_transient_error = state
+            .accounts
+            .iter()
+            .any(|a| a.status == "error" || (a.status == "stale" && a.error.is_some()));
+
+        let sleep_duration = if has_transient_error {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            failure_backoff(consecutive_failures, config.refresh_interval())
+        } else {
+            consecutive_failures = 0;
+            Duration::from_secs(config.refresh_interval())
+        };
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(config.refresh_interval())) => {},
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                break;
-            }
+            _ = tokio::time::sleep(sleep_duration) => {},
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
         }
     }
     Ok(())
 }
 
 async fn once() -> Result<()> {
+    let _terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let config = config::load()?;
     let state = refresh(&config).await;
     write_state(&state)?;
@@ -540,14 +614,36 @@ fn log_cycle(state: &AppState) {
     eprintln!("[цикл] {summary}");
 }
 
-fn read_state() -> Option<AppState> {
-    let raw = fs::read_to_string(util::state_file()).ok()?;
+fn failure_backoff(consecutive_failures: u32, max_interval: u64) -> Duration {
+    let backoff = config::MIN_REFRESH_SECONDS
+        .saturating_mul(1 << (consecutive_failures.saturating_sub(1)).min(3));
+    Duration::from_secs(backoff.min(max_interval))
+}
+
+fn persistent_state_file() -> PathBuf {
+    util::persistent_state_dir().join("state.json")
+}
+
+fn read_state_from(runtime_path: &Path, persistent_path: &Path) -> Option<AppState> {
+    if let Ok(raw) = fs::read_to_string(runtime_path) {
+        if let Ok(state) = serde_json::from_str::<AppState>(&raw) {
+            return Some(state);
+        }
+    }
+    let raw = fs::read_to_string(persistent_path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
+fn read_state() -> Option<AppState> {
+    read_state_from(&util::state_file(), &persistent_state_file())
+}
+
 fn write_state(state: &AppState) -> Result<()> {
-    let path = util::state_file();
-    util::atomic_write(&path, serde_json::to_string_pretty(state)?.as_bytes())?;
+    let bytes = serde_json::to_string_pretty(state)?.into_bytes();
+    let runtime_path = util::state_file();
+    util::atomic_write(&runtime_path, &bytes)?;
+    let persistent_path = persistent_state_file();
+    let _ = util::atomic_write_mode(&persistent_path, &bytes, Some(0o600));
     Ok(())
 }
 
@@ -624,27 +720,62 @@ fn doctor() -> Result<()> {
                     .unwrap_or(false);
                 println!("{} DeepSeek '{}': {}", mark(present), name, api_key_env);
             }
-            config::AccountConfig::Antigravity { id, name } => {
+            config::AccountConfig::Openrouter {
+                name, api_key_env, ..
+            } => {
+                let present = std::env::var(api_key_env)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                println!("{} OpenRouter '{}': {}", mark(present), name, api_key_env);
+            }
+            config::AccountConfig::OpencodeGo { name, db_file, .. } => {
+                let path = util::expand_home(
+                    &db_file
+                        .clone()
+                        .unwrap_or_else(providers::opencode_go::default_db_file),
+                );
+                println!(
+                    "{} OpenCode Go '{}': {}",
+                    mark(path.exists()),
+                    name,
+                    path.display()
+                );
+            }
+            config::AccountConfig::Antigravity {
+                id,
+                name,
+                token_file,
+            } => {
                 let agy = util::resolve_command("agy").is_some();
                 let snapshot = providers::antigravity::snapshot_path(id);
                 let hook = providers::antigravity::hook_script_path(id)?;
+                let token = providers::antigravity::find_token_file(token_file.as_deref());
+                let has_source = token.is_some() || snapshot.exists();
+                let token_desc = match &token {
+                    Some(path) => format!("найден ({})", path.display()),
+                    None => "не найден".to_owned(),
+                };
                 println!(
-                    "{} Antigravity '{}': agy={}, snapshot={}, hook={}",
-                    mark(agy && snapshot.exists()),
+                    "{} Antigravity '{}': token={}, agy={}, snapshot={}",
+                    mark(has_source),
                     name,
+                    token_desc,
                     if agy {
                         "найден"
                     } else {
                         "не найден"
                     },
-                    snapshot.display(),
-                    hook.display()
+                    snapshot.display()
                 );
+                if token.is_none() && !snapshot.exists() {
+                    println!("    hook={}", hook.display());
+                }
             }
         }
     }
 
     println!("\nState file: {}", util::state_file().display());
+    println!("Persistent state: {}", persistent_state_file().display());
     println!("Для сетевой проверки: ai-usage once");
     Ok(())
 }
@@ -654,5 +785,54 @@ fn mark(ok: bool) -> &'static str {
         "[OK]"
     } else {
         "[WARN]"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_backoff_steps_up_and_caps_at_max_interval() {
+        assert_eq!(failure_backoff(1, 120), Duration::from_secs(15));
+        assert_eq!(failure_backoff(2, 120), Duration::from_secs(30));
+        assert_eq!(failure_backoff(3, 120), Duration::from_secs(60));
+        assert_eq!(failure_backoff(4, 120), Duration::from_secs(120));
+        assert_eq!(failure_backoff(5, 120), Duration::from_secs(120));
+        assert_eq!(failure_backoff(1, 20), Duration::from_secs(15));
+        assert_eq!(failure_backoff(2, 20), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn read_state_falls_back_to_persistent_storage() {
+        let temp = std::env::temp_dir().join(format!("ai-usage-state-test-{}", std::process::id()));
+        let runtime = temp.join("runtime/state.json");
+        let persistent = temp.join("persistent/state.json");
+        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        fs::create_dir_all(persistent.parent().unwrap()).unwrap();
+
+        let app_state = AppState {
+            schema_version: model::SCHEMA_VERSION,
+            updated_at: 12345,
+            accounts: Vec::new(),
+        };
+        let raw = serde_json::to_string(&app_state).unwrap();
+        fs::write(&persistent, &raw).unwrap();
+
+        // Runtime file does not exist yet: falls back to persistent
+        let loaded = read_state_from(&runtime, &persistent).unwrap();
+        assert_eq!(loaded.updated_at, 12345);
+
+        // When runtime file exists, it takes precedence
+        let runtime_state = AppState {
+            schema_version: model::SCHEMA_VERSION,
+            updated_at: 67890,
+            accounts: Vec::new(),
+        };
+        fs::write(&runtime, serde_json::to_string(&runtime_state).unwrap()).unwrap();
+        let loaded = read_state_from(&runtime, &persistent).unwrap();
+        assert_eq!(loaded.updated_at, 67890);
+
+        fs::remove_dir_all(&temp).ok();
     }
 }

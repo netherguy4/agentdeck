@@ -73,12 +73,14 @@ $XDG_CONFIG_HOME/ai-usage/config.toml
 2. если с прошлой попытки не прошла пауза, запрос не делается вовсе;
 3. иначе выполняется `GET https://api.anthropic.com/api/oauth/usage` с этим токеном;
 4. массив `limits[]` превращается в окна: он надмножество верхнеуровневых полей и только в нём приходят лимиты, привязанные к модели (`weekly_scoped` + `scope.model`);
-5. удачный ответ ложится в `$XDG_RUNTIME_DIR/ai-usage/claude-usage-<id>.json` (права `0600`) вместе с моментом следующей попытки;
+5. удачный ответ ложится в `$XDG_STATE_HOME/ai-usage/claude-usage-<id>.json` (права `0600`) вместе с моментом следующей попытки;
 6. если запроса не было или он не удался — показывается самое свежее из двух: наш кеш или `cachedUsageUtilization` из `.claude.json`, который Claude Code обновляет при запуске.
 
-**Частота.** Endpoint отвечает `429` задолго до общего интервала обновления: опрос раз в 120 с на живом аккаунте держал его в отказе постоянно, и виджет молча показывал многочасовой кеш Claude Code. Между удачными запросами выдерживается минимум 5 минут (1.7% пятичасового окна), а `429` наращивает паузу 5 → 10 → 20 → 40 → 60 минут и сбрасывается первым успехом. Бюджет endpoint делится с самим Claude Code, поэтому фиксированного интервала мало — нужен отход.
+**Частота.** Endpoint отвечает `429` задолго до общего интервала обновления: опрос раз в 120 с на живом аккаунте держал его в отказе постоянно, и виджет молча показывал многочасовой кеш Claude Code. Между удачными запросами выдерживается минимум 5 минут (при стандартном цикле сервиса в 120 секунд — примерно раз в 6 минут), а `429` наращивает паузу 10 → 20 → 40 → 60 минут и сбрасывается первым успехом. Начальная пауза после `429` задана отдельно от обычного интервала опроса. Бюджет endpoint делится с самим Claude Code, поэтому фиксированного интервала мало — нужен отход.
 
-**Возраст.** Окно, чей `resets_at` уже прошёл, о текущем периоде не говорит ничего: из запасных данных оно выбрасывается. Показывать использование закончившегося периода — врать, а считать его сброшенным — гадать. Наступивший `resets_at` в свежих данных — другое дело: это и означает, что окно началось заново, и UI показывает 100%.
+**Freshness.** Live responses and caches within `stale_seconds` retain elapsed windows: the UI shows 100% after `resets_at` until the provider reports a new period. Only stale caches discard elapsed windows, whose current usage is unknown. Both the daemon cache and Claude Code cache follow this rule, so a fresh five-hour window survives between polls.
+
+After a backward clock correction, future-dated caches stay stale and lose to any nonfuture source. A persisted `last_attempt_at` lets retry deadlines recover once while preserving their polling or 429 cooldown; quota percentages, fetch times and server reset times are never rewritten as fresh data.
 
 Раньше данные приходили из status-line hook, то есть только когда пользователь работал в Claude Code. Активный опрос убрал это требование: виджету больше не нужно ни ставить hook, ни трогать `settings.json`.
 
@@ -87,7 +89,7 @@ Hook остался как необязательная косметика (`--h
 Ограничения архитектуры:
 
 - тариф и почта Claude читаются из `.claude.json`. Тариф берётся из `userRateLimitTier` → `organizationRateLimitTier` → `organizationType`: только уровень лимитов различает `Max 5x` и `Max 20x`, тогда как `organizationType` для обоих даёт `claude_max`. Заданный вручную `plan` в конфиге имеет приоритет над определённым;
-- access token живёт около 8 часов и обновляется только самим Claude Code — мы принципиально не пишем в `.credentials.json`, чтобы не сломать вход;
+- Claude access tokens renew automatically through the refresh-token grant used by Claude Code. Shared directory locks (`<config>/.oauth_refresh.lock`, then `<canonical config>.lock`; 60-second stale timeout, 5-second heartbeat) serialize rotation with the CLI. Credentials are reread under the locks, other JSON fields are preserved, and updates are atomic with mode 0600. A bounded detached refresh task finishes saving even if the outer provider deadline cancels its caller; SIGTERM/SIGINT and normal CLI exit wait for pending rotations. Permanent authentication failures wait up to an hour, with immediate eligibility after credentials change. Revoked refresh tokens still require login. The persistent quota cache covers network outages during boot;
 - stale threshold настраивается через `stale_seconds`, по умолчанию 15 минут — 5% пятичасового окна. Прежние сутки прятали отказ endpoint за многочасовым кешем: аккаунт числился `ok`, показывая цифры пятичасовой давности;
 - два account ID с одним `CLAUDE_CONFIG_DIR` отклоняются валидацией конфига.
 
@@ -99,7 +101,7 @@ Hook остался как необязательная косметика (`--h
 
 1. запускается `<command> app-server` с отдельным `CODEX_HOME`;
 2. по stdin отправляются JSONL-сообщения `initialize`, `initialized`, `account/read`, `account/rateLimits/read`;
-3. stdout читается до ответов ID `1` и `2`, максимум 20 секунд;
+3. stdout читается до ответов ID `1` и `2`, максимум 8 секунд на попытку;
 4. account даёт email и `planType` (`plus`/`pro`/`business`/…), который приводится к тому же виду, что и тариф Claude;
 5. rate-limit bucket выбирается по `limit_id`, по умолчанию `codex`;
 6. `primary` и `secondary` становятся окнами с подписью по длительности;
@@ -111,6 +113,8 @@ Hook остался как необязательная косметика (`--h
 
 stderr app-server читается в bounded-буфер (хвост 4 КБ) и проходит через redaction перед попаданием в текст ошибки. Без этого несуществующий `CODEX_HOME` давал сообщение «Codex не вернул account/read» без единого намёка на причину.
 
+Transient failures, including the provider's own response timeout, allow two attempts with a one-second pause. Two attempts fit response timeouts and bounded diagnostic collection inside the shared 30-second provider deadline.
+
 ### DeepSeek provider
 
 Файл: `src/providers/deepseek.rs`.
@@ -118,6 +122,24 @@ stderr app-server читается в bounded-буфер (хвост 4 КБ) и 
 Выполняется `GET <base_url>/user/balance` с bearer token. Ключ читается из env, имя переменной хранится в config. Setup сохраняет значения в `secrets.env` с правами `0600`, выставленными на временном файле до `rename` — итоговый файл не существует с более широкими правами ни мгновения.
 
 HTTP client общий, с таймаутами 15 с на запрос и 5 с на соединение. Сверх этого каждый provider fetch ограничен общим дедлайном в 30 секунд в `main::refresh`, поэтому зависший провайдер не задерживает остальные аккаунты.
+
+### Antigravity provider
+
+Файл: `src/providers/antigravity.rs`.
+
+Поддерживает два источника данных:
+1. **Прямой опрос Google API (активный, основной):**
+   - Демон находит OAuth-токены `acp_token.json` в T3 Code (`~/.t3/userdata/providers/antigravity/*/antigravity-acp/acp_token.json`), Gemini CLI (`~/.gemini/antigravity-acp/acp_token.json`) или по явному пути `token_file` в `config.toml`.
+   - Выполняется обновление токена доступа через `https://oauth2.googleapis.com/token`.
+   - Запрашивается текущая квота через `POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` (с fallback на `cloudcode-pa.googleapis.com`).
+   - Email пользователя подтягивается через `https://www.googleapis.com/oauth2/v1/userinfo`.
+   - Запросы к Google API кэшируются с интервалом не чаще 120 секунд (`MIN_POLL_SECONDS`), а снимок квоты сохраняется в `$XDG_STATE_HOME/ai-usage/antigravity-usage-<id>.json` с правами `0600`.
+   - A failed live poll immediately marks the last good snapshot `stale`, retains its original timestamp and quota, and reports the error. Google HTTP response bodies are excluded from diagnostics. Successful polling restores `ok`; hook-only accounts retain their age-based grace period.
+2. **Пассивный hook CLI `agy` (запасной):**
+   - Для терминального использования `agy` по-прежнему доступен wrapper-скрипт `~/.config/ai-usage/hooks/agy-<account>.sh` (`ai-usage agy-hook --account <id>`).
+   - При отсутствии токена или временной недоступности сети виджет плавно переходит на сохранённый снимок.
+
+The panel always prioritizes Gemini, including when the cached active model is Claude. `state_from_snapshot` puts Gemini first and makes third-party windows scoped; CLI snapshots and their status line still follow the active model. A snapshot dated in the future triggers a new Google poll and remains stale until refreshed after a backward clock correction.
 
 ### GNOME extension
 
@@ -149,13 +171,16 @@ Extension:
 ~/.config/systemd/user/ai-usage.service
 ~/.config/ai-usage/hooks/agy-<account>.sh
 $XDG_RUNTIME_DIR/ai-usage/state.json
-$XDG_RUNTIME_DIR/ai-usage/claude-usage-<account>.json
+~/.local/state/ai-usage/claude-usage-<account>.json
 ~/.local/state/ai-usage/antigravity-usage-<account>.json
+~/.local/state/ai-usage/history.jsonl
 ```
 
 Все пути должны уважать XDG environment variables.
 
-`$XDG_RUNTIME_DIR` лежит на tmpfs, поэтому туда попадает только то, что демон умеет восстановить сам: `state.json` он переписывает каждый цикл, а `claude-usage-*` — обычный кеш поверх сетевого запроса. Снимок Antigravity восстановить некому — его присылает `agy` и только пока запущен, — поэтому он живёт в `$XDG_STATE_HOME`.
+`$XDG_RUNTIME_DIR` лежит на tmpfs, поэтому туда попадает только то, что демон гарантированно восстановит сам: `state.json` он переписывает каждый цикл. Всё, что зависит от внешнего источника, живёт в `$XDG_STATE_HOME`: снимок Antigravity присылает `agy` и только пока запущен, the Claude cache preserves quota during network or authentication failures.
+
+`history.jsonl` (только `daemon`, права 600) — журнал снимков лимитов для внешней калибровки расхода, например `~/.general/scripts/model-route`: строка `{"t":…,"accounts":[{id, provider, plan, windows[key, used_percent, duration_mins, resets_at, scope], balances[currency, total]}]}` пишется, только когда цифры свежих `ok`-аккаунтов изменились. Почта, имена и ошибки туда не попадают. После 8 МБ файл переезжает в `history.jsonl.1`; это примерно месяц активной работы.
 
 ## Безопасность и приватность
 

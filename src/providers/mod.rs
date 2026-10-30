@@ -2,6 +2,8 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod deepseek;
+pub mod opencode_go;
+pub mod openrouter;
 
 use crate::config::AccountConfig;
 use crate::model::AccountState;
@@ -31,8 +33,19 @@ pub async fn fetch(account: AccountConfig, stale_seconds: i64) -> AccountState {
             api_key_env,
             base_url,
         } => deepseek::fetch(&id, &name, &api_key_env, &base_url).await,
-        AccountConfig::Antigravity { id, name } => {
-            antigravity::fetch(&id, &name, stale_seconds).await
+        AccountConfig::Openrouter {
+            id,
+            name,
+            api_key_env,
+            base_url,
+        } => openrouter::fetch(&id, &name, &api_key_env, &base_url).await,
+        AccountConfig::Antigravity {
+            id,
+            name,
+            token_file,
+        } => antigravity::fetch(&id, &name, token_file.as_deref(), stale_seconds).await,
+        AccountConfig::OpencodeGo { id, name, db_file } => {
+            opencode_go::fetch(&id, &name, db_file.as_deref()).await
         }
     };
 

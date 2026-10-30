@@ -155,15 +155,21 @@ CODEX_HOME="$HOME/.codex-profile" codex app-server
 
 Текст ошибки уже содержит exit status app-server и redacted-хвост его stderr, поэтому типичные причины (нет каталога, нет входа, не та команда) видны сразу из `ai-usage once`.
 
+The eight-second app-server timeout is retried once after a one-second pause. If both attempts fail, the specific timeout remains visible and the daemon retries on its 15/30/60/120-second failure schedule.
+
+### Antigravity stale
+
+A failed Google API poll immediately shows `stale` and the HTTP status or connection error, preserving the last good quota and its original timestamp. The daemon retries automatically; a successful poll clears the error. Google response bodies are never included in diagnostics. Hook-only accounts keep the existing age-based grace period.
+
 ### Claude waiting/stale
 
 Сначала `ai-usage doctor`: он скажет, есть ли вход и сколько живёт токен. Дальше по тексту ошибки в меню:
 
 - **«Anthropic ограничил частоту запросов»** — endpoint отвечает `429`. Ждать: пауза растёт до часа и снимается первым успехом. Бюджет общий с самим Claude Code, так что при активной работе в нём это ожидаемо.
-- **«Токен Claude истёк»** — обновить его может только сам Claude Code; достаточно его запустить.
+- Expired Claude access tokens are renewed automatically by the service. Network failures retry after at least 15 seconds; revoked/expired refresh tokens require `claude auth login`. The last error remains visible throughout the retry pause.
 - **«Выполни вход: claude»** — в `<config_dir>/.credentials.json` нет OAuth-записи.
 
-Кеш последнего удачного ответа лежит в `$XDG_RUNTIME_DIR/ai-usage/claude-usage-<id>.json`. Там же хранится момент следующей попытки: удалить файл — значит разрешить запрос немедленно.
+Кеш последнего удачного ответа лежит в `$XDG_STATE_HOME/ai-usage/claude-usage-<id>.json` (обычно `~/.local/state/ai-usage/`) и переживает перезагрузку. Там же хранится момент следующей попытки: удалить файл — значит разрешить запрос немедленно.
 
 Проверить, что происходит на самом деле, можно так (токен в вывод не попадает):
 

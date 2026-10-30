@@ -33,13 +33,15 @@ pub fn run() -> Result<()> {
         println!("  2) Codex");
         println!("  3) DeepSeek API");
         println!("  4) Google Antigravity (agy)");
-        println!("  5) Завершить");
-        match prompt("Выбор", Some("5"))?.as_str() {
+        println!("  5) OpenRouter API");
+        println!("  6) Завершить");
+        match prompt("Выбор", Some("6"))?.as_str() {
             "1" => add_claude(&mut config)?,
             "2" => add_codex(&mut config)?,
             "3" => add_deepseek(&mut config)?,
             "4" => add_antigravity(&mut config)?,
-            "5" | "" => break,
+            "5" => add_openrouter(&mut config)?,
+            "6" | "" => break,
             _ => println!("Неизвестный пункт."),
         }
     }
@@ -172,6 +174,33 @@ fn add_deepseek(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+fn add_openrouter(config: &mut Config) -> Result<()> {
+    println!("\nOpenRouter API");
+    let id = prompt("ID аккаунта", Some("openrouter-main"))?;
+    crate::util::validate_id(&id)?;
+    let name = prompt("Название в виджете", Some("OpenRouter"))?;
+    let key = rpassword::prompt_password("API key (ввод скрыт): ")?;
+    if key.is_empty() {
+        bail!("API key не может быть пустым");
+    }
+
+    let env_name = crate::util::env_name_for_provider_and_id("openrouter", &id);
+    save_secret(&env_name, &key)?;
+
+    config::upsert_account(
+        config,
+        AccountConfig::Openrouter {
+            id,
+            name,
+            api_key_env: env_name,
+            base_url: "https://openrouter.ai/api/v1".to_owned(),
+        },
+    );
+    config::save(config)?;
+    println!("Ключ сохранён в secrets.env с правами 600.");
+    Ok(())
+}
+
 fn add_antigravity(config: &mut Config) -> Result<()> {
     println!("\nGoogle Antigravity (agy)");
     let id = prompt("ID аккаунта", Some("agy-main"))?;
@@ -183,6 +212,7 @@ fn add_antigravity(config: &mut Config) -> Result<()> {
         AccountConfig::Antigravity {
             id: id.clone(),
             name,
+            token_file: None,
         },
     );
     config::save(config)?;

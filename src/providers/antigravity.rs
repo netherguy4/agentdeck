@@ -1,11 +1,63 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{AccountState, QuotaWindow, FIVE_HOUR_MINS, WEEKLY_MINS};
+
+/// Минимальный интервал между прямыми сетевыми запросами к Google API квоты (2 минуты),
+/// чтобы не создавать лишней нагрузки при быстром тике демона или частых `ai-usage once`.
+pub const MIN_POLL_SECONDS: i64 = 120;
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcpToken {
+    pub client_id: String,
+    pub client_secret: String,
+    pub refresh_token: String,
+    #[serde(default = "default_token_uri")]
+    pub token_uri: String,
+    #[serde(default = "default_project_id")]
+    pub project_id: String,
+}
+
+fn default_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_owned()
+}
+
+fn default_project_id() -> String {
+    "aicode-consumers".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotaSummaryResponse {
+    #[serde(default)]
+    pub groups: Vec<QuotaGroup>,
+    #[serde(default)]
+    pub buckets: Vec<QuotaBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotaGroup {
+    #[serde(rename = "displayName")]
+    #[allow(dead_code)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub buckets: Vec<QuotaBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuotaBucket {
+    #[serde(rename = "bucketId")]
+    pub bucket_id: Option<String>,
+    #[serde(rename = "remainingFraction")]
+    pub remaining_fraction: Option<f64>,
+    #[serde(rename = "resetTime")]
+    pub reset_time: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct StatusPayload {
@@ -39,17 +91,17 @@ struct QuotaInfo {
     reset_in_seconds: Option<i64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Snapshot {
-    email: Option<String>,
-    plan: Option<String>,
-    model: Option<String>,
-    windows: Vec<QuotaWindow>,
-    updated_at: i64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    pub model: Option<String>,
+    pub windows: Vec<QuotaWindow>,
+    pub updated_at: i64,
 }
 
-/// Снимок живёт вне tmpfs: `agy` — единственный источник этих цифр, и после
-/// перезагрузки восстановить их некому, пока пользователь снова не откроет CLI.
+/// Снимок живёт вне tmpfs: `agy` / Google API обновляют его периодически, и после
+/// перезагрузки восстановить квоту без этого файла невозможно до первого запроса.
 pub fn snapshot_path(account_id: &str) -> PathBuf {
     crate::util::persistent_state_dir().join(format!("antigravity-usage-{account_id}.json"))
 }
@@ -97,41 +149,434 @@ pub fn remove_hook_script(account_id: &str) -> Result<bool> {
 pub fn status_line_from_payload(account_id: &str, raw: &str) -> Result<String> {
     crate::util::validate_id(account_id)?;
     let now = crate::util::unix_now();
-    let Some(snapshot) = snapshot_from_payload(raw, now)? else {
+    let Some(mut snapshot) = snapshot_from_payload(raw, now)? else {
         return Ok("AI Usage · ожидание квоты".to_owned());
     };
 
     let line = status_line_text(&snapshot);
     let path = snapshot_path(account_id);
+    let prev: Option<Snapshot> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    drop_argon_view_of_shared_windows(&mut snapshot);
+    carry_missing_windows(&mut snapshot, prev.as_ref(), now);
     let bytes = serde_json::to_vec_pretty(&snapshot)?;
     crate::util::atomic_write_mode(&path, &bytes, Some(0o600))?;
     Ok(line)
 }
 
-pub async fn fetch(id: &str, name: &str, stale_seconds: i64) -> Result<AccountState> {
+/// With Argon active, agy reports gemini-5h/gemini-weekly as untouched windows that
+/// restart on every call, while the quota API shows the real shared Flash pool
+/// (2026-10-16). Argon spends only its own bucket, so its view of them is dropped.
+fn drop_argon_view_of_shared_windows(snapshot: &mut Snapshot) {
+    let argon = snapshot
+        .model
+        .as_deref()
+        .is_some_and(|m| m.to_ascii_lowercase().contains("argon"));
+    if argon {
+        snapshot
+            .windows
+            .retain(|w| !matches!(w.key.as_str(), "gemini-5h" | "gemini-weekly"));
+    }
+}
+
+/// Ищет файл `acp_token.json` в системе.
+///
+/// Порядок поиска:
+/// 1. Явно указанный в конфигурации путь `token_file`.
+/// 2. T3 Code: `~/.t3/userdata/providers/antigravity/*/antigravity-acp/acp_token.json`.
+/// 3. Gemini harness: `~/.gemini/antigravity-acp/acp_token.json`.
+/// 4. Стандартный каталог: `~/.config/antigravity/acp_token.json`.
+pub fn find_token_file(custom: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = custom {
+        let expanded = crate::util::expand_home(path);
+        if expanded.is_file() {
+            return Some(expanded);
+        }
+        return None;
+    }
+
+    let home = dirs::home_dir()?;
+
+    // 1. T3 Code: ~/.t3/userdata/providers/antigravity/*/antigravity-acp/acp_token.json
+    let t3_dir = home.join(".t3/userdata/providers/antigravity");
+    if let Ok(entries) = fs::read_dir(t3_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("antigravity-acp").join("acp_token.json");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // 2. Gemini CLI: ~/.gemini/antigravity-acp/acp_token.json
+    let gemini_candidate = home.join(".gemini/antigravity-acp/acp_token.json");
+    if gemini_candidate.is_file() {
+        return Some(gemini_candidate);
+    }
+
+    // 3. Fallback: ~/.config/antigravity/acp_token.json
+    let config_candidate = home.join(".config/antigravity/acp_token.json");
+    if config_candidate.is_file() {
+        return Some(config_candidate);
+    }
+
+    None
+}
+
+pub fn read_token_file(path: &Path) -> Result<AcpToken> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Не удалось прочитать токен {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("Некорректный JSON токена в {}", path.display()))
+}
+
+async fn refresh_access_token(client: &reqwest::Client, acp: &AcpToken) -> Result<String> {
+    let params = [
+        ("client_id", acp.client_id.as_str()),
+        ("client_secret", acp.client_secret.as_str()),
+        ("refresh_token", acp.refresh_token.as_str()),
+        ("grant_type", "refresh_token"),
+    ];
+    let response = client
+        .post(&acp.token_uri)
+        .form(&params)
+        .send()
+        .await
+        .context("Не удалось связаться с Google OAuth сервером")?;
+
+    // Тело ответа OAuth не выводим: ошибка уходит в состояние, журнал и UI.
+    if !response.status().is_success() {
+        bail!(
+            "Ошибка обновления Google OAuth токена (HTTP {})",
+            response.status()
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct OauthResponse {
+        access_token: String,
+    }
+
+    let parsed: OauthResponse = response
+        .json()
+        .await
+        .context("Некорректный JSON ответа Google OAuth")?;
+    Ok(parsed.access_token)
+}
+
+async fn fetch_user_email(client: &reqwest::Client, access_token: &str) -> Option<String> {
+    let response = client
+        .get("https://www.googleapis.com/oauth2/v1/userinfo")
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct UserInfo {
+        email: Option<String>,
+    }
+    response.json::<UserInfo>().await.ok().and_then(|u| u.email)
+}
+
+async fn request_quota_summary(
+    client: &reqwest::Client,
+    access_token: &str,
+    project_id: &str,
+) -> Result<QuotaSummaryResponse> {
+    // The daily endpoint answers successfully but omits the Gemini buckets (checked
+    // 2026-10-16), so production goes first and buckets from both are merged.
+    let endpoints = [
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    ];
+
+    let mut merged: Option<QuotaSummaryResponse> = None;
+    let mut last_err = None;
+    for endpoint in endpoints {
+        let resp = client
+            .post(endpoint)
+            .bearer_auth(access_token)
+            .header("User-Agent", "antigravity/1.1.9")
+            .json(&serde_json::json!({ "project": project_id }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(res) if res.status().is_success() => {
+                match res.json::<QuotaSummaryResponse>().await {
+                    Ok(parsed) => merged = Some(merge_quota_responses(merged, parsed)),
+                    Err(_) => last_err = Some("Некорректный JSON ответа квоты Google".to_owned()),
+                }
+            }
+            Ok(res) => {
+                last_err = Some(format!("HTTP {}", res.status()));
+            }
+            Err(e) => {
+                last_err = Some(format!("Сетевая ошибка: {e}"));
+            }
+        }
+    }
+
+    if let Some(merged) = merged {
+        return Ok(merged);
+    }
+    bail!(last_err.unwrap_or_else(|| "Не удалось получить квоту от Google API".to_owned()))
+}
+
+/// Flattens both responses; the earlier (production) bucket wins on a duplicate id.
+fn merge_quota_responses(
+    first: Option<QuotaSummaryResponse>,
+    next: QuotaSummaryResponse,
+) -> QuotaSummaryResponse {
+    let flatten = |r: QuotaSummaryResponse| {
+        r.buckets
+            .into_iter()
+            .chain(r.groups.into_iter().flat_map(|g| g.buckets))
+            .collect::<Vec<_>>()
+    };
+    let mut buckets = first.map(flatten).unwrap_or_default();
+    for bucket in flatten(next) {
+        if !buckets.iter().any(|b| b.bucket_id == bucket.bucket_id) {
+            buckets.push(bucket);
+        }
+    }
+    QuotaSummaryResponse {
+        groups: Vec::new(),
+        buckets,
+    }
+}
+
+/// Keeps windows that only one source reports (the Argon bucket comes only from the
+/// agy hook) until they reset, so a live poll and a hook write no longer erase each other.
+// ponytail: a carried window keeps its last value until reset or the next agy hook;
+// drop this once the quota API returns every bucket.
+fn carry_missing_windows(snapshot: &mut Snapshot, prev: Option<&Snapshot>, now: i64) {
+    let Some(prev) = prev else { return };
+    let active = active_family(snapshot.model.as_deref());
+    for window in &prev.windows {
+        let fresh = window.resets_at.is_some_and(|reset| reset > now);
+        if fresh && !snapshot.windows.iter().any(|w| w.key == window.key) {
+            snapshot.windows.push(window.clone());
+        }
+    }
+    sort_windows(&mut snapshot.windows, active);
+}
+
+pub fn snapshot_from_quota_response(
+    response: QuotaSummaryResponse,
+    email: Option<String>,
+    plan: Option<String>,
+    model: Option<String>,
+    now: i64,
+) -> Option<Snapshot> {
+    let mut quota_map: BTreeMap<String, QuotaInfo> = BTreeMap::new();
+    for bucket in response
+        .buckets
+        .into_iter()
+        .chain(response.groups.into_iter().flat_map(|g| g.buckets))
+    {
+        if let Some(id) = bucket.bucket_id {
+            quota_map.insert(
+                id,
+                QuotaInfo {
+                    remaining_fraction: bucket.remaining_fraction,
+                    reset_time: bucket.reset_time,
+                    reset_in_seconds: None,
+                },
+            );
+        }
+    }
+
+    let active = active_family(model.as_deref());
+    let mut windows: Vec<QuotaWindow> = quota_map
+        .into_iter()
+        .filter_map(|(key, quota)| quota_window(&key, quota, now, active))
+        .collect();
+
+    if windows.is_empty() {
+        return None;
+    }
+
+    sort_windows(&mut windows, active);
+
+    Some(Snapshot {
+        email: email.filter(|value| !value.trim().is_empty()),
+        plan: plan.filter(|value| !value.trim().is_empty()),
+        model,
+        windows,
+        updated_at: now,
+    })
+}
+
+pub async fn live_quota(token_file: &Path, prev: Option<&Snapshot>) -> Result<Snapshot> {
+    let acp = read_token_file(token_file)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .context("Не удалось инициализировать HTTP клиент")?;
+
+    let access_token = refresh_access_token(&client, &acp).await?;
+    let email = match fetch_user_email(&client, &access_token).await {
+        Some(email) => Some(email),
+        None => prev.and_then(|p| p.email.clone()),
+    };
+
+    let quota_res = request_quota_summary(&client, &access_token, &acp.project_id).await?;
+    let now = crate::util::unix_now();
+    let plan = prev
+        .and_then(|p| p.plan.clone())
+        .or_else(|| Some("Google AI Pro".to_owned()));
+    let model = detect_model(prev);
+
+    let mut snapshot = snapshot_from_quota_response(quota_res, email, plan, model, now)
+        .context("Google API не вернул бакетов квоты")?;
+    carry_missing_windows(&mut snapshot, prev, now);
+    Ok(snapshot)
+}
+
+fn detect_model(prev: Option<&Snapshot>) -> Option<String> {
+    if let Some(model) = prev.and_then(|p| p.model.clone()) {
+        return Some(model);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let settings_path = home.join(".gemini/antigravity-cli/settings.json");
+        if let Ok(raw) = fs::read_to_string(settings_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(m) = val.get("model").and_then(|m| m.as_str()) {
+                    if !m.trim().is_empty() {
+                        return Some(m.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    Some("Gemini 3.8 Flash (High)".to_owned())
+}
+
+pub async fn fetch(
+    id: &str,
+    name: &str,
+    token_file: Option<&Path>,
+    stale_seconds: i64,
+) -> Result<AccountState> {
     let path = snapshot_path(id);
     adopt_legacy_snapshot(id, &path);
-    if !path.exists() {
+
+    let prev_snapshot: Option<Snapshot> = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+    } else {
+        None
+    };
+
+    let now = crate::util::unix_now();
+    let mut last_error = None;
+    let mut current_snapshot = prev_snapshot;
+
+    if let Some(token_path) = find_token_file(token_file) {
+        let should_poll = quota_poll_due(current_snapshot.as_ref(), now);
+
+        if should_poll {
+            match live_quota(&token_path, current_snapshot.as_ref()).await {
+                Ok(new_snapshot) => {
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&new_snapshot) {
+                        let _ = crate::util::atomic_write_mode(&path, &bytes, Some(0o600));
+                    }
+                    current_snapshot = Some(new_snapshot);
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    let Some(snapshot) = current_snapshot else {
+        if let Some(err) = last_error {
+            return Ok(AccountState::error(
+                id,
+                name,
+                "antigravity",
+                format!("Ошибка Google API: {err}"),
+            ));
+        }
         let mut state = AccountState::error(
             id,
             name,
             "antigravity",
-            "Открой agy и подключи status-line hook",
+            "Не найден токен (acp_token.json) и нет данных от agy status-line hook",
         );
         state.status = "waiting".to_owned();
         return Ok(state);
-    }
+    };
 
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
-    let snapshot: Snapshot = serde_json::from_str(&raw)
-        .with_context(|| format!("Некорректный snapshot {}", path.display()))?;
+    Ok(state_from_snapshot(
+        id,
+        name,
+        snapshot,
+        last_error,
+        crate::util::unix_now(),
+        stale_seconds,
+    ))
+}
 
-    let now = crate::util::unix_now();
+fn quota_poll_due(snapshot: Option<&Snapshot>, now: i64) -> bool {
+    snapshot
+        .is_none_or(|s| now < s.updated_at || now.saturating_sub(s.updated_at) >= MIN_POLL_SECONDS)
+}
+
+/// Неудачный живой опрос сразу помечает кэш устаревшим, сохраняя последнюю
+/// удачную квоту и её `updated_at`. Без опроса (только hook) — прежний
+/// порог по возрасту снимка.
+fn state_from_snapshot(
+    id: &str,
+    name: &str,
+    snapshot: Snapshot,
+    poll_error: Option<String>,
+    now: i64,
+    stale_seconds: i64,
+) -> AccountState {
     let age = now.saturating_sub(snapshot.updated_at).max(0);
-    let stale = age > stale_threshold(&snapshot.windows, stale_seconds);
+    let stale = poll_error.is_some()
+        || snapshot.updated_at > now
+        || age > stale_threshold(&snapshot.windows, stale_seconds);
 
-    Ok(AccountState {
+    let error = if let Some(err) = poll_error {
+        Some(format!(
+            "Ошибка Google API: {err}; данные от {} назад",
+            format_age(age)
+        ))
+    } else if snapshot.updated_at > now {
+        Some("Системные часы изменились; ожидание свежей квоты Google".to_owned())
+    } else if stale {
+        Some(format!(
+            "agy не обновлял квоту {}; открой agy или выполни /usage",
+            format_age(age)
+        ))
+    } else {
+        None
+    };
+
+    // The panel always represents Gemini; CLI snapshots still follow the active model.
+    let mut windows = snapshot.windows;
+    for window in &mut windows {
+        let family = family_for_key(&window.key);
+        if family == "gemini" {
+            window.scope = None;
+        } else if let Some(scope) = scope_for_family(&family) {
+            window.scope = Some(scope);
+        }
+    }
+    sort_windows(&mut windows, Some("gemini"));
+
+    AccountState {
         id: id.to_owned(),
         name: name.to_owned(),
         provider: "antigravity".to_owned(),
@@ -139,23 +584,14 @@ pub async fn fetch(id: &str, name: &str, stale_seconds: i64) -> Result<AccountSt
         plan: snapshot.plan.as_deref().map(crate::util::humanize_plan),
         email: snapshot.email,
         model: snapshot.model,
-        windows: snapshot.windows,
+        windows,
         balances: Vec::new(),
-        error: stale.then(|| {
-            format!(
-                "agy не обновлял квоту {}; открой agy или выполни /usage",
-                format_age(age)
-            )
-        }),
+        error,
         updated_at: snapshot.updated_at,
-    })
+    }
 }
 
 /// Переносит снимок из tmpfs, если он остался там от прошлой версии.
-///
-/// Без этого обновление на живой сессии стоило бы пользователю ещё одного
-/// «открой agy», хотя данные никуда не делись. Молча: снимок восстановим, и
-/// срывать из-за него обновление аккаунта незачем.
 fn adopt_legacy_snapshot(account_id: &str, path: &PathBuf) {
     if path.exists() {
         return;
@@ -173,16 +609,6 @@ fn adopt_legacy_snapshot(account_id: &str, path: &PathBuf) {
 }
 
 /// Через сколько снимок `agy` перестаёт что-либо значить.
-///
-/// Глобальный `stale_seconds` рассчитан на провайдеров, которых демон
-/// опрашивает сам: там пауза в опросе и правда означает «цифры могли уйти».
-/// С `agy` иначе — закрытый CLI квоту не тратит, а открытый сам дёргает hook,
-/// поэтому снимок остаётся точным всё окно, которое описывает. Порог в 15
-/// минут висел бы предупреждением почти всегда, ничего при этом не сообщая.
-///
-/// Отсчитываем от самого короткого окна: когда оно прожито целиком, данные
-/// заведомо описывают уже прошедший период. Глобальная настройка остаётся
-/// нижней границей, чтобы её нельзя было случайно ослабить.
 fn stale_threshold(windows: &[QuotaWindow], stale_seconds: i64) -> i64 {
     windows
         .iter()
@@ -204,11 +630,6 @@ fn snapshot_from_payload(raw: &str, now: i64) -> Result<Option<Snapshot>> {
             .or_else(|| model.id.filter(|value| !value.trim().is_empty()))
     });
 
-    // Квота Antigravity — это семейства моделей, у каждого своё пятичасовое и
-    // недельное окно. Активное семейство целиком считается общим лимитом
-    // аккаунта: исчерпанное недельное окно блокирует работу так же, как
-    // пятичасовое. Чужие семейства остаются scoped — там достаточно сменить
-    // модель, и панель не обязана падать в 0%.
     let active = active_family(model.as_deref());
     let mut windows: Vec<QuotaWindow> = payload
         .quota
@@ -285,11 +706,6 @@ fn duration_for_key(key: &str) -> Option<u64> {
 }
 
 /// Семейство моделей, к которому привязан bucket.
-///
-/// `gemini-5h` и `gemini-weekly` — это одно семейство с двумя окнами, и панели
-/// важно различать именно семейства: исчерпанное окно активного блокирует
-/// работу, чужого — нет. Ключ с незнакомым окончанием остаётся отдельным
-/// семейством целиком, поэтому будущие bucket-ы не склеиваются наугад.
 fn family_for_key(key: &str) -> String {
     let normalized = key.to_ascii_lowercase();
     for suffix in WINDOW_SUFFIXES {
@@ -306,17 +722,11 @@ fn scope_for_family(family: &str) -> Option<String> {
     match family {
         "gemini" => Some("Gemini".to_owned()),
         "3p" | "third-party" | "third_party" => Some("Сторонние модели".to_owned()),
-        // Незнакомое семейство считаем общим лимитом: пропустить блокирующее
-        // окно хуже, чем лишний раз показать 0%.
         _ => None,
     }
 }
 
 /// Семейство, которым `agy` пользуется прямо сейчас.
-///
-/// Antigravity гоняет и Gemini, и сторонние модели через один аккаунт, но
-/// квоту тратит только активная. Если модель неизвестна, ни одно семейство не
-/// объявляется общим — панель тогда покажет худшее окно, а не случайное.
 fn active_family(model: Option<&str>) -> Option<&'static str> {
     let model = model?.trim().to_ascii_lowercase();
     if model.is_empty() {
@@ -335,7 +745,6 @@ fn label_for_key(key: &str) -> String {
     match (scope_for_family(&family), duration) {
         (Some(scope), _) => format!("{scope} · {window}"),
         (None, Some(_)) => format!("{} · {window}", title_case(&family)),
-        // Ключ без узнаваемого окна показываем как есть: терять его нельзя.
         (None, None) => title_case(key),
     }
 }
@@ -374,8 +783,6 @@ fn family_priority(key: &str, active: Option<&str>) -> u8 {
 }
 
 fn status_line_text(snapshot: &Snapshot) -> String {
-    // Худшее из общих окон, а не первое: запас в пятичасовом окне ничего не
-    // значит, когда недельное того же семейства уже исчерпано.
     let general = snapshot
         .windows
         .iter()
@@ -398,10 +805,7 @@ fn status_line_text(snapshot: &Snapshot) -> String {
 }
 
 /// Минимальный разбор RFC 3339 в unix-время.
-///
-/// Нужен только как запасной путь для `reset_time`, поэтому тянуть ради него
-/// `chrono` в зависимости не стоит.
-fn parse_rfc3339(value: &str) -> Option<i64> {
+pub(crate) fn parse_rfc3339(value: &str) -> Option<i64> {
     let (date, rest) = value.trim().split_once(['T', 't'])?;
     let (time, offset) = split_offset(rest)?;
 
@@ -465,9 +869,6 @@ fn format_age(seconds: i64) -> String {
 mod tests {
     use super::*;
 
-    /// Живой payload `agy` 1.1.8, снятый на Google AI Pro 29 июля 2026 года.
-    /// Email заменён; остальное — как приходит из CLI, включая четыре bucket-а:
-    /// два семейства моделей по два окна каждое.
     const SAMPLE: &str = r#"{
       "cwd": "/tmp",
       "model": {
@@ -504,8 +905,6 @@ mod tests {
       "email": "developer@example.com"
     }"#;
 
-    /// `agy` — единственный источник этих цифр. Снимок на tmpfs означал бы
-    /// «открой agy» после каждой перезагрузки, хотя квота никуда не делась.
     #[test]
     fn the_snapshot_does_not_live_on_tmpfs() {
         let path = snapshot_path("agy-main");
@@ -569,9 +968,6 @@ mod tests {
         );
     }
 
-    /// Главный смысл правки: у активного семейства общими становятся **оба**
-    /// окна. Иначе исчерпанный недельный лимит не опустит число в панели —
-    /// `panelWindow()` просто не увидит scoped-окно.
     #[test]
     fn every_window_of_the_active_family_counts_as_a_general_limit() {
         let snapshot = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
@@ -599,8 +995,39 @@ mod tests {
         );
     }
 
-    /// Без активной модели нельзя объявлять общим случайный bucket: панель
-    /// должна показать худшее окно, а не первое попавшееся.
+    #[test]
+    fn the_panel_keeps_gemini_primary_when_the_active_model_is_claude() {
+        let raw = SAMPLE.replace("Gemini 3.6 Flash (High)", "Claude Opus 5.5");
+        let snapshot = snapshot_from_payload(&raw, 1_000).unwrap().unwrap();
+        assert_eq!(snapshot.windows[0].key, "3p-5h");
+        assert_eq!(status_line_text(&snapshot), "AI Usage · 100%");
+        for poll_error in [None, Some("HTTP 503".to_owned())] {
+            let state = state_from_snapshot("agy", "Agy", snapshot.clone(), poll_error, 1_001, 900);
+            assert_eq!(state.windows[0].key, "gemini-5h");
+            assert_eq!(state.windows[0].scope, None);
+            assert_eq!(state.windows[0].remaining_percent, 42.0);
+            assert!(state
+                .windows
+                .iter()
+                .filter(|w| w.key.starts_with("3p-"))
+                .all(|w| w.scope.as_deref() == Some("Сторонние модели")));
+            assert_eq!(state.updated_at, snapshot.updated_at);
+        }
+    }
+
+    #[test]
+    fn a_clock_step_back_repolls_instead_of_treating_future_data_as_fresh() {
+        let snapshot = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
+        assert!(quota_poll_due(Some(&snapshot), 900));
+        assert!(!quota_poll_due(Some(&snapshot), 1_000));
+        assert!(!quota_poll_due(Some(&snapshot), 1_119));
+        assert!(quota_poll_due(Some(&snapshot), 1_120));
+        assert!(quota_poll_due(None, 900));
+        let state = state_from_snapshot("agy", "Agy", snapshot, None, 900, 900);
+        assert_eq!(state.status, "stale");
+        assert!(state.error.unwrap().contains("Системные часы изменились"));
+    }
+
     #[test]
     fn an_unknown_active_model_leaves_every_family_scoped() {
         let raw = SAMPLE.replace(r#""display_name": "Gemini 3.6 Flash (High)","#, "");
@@ -620,8 +1047,6 @@ mod tests {
         let future = window(&snapshot, "future-pool");
         assert_eq!(future.label, "Future Pool");
         assert_eq!(future.duration_mins, None);
-        // Незнакомое семейство считаем общим: пропустить блокирующий лимит
-        // хуже, чем лишний раз показать 0%.
         assert_eq!(future.scope, None);
     }
 
@@ -646,7 +1071,6 @@ mod tests {
     fn parses_rfc3339_with_and_without_offsets() {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_rfc3339("2026-07-29T19:05:06Z"), Some(1_785_351_906));
-        // Високосный год и смещение часового пояса.
         assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(
             parse_rfc3339("2026-07-29T22:05:06+03:00"),
@@ -660,12 +1084,9 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
     }
 
-    /// Пятнадцать минут без `agy` — не повод для предупреждения: закрытый CLI
-    /// квоту не тратит, и снимок всё ещё точен.
     #[test]
     fn a_short_pause_in_agy_is_not_staleness() {
         let snapshot = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
-        // Самое короткое окно — пятичасовое.
         assert_eq!(stale_threshold(&snapshot.windows, 900), 5 * 3_600);
     }
 
@@ -676,14 +1097,49 @@ mod tests {
         assert_eq!(stale_threshold(&snapshot.windows, 900), 900);
     }
 
-    /// Глобальная настройка остаётся нижней границей: ослабить её окном нельзя.
     #[test]
     fn the_global_threshold_is_a_floor() {
         let snapshot = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
         assert_eq!(stale_threshold(&snapshot.windows, 86_400), 86_400);
     }
 
-    /// Строка внутри `agy` обязана показывать то же, что и панель.
+    #[test]
+    fn a_failed_live_poll_marks_a_recent_snapshot_stale_until_recovery() {
+        let cached = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
+
+        let failed = state_from_snapshot(
+            "agy",
+            "Agy",
+            cached.clone(),
+            Some("HTTP 503 Service Unavailable".to_owned()),
+            1_300,
+            900,
+        );
+        assert_eq!(failed.status, "stale");
+        assert_eq!(failed.updated_at, 1_000);
+        let quota = |windows: &[QuotaWindow]| {
+            windows
+                .iter()
+                .map(|window| (window.key.clone(), window.remaining_percent))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(quota(&failed.windows), quota(&cached.windows));
+        let error = failed.error.unwrap();
+        assert!(error.contains("HTTP 503"), "{error}");
+
+        let recovered = snapshot_from_payload(SAMPLE, 1_400).unwrap().unwrap();
+        let ok = state_from_snapshot("agy", "Agy", recovered, None, 1_400, 900);
+        assert_eq!((ok.status.as_str(), ok.error), ("ok", None));
+        assert_eq!(ok.updated_at, 1_400);
+
+        // Hook-only accounts keep the age-based grace window.
+        let hook = state_from_snapshot("agy", "Agy", cached.clone(), None, 1_000 + 3_600, 900);
+        assert_eq!(hook.status, "ok");
+        let hook = state_from_snapshot("agy", "Agy", cached, None, 1_001 + 5 * 3_600, 900);
+        assert_eq!(hook.status, "stale");
+        assert!(hook.error.unwrap().starts_with("agy не обновлял квоту"));
+    }
+
     #[test]
     fn the_status_line_reports_the_worst_general_window() {
         let snapshot = snapshot_from_payload(SAMPLE, 1_000).unwrap().unwrap();
@@ -727,5 +1183,201 @@ mod tests {
             reset_in_seconds: Some(10),
         };
         assert!(quota_window("bad", quota, 1_000, None).is_none());
+    }
+
+    #[test]
+    fn parses_google_quota_summary_response_into_windows() {
+        let raw = r#"{
+          "buckets": [
+            {
+              "bucketId": "3p-5h",
+              "remainingFraction": 1.0,
+              "resetTime": "2026-07-29T19:05:06Z"
+            },
+            {
+              "bucketId": "3p-weekly",
+              "remainingFraction": 0.85,
+              "resetTime": "2026-08-05T14:05:06Z"
+            },
+            {
+              "bucketId": "gemini-5h",
+              "remainingFraction": 0.42,
+              "resetTime": "2026-07-29T19:05:06Z"
+            },
+            {
+              "bucketId": "gemini-weekly",
+              "remainingFraction": 0.9378,
+              "resetTime": "2026-08-05T14:05:06Z"
+            }
+          ]
+        }"#;
+        let resp: QuotaSummaryResponse = serde_json::from_str(raw).unwrap();
+        let snapshot = snapshot_from_quota_response(
+            resp,
+            Some("test@example.com".to_owned()),
+            Some("Google AI Pro".to_owned()),
+            Some("Gemini 3.8 Flash (High)".to_owned()),
+            1_700_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.email.as_deref(), Some("test@example.com"));
+        assert_eq!(snapshot.plan.as_deref(), Some("Google AI Pro"));
+        assert_eq!(snapshot.model.as_deref(), Some("Gemini 3.8 Flash (High)"));
+        assert_eq!(snapshot.windows.len(), 4);
+
+        let g5 = window(&snapshot, "gemini-5h");
+        assert_eq!(g5.remaining_percent.round(), 42.0);
+        assert_eq!(g5.used_percent.round(), 58.0);
+        assert_eq!(g5.scope, None); // active family is Gemini
+
+        let p3 = window(&snapshot, "3p-weekly");
+        assert_eq!(p3.remaining_percent.round(), 85.0);
+        assert_eq!(p3.scope.as_deref(), Some("Сторонние модели"));
+    }
+
+    #[test]
+    fn parses_grouped_google_quota_summary() {
+        let raw = r#"{
+          "groups": [
+            {
+              "displayName": "Internal Group",
+              "buckets": [
+                {
+                  "bucketId": "gemini-5h",
+                  "remainingFraction": 0.77,
+                  "resetTime": "2026-07-29T19:05:06Z"
+                }
+              ]
+            }
+          ]
+        }"#;
+        let resp: QuotaSummaryResponse = serde_json::from_str(raw).unwrap();
+        let snapshot = snapshot_from_quota_response(resp, None, None, None, 1_700_000_000).unwrap();
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].remaining_percent.round(), 77.0);
+    }
+
+    #[test]
+    fn production_buckets_win_and_daily_only_buckets_are_added() {
+        let parse = |raw: &str| serde_json::from_str::<QuotaSummaryResponse>(raw).unwrap();
+        let prod = parse(
+            r#"{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.5},{"bucketId":"3p-5h","remainingFraction":1}]}"#,
+        );
+        let daily = parse(
+            r#"{"groups":[{"buckets":[{"bucketId":"3p-5h","remainingFraction":0.1},{"bucketId":"x-weekly","remainingFraction":0.9}]}]}"#,
+        );
+        let merged = merge_quota_responses(Some(prod), daily);
+        let ids: Vec<_> = merged
+            .buckets
+            .iter()
+            .map(|b| (b.bucket_id.clone().unwrap(), b.remaining_fraction.unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("gemini-weekly".into(), 0.5),
+                ("3p-5h".into(), 1.0),
+                ("x-weekly".into(), 0.9)
+            ]
+        );
+    }
+
+    #[test]
+    fn argon_hook_keeps_the_shared_gemini_pool_from_the_last_poll() {
+        let now = 1_000;
+        let polled = Snapshot {
+            email: None,
+            plan: None,
+            model: Some("Gemini 3.8 Flash (High)".into()),
+            updated_at: now - 60,
+            windows: vec![
+                QuotaWindow::new(
+                    "gemini-weekly",
+                    "w",
+                    50.0,
+                    Some(WEEKLY_MINS),
+                    Some(now + 3600),
+                ),
+                QuotaWindow::new("old-weekly", "o", 10.0, Some(WEEKLY_MINS), Some(now - 1)),
+            ],
+        };
+        let mut hook = Snapshot {
+            email: None,
+            plan: None,
+            model: Some("Gemini 4 Argon (High)".into()),
+            updated_at: now,
+            windows: vec![
+                QuotaWindow::new(
+                    "gemini-weekly",
+                    "w",
+                    0.0,
+                    Some(WEEKLY_MINS),
+                    Some(now + 604_800),
+                ),
+                QuotaWindow::new(
+                    "gemini-argon-wtu-weekly",
+                    "a",
+                    7.2,
+                    Some(WEEKLY_MINS),
+                    Some(now + 600_000),
+                ),
+            ],
+        };
+        drop_argon_view_of_shared_windows(&mut hook);
+        carry_missing_windows(&mut hook, Some(&polled), now);
+        let used = |k: &str| {
+            hook.windows
+                .iter()
+                .find(|w| w.key == k)
+                .map(|w| w.used_percent)
+        };
+        assert_eq!(used("gemini-weekly"), Some(50.0));
+        assert_eq!(used("gemini-argon-wtu-weekly"), Some(7.2));
+        assert_eq!(used("old-weekly"), None, "an expired window is not carried");
+    }
+
+    #[test]
+    fn reads_acp_token_file_format() {
+        let temp = std::env::temp_dir().join(format!(
+            "ai-usage-acp-test-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let token_json = r#"{
+          "client_id": "test-client-id.apps.googleusercontent.com",
+          "client_secret": "test-secret",
+          "refresh_token": "1//test-refresh-token",
+          "token_uri": "https://oauth2.googleapis.com/token",
+          "project_id": "aicode-consumers"
+        }"#;
+        fs::write(&temp, token_json).unwrap();
+
+        let parsed = read_token_file(&temp).unwrap();
+        assert_eq!(
+            parsed.client_id,
+            "test-client-id.apps.googleusercontent.com"
+        );
+        assert_eq!(parsed.client_secret, "test-secret");
+        assert_eq!(parsed.refresh_token, "1//test-refresh-token");
+        assert_eq!(parsed.project_id, "aicode-consumers");
+
+        let _ = fs::remove_file(temp);
+    }
+
+    #[test]
+    fn find_token_file_respects_custom_path() {
+        let temp = std::env::temp_dir().join(format!(
+            "ai-usage-custom-acp-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&temp, "{}").unwrap();
+
+        assert_eq!(find_token_file(Some(&temp)), Some(temp.clone()));
+        let missing = temp.join("missing.json");
+        assert_eq!(find_token_file(Some(&missing)), None);
+
+        let _ = fs::remove_file(temp);
     }
 }

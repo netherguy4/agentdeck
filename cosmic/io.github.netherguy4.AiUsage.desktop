@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AI Usage
+Name[ru]=Квоты AI
+Exec=ai-usage-cosmic
+Icon=utilities-system-monitor-symbolic
+NoDisplay=true
+X-CosmicApplet=true

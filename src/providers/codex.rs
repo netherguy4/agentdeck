@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -11,12 +11,45 @@ use tokio::time::timeout;
 
 use crate::model::{AccountState, QuotaWindow};
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Сколько байт stderr сохраняем для диагностики. Держим хвост, а не начало:
 /// причина падения обычно в последних строках.
 const STDERR_CAPTURE_BYTES: usize = 4096;
 
 pub async fn fetch(
+    id: &str,
+    name: &str,
+    codex_home: &Path,
+    command: &str,
+    limit_id: &str,
+) -> Result<AccountState> {
+    // Two attempts leave room for response timeouts and diagnostics within
+    // the shared 30-second provider deadline.
+    const MAX_ATTEMPTS: usize = 2;
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fetch_once(id, name, codex_home, command, limit_id).await {
+            Ok(state) => return Ok(state),
+            Err(error) => {
+                let err_msg = error.to_string();
+                let retriable = is_retriable_error(&err_msg);
+                last_error = Some(error);
+
+                if !retriable || attempt == MAX_ATTEMPTS {
+                    break;
+                }
+
+                let delay = Duration::from_millis(1000 * attempt as u64);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("Codex fetch failed")))
+}
+
+async fn fetch_once(
     id: &str,
     name: &str,
     codex_home: &Path,
@@ -35,7 +68,11 @@ pub async fn fetch(
         )
     })?;
 
-    let mut child = Command::new(&resolved)
+    let mut builder = Command::new(&resolved);
+    if let Some(dir) = interpreter_dir(Path::new(&resolved)) {
+        builder.env("PATH", prepend_path(&dir));
+    }
+    let mut child = builder
         .arg("app-server")
         .env("CODEX_HOME", &codex_home)
         .stdin(Stdio::piped())
@@ -146,6 +183,34 @@ pub async fn fetch(
         &account_message,
         &limits_response,
     )
+}
+
+/// Codex — это node-скрипт с шебангом `#!/usr/bin/env node`. Демон стартует без
+/// mise-окружения, поэтому node в PATH может не быть вовсе. Ищем интерпретатор
+/// рядом с самим codex, проходя цепочку симлинков: и у mise, и у npm-global
+/// исполняемый файл лежит в том же bin-каталоге, что и node.
+fn interpreter_dir(command: &Path) -> Option<PathBuf> {
+    let mut current = command.to_path_buf();
+    // Ограничение на длину цепочки — защита от кольца симлинков.
+    for _ in 0..16 {
+        let dir = current.parent()?;
+        if dir.join("node").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        let target = std::fs::read_link(&current).ok()?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            dir.join(target)
+        };
+    }
+    None
+}
+
+fn prepend_path(dir: &Path) -> std::ffi::OsString {
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    let dirs = std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&rest));
+    std::env::join_paths(dirs).unwrap_or(rest)
 }
 
 struct Responses {
@@ -346,12 +411,10 @@ pub fn parse_account_state(
         .get("email")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    // planType приходит как 'plus'/'pro'/'business' — приводим к тому же виду,
-    // что и тариф Claude, иначе в одной панели соседствуют разные стили.
     let account_plan = account
         .get("planType")
         .and_then(Value::as_str)
-        .map(crate::util::humanize_plan);
+        .map(plan_label);
 
     reject_rpc_error(limits_message)?;
     let result = limits_message
@@ -382,7 +445,7 @@ pub fn parse_account_state(
     let bucket_plan = bucket
         .get("planType")
         .and_then(Value::as_str)
-        .map(crate::util::humanize_plan);
+        .map(plan_label);
 
     Ok(AccountState {
         id: id.to_owned(),
@@ -397,6 +460,30 @@ pub fn parse_account_state(
         error: None,
         updated_at: crate::util::unix_now(),
     })
+}
+
+/// Имена тарифов OpenAI в протоколе и в интерфейсе — разные слова: `team`
+/// показывается как Business, а `business` — как Enterprise. Общий
+/// `humanize_plan` назвал бы тариф чужим именем, поэтому здесь таблица,
+/// снятая с `plan_type_display_name` из openai/codex
+/// (codex-rs/tui/src/status/helpers.rs). Неизвестное значение не теряем:
+/// протокол знает ещё и вариант `unknown`, а список тарифов растёт.
+fn plan_label(raw: &str) -> String {
+    match raw {
+        // Апстрим зовёт эти тарифы «Pro» и «Pro Lite»; у нас они подписаны
+        // множителем лимита — так видно, чем они отличаются, и подпись совпадает
+        // по смыслу с Max 5x/20x у Claude.
+        "pro" => "Pro 20x",
+        "prolite" => "Pro 5x",
+        "team" | "self_serve_business_usage_based" => "Business",
+        "self_serve_business_prolite" => "Business Premium",
+        "business" | "ent26" | "enterprise_cbp_usage_based" => "Enterprise",
+        "enterprise_cbp_automation" => "Enterprise (Automation)",
+        "edu_plus" => "Edu Plus",
+        "edu_pro" => "Edu Pro",
+        other => return crate::util::humanize_plan(other),
+    }
+    .to_owned()
 }
 
 fn rpc_error_text(message: &Value) -> Option<String> {
@@ -414,6 +501,31 @@ fn reject_rpc_error(message: &Value) -> Result<()> {
         bail!("Codex app-server: {text}");
     }
     Ok(())
+}
+
+pub fn is_retriable_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("authentication required") || lower.contains("unauthenticated") {
+        return false;
+    }
+    lower.contains("failed to fetch codex rate limits")
+        || lower.contains("error sending request")
+        || lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("codex app-server не ответил за ")
+        || lower.contains("network")
+        || lower.contains("сеть")
+        || lower.contains("dns")
+        || lower.contains("resolv")
+        || lower.contains("temporary")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("http2 error")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
 }
 
 fn parse_window(key: &str, value: &Value) -> Option<QuotaWindow> {
@@ -480,6 +592,34 @@ mod tests {
         assert_eq!(weekly.label, "Неделя");
     }
 
+    /// Значения — полный `PlanType` из app-server-protocol, ожидания — из
+    /// теста `plan_type_display_name_remaps_display_labels` того же апстрима.
+    #[test]
+    fn plan_labels_follow_the_names_codex_itself_shows() {
+        for (raw, expected) in [
+            ("free", "Free"),
+            ("go", "Go"),
+            ("plus", "Plus"),
+            ("pro", "Pro 20x"),
+            ("prolite", "Pro 5x"),
+            ("team", "Business"),
+            ("self_serve_business_prolite", "Business Premium"),
+            ("self_serve_business_usage_based", "Business"),
+            ("business", "Enterprise"),
+            ("ent26", "Enterprise"),
+            ("enterprise_cbp_automation", "Enterprise (Automation)"),
+            ("enterprise_cbp_usage_based", "Enterprise"),
+            ("enterprise", "Enterprise"),
+            ("edu", "Edu"),
+            ("edu_plus", "Edu Plus"),
+            ("edu_pro", "Edu Pro"),
+            ("unknown", "Unknown"),
+            ("some_future_plan", "Some Future Plan"),
+        ] {
+            assert_eq!(plan_label(raw), expected, "тариф {raw}");
+        }
+    }
+
     #[test]
     fn parses_both_windows_when_the_plan_has_two() {
         let state = state(ACCOUNT_OK, LIMITS_TWO).unwrap();
@@ -518,6 +658,95 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn retriable_error_recognizes_transient_network_failures() {
+        assert!(is_retriable_error(
+            "failed to fetch codex rate limits: error sending request for url (https://chatgpt.com/backend-api/wham/usage)"
+        ));
+        assert!(is_retriable_error("connection refused"));
+        assert!(is_retriable_error("operation timed out"));
+        assert!(is_retriable_error(
+            "Codex app-server не ответил за 8 секунд"
+        ));
+        assert!(is_retriable_error("Сеть недоступна"));
+        assert!(is_retriable_error("error trying to connect: dns error"));
+
+        assert!(!is_retriable_error(
+            "codex account authentication required to read rate limits"
+        ));
+        assert!(!is_retriable_error("unknown bucket id"));
+    }
+
+    #[tokio::test]
+    async fn retries_a_slow_app_server_and_keeps_timeout_failures_within_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-usage-codex-timeout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("codex");
+        std::fs::write(
+            &command,
+            r#"#!/bin/sh
+printf 'attempt\n' >> "$CODEX_HOME/attempts"
+for i in 1 2 3 4; do IFS= read -r message || exit 1; done
+if [ ! -e "$CODEX_HOME/first-attempt" ] || [ -e "$CODEX_HOME/always-slow" ]; then
+    : > "$CODEX_HOME/first-attempt"
+    exec /usr/bin/sleep 60
+fi
+exec /usr/bin/cat "$CODEX_HOME/responses.jsonl"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            root.join("responses.jsonl"),
+            format!("{}\n{}\n", line(ACCOUNT_OK), line(LIMITS_PLUS)),
+        )
+        .unwrap();
+
+        let recovered = timeout(
+            crate::PROVIDER_DEADLINE,
+            fetch(
+                "mock-codex",
+                "Codex",
+                &root,
+                command.to_str().unwrap(),
+                "codex",
+            ),
+        )
+        .await;
+        let recovered_attempts = std::fs::read_to_string(root.join("attempts")).unwrap();
+
+        std::fs::remove_file(root.join("attempts")).unwrap();
+        std::fs::write(root.join("always-slow"), "").unwrap();
+        let failed = timeout(
+            crate::PROVIDER_DEADLINE,
+            fetch(
+                "mock-codex",
+                "Codex",
+                &root,
+                command.to_str().unwrap(),
+                "codex",
+            ),
+        )
+        .await;
+        let failed_attempts = std::fs::read_to_string(root.join("attempts")).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(recovered.unwrap().unwrap().status, "ok");
+        assert_eq!(recovered_attempts.lines().count(), 2);
+        assert_eq!(failed_attempts.lines().count(), 2);
+        let error = failed.expect("provider deadline must not erase the timeout error");
+        assert!(error
+            .unwrap_err()
+            .to_string()
+            .contains("не ответил за 8 секунд"));
     }
 
     #[test]
@@ -681,6 +910,30 @@ mod tests {
         let text = "Error: CODEX_HOME points to \"/var/home/user/.codex-work\", but that path does not exist";
         let redacted = redact(text);
         assert_eq!(redacted, text, "путь и текст ошибки должны сохраниться");
+    }
+
+    #[test]
+    fn finds_node_beside_the_symlink_target() {
+        // ~/.local/bin/codex — симлинк в mise-каталог; node лежит рядом с
+        // целью ссылки, а не рядом с самой ссылкой.
+        let root = std::env::temp_dir().join(format!("ai-usage-codex-{}", std::process::id()));
+        let mise = root.join("mise/bin");
+        let local = root.join("local/bin");
+        std::fs::create_dir_all(&mise).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(mise.join("node"), "").unwrap();
+        std::fs::write(mise.join("codex"), "").unwrap();
+        let link = local.join("codex");
+        std::os::unix::fs::symlink("../../mise/bin/codex", &link).unwrap();
+
+        assert_eq!(
+            interpreter_dir(&link).map(|dir| dir.canonicalize().unwrap()),
+            Some(mise.canonicalize().unwrap())
+        );
+        // Обычный бинарник без node по соседству — искать нечего.
+        assert!(interpreter_dir(&root.join("local/bin/other")).is_none());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -34,3 +34,9 @@ base_url = "https://api.deepseek.com"
 provider = "antigravity"
 id = "agy-main"
 name = "Google AI Pro"
+
+# Учётные данные читаются из ~/.local/share/opencode/opencode.db после /connect в OpenCode.
+[[accounts]]
+provider = "opencode-go"
+id = "opencode-go"
+name = "OpenCode Go"

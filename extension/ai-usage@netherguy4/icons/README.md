@@ -6,6 +6,7 @@
 | `ai-usage-codex-symbolic.svg` | знак OpenAI | [lobe-icons](https://github.com/lobehub/lobe-icons), MIT |
 | `ai-usage-deepseek-symbolic.svg` | знак DeepSeek | [simple-icons](https://github.com/simple-icons/simple-icons), CC0 |
 | `ai-usage-antigravity-symbolic.svg` | знак Google Antigravity | [lobe-icons](https://github.com/lobehub/lobe-icons), MIT |
+| `ai-usage-opencode-go-symbolic.svg` | знак OpenCode | [lobe-icons](https://github.com/lobehub/lobe-icons), MIT |
 
 Файлы приведены к одному виду: `viewBox`, `fill="currentColor"` и суффикс
 `-symbolic.svg`, чтобы GNOME перекрашивал их под тему панели. Геометрия путей не
@@ -13,7 +14,7 @@
 фильтрах и в symbolic-иконке всё равно потерял бы цвет.
 
 **Товарные знаки.** Лицензии выше относятся к SVG-файлам, но не к самим
-логотипам: они остаются товарными знаками Anthropic, OpenAI, Google и DeepSeek
+логотипам: они остаются товарными знаками Anthropic, OpenAI, Google, DeepSeek и OpenCode
 соответственно. Здесь они используются только для того, чтобы обозначить, к
 какому сервису относится строка — это номинативное использование, а не знак
 принадлежности или одобрения. Правообладатель может попросить убрать их;

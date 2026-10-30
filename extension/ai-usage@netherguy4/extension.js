@@ -16,12 +16,22 @@ export default class AiUsageExtension extends Extension {
     enable() {
         this._state = null;
         this._reloadSource = 0;
+        this._revealed = new Set();
         this._iconDir = this.dir.get_child('icons');
 
         this._indicator = new PanelMenu.Button(0.0, this.metadata.name, false);
         this._panelBox = new St.BoxLayout({style_class: 'ai-usage-panel-box'});
         this._indicator.add_child(this._panelBox);
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'right');
+
+        // Почта снова прячется, когда меню закрыли: показ рассчитан на один
+        // взгляд, а не на то, чтобы остаться раскрытым до перезапуска.
+        this._indicator.menu.connect('open-state-changed', (_menu, open) => {
+            if (!open && this._revealed.size) {
+                this._revealed.clear();
+                this._render();
+            }
+        });
 
         const runtimeDir = GLib.get_user_runtime_dir();
         this._stateFile = Gio.File.new_for_path(
@@ -62,6 +72,7 @@ export default class AiUsageExtension extends Extension {
         this._stateFile = null;
         this._iconDir = null;
         this._state = null;
+        this._revealed = null;
     }
 
     _queueReload() {
@@ -121,10 +132,23 @@ export default class AiUsageExtension extends Extension {
             if (index > 0)
                 this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-            const subtitle = [account.plan, account.email].filter(Boolean).join(' · ');
+            const revealed = this._revealed.has(account.id);
+            const email = account.email
+                ? (revealed ? account.email : maskEmail(account.email))
+                : null;
+            const subtitle = [account.plan, email].filter(Boolean).join(' · ');
             this._addItem(`${account.name}${subtitle ? ` — ${subtitle}` : ''}`, {
                 header: true,
                 gicon: this._providerIcon(account.provider),
+                onClick: account.email
+                    ? () => {
+                        if (revealed)
+                            this._revealed.delete(account.id);
+                        else
+                            this._revealed.add(account.id);
+                        this._render();
+                    }
+                    : null,
             });
 
             const windows = Array.isArray(account.windows) ? account.windows : [];
@@ -190,7 +214,7 @@ export default class AiUsageExtension extends Extension {
         }
     }
 
-    _addItem(text, {header = false, style = null, gicon = null} = {}) {
+    _addItem(text, {header = false, style = null, gicon = null, onClick = null} = {}) {
         // Собираем строку сами, а не через PopupImageMenuItem: порядок детей
         // у базового пункта меняется между версиями GNOME.
         const item = new PopupMenu.PopupBaseMenuItem({reactive: false});
@@ -198,7 +222,18 @@ export default class AiUsageExtension extends Extension {
         if (gicon)
             box.add_child(new St.Icon({gicon, style_class: 'popup-menu-icon ai-usage-menu-icon'}));
 
-        const label = new St.Label({text, y_align: Clutter.ActorAlign.CENTER});
+        // Строка с почтой кликабельна целиком: отдельная кнопка внутри строки
+        // дала бы мишень в несколько пикселей.
+        const label = onClick
+            ? new St.Button({
+                label: text,
+                can_focus: true,
+                style_class: 'ai-usage-reveal',
+                y_align: Clutter.ActorAlign.CENTER,
+            })
+            : new St.Label({text, y_align: Clutter.ActorAlign.CENTER});
+        if (onClick)
+            label.connect('clicked', onClick);
         if (header)
             label.add_style_class_name('ai-usage-header');
         if (style)
@@ -208,6 +243,13 @@ export default class AiUsageExtension extends Extension {
         item.add_child(box);
         this._indicator.menu.addMenuItem(item);
     }
+}
+
+// Почта в заголовке — самое узнаваемое, что есть на скриншоте панели.
+// Домен оставляем: он подсказывает, что за аккаунт, но никого не называет.
+function maskEmail(email) {
+    const at = email.indexOf('@');
+    return at > 0 ? `${email[0]}•••${email.slice(at)}` : '•••';
 }
 
 // Какое окно выносить в панель.

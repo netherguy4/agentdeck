@@ -50,6 +50,10 @@ gjs -m extension/ai-usage@netherguy4/extension.js   # разбор модуля
 
 Измерено вручную, с остановленным демоном: `429` содержит `Retry-After: 0` и никаких `anthropic-ratelimit-*`; через 60 с простоя приходит `200`; повторный запрос через ~90 с снова даёт `429`; при опросе раз в 5 минут отказов нет. Отсюда `MIN_POLL_SECONDS = 300` и отход 5 → 10 → 20 → 40 → 60 минут.
 
+**Claude cadence — 2026-10-08.** Normal successful polling was reduced from 600 to 300 seconds; with the default 120-second daemon cycle, live GETs are about six minutes apart. The separate 429 backoff remains 600/1200/2400/3600 seconds. All 149 release tests, release Clippy with `-D warnings`, release build and changed-file rustfmt passed. Clock-recovery cases pin the successful and rate-limited pauses independently. No new live rate-limit stress test was run; the five-minute calibration above is the existing evidence.
+
+Activated with an approved service restart at 17:17:51 EEST. The loaded executable hash/inode matched the prepared build; all four accounts were OK in the first cycle. Claude used fresh CLI cache and persisted a 300-second cooldown. A full live polling interval was not observed after activation.
+
 **last-known-good.** После удачного refresh провайдер намеренно сломан: аккаунт перешёл в `stale`, сохранив квоту, plan и прежний `updated_at`, и показал текст ошибки.
 
 ### Не пройдено — требует действия пользователя
@@ -258,3 +262,18 @@ Commit/tag:
 ```
 
 Не добавляй токены, email реальных аккаунтов или содержимое auth-файлов.
+
+## 2026-10-07: automatic Claude OAuth renewal
+
+- Release checks: 143 backend tests passed; release Clippy with `-D warnings`, release build, changed-file rustfmt and `git diff --check` passed. Existing unrelated `openrouter.rs` formatting differences remain.
+- Local HTTP regression covers expired credentials, token rotation, concurrent refresh exclusion, stale-lock recovery, preservation of other credential namespaces, mode 0600, caller cancellation and exit draining, permanent auth failures, secret-safe malformed responses, and concurrent logout.
+- Registered isolated daemon startup and graceful SIGTERM stop passed with a fabricated expired profile; no live credentials were changed by this check.
+- Installed binary matches the release artifact. Rollback: `~/.local/state/ai-usage/backups/20261007-startup-104913/ai-usage.before`.
+- User-approved `ai-usage.service` restart at 10:51:45 EEST activated the installed binary; loaded inode verified. First cycle reported all four accounts OK. Live access-token expiry was not forced; renewal was tested against the local HTTP endpoint.
+
+## 2026-10-07: Codex and Antigravity recovery
+
+- `cargo test --release --quiet`: 145 tests passed. Release Clippy with `-D warnings`, release build with `--locked`, changed-file rustfmt and `git diff --check` passed.
+- Offline Codex subprocess regression exercises the real eight-second timeout: a slow first attempt recovers on the second; repeated timeouts retain the specific error and finish before the shared 30-second deadline. The final fixture was rerun independently and passed; it consumes the complete request batch before responding.
+- Antigravity regression covers immediate `stale` after a failed poll with a recent snapshot, retained quota and original timestamp, recovery to `ok`, and unchanged hook-only grace. Google HTTP response bodies are excluded from diagnostics.
+- Installed artifact matches the release build. Service restart at 11:25:22 EEST loaded the new inode; first cycle reported all four configured accounts OK. Rollback: `~/.local/state/ai-usage/backups/20261007-provider-recovery-112522/ai-usage.before`.

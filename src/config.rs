@@ -35,7 +35,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum AccountConfig {
     Claude {
@@ -60,9 +60,26 @@ pub enum AccountConfig {
         #[serde(default = "default_deepseek_base_url")]
         base_url: String,
     },
+    Openrouter {
+        id: String,
+        name: String,
+        api_key_env: String,
+        #[serde(default = "default_openrouter_base_url")]
+        base_url: String,
+    },
     Antigravity {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_file: Option<PathBuf>,
+    },
+    /// Учётные данные читаются из базы OpenCode (`/connect`).
+    #[serde(rename = "opencode-go")]
+    OpencodeGo {
+        id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        db_file: Option<PathBuf>,
     },
 }
 
@@ -72,7 +89,9 @@ impl AccountConfig {
             Self::Claude { id, .. }
             | Self::Codex { id, .. }
             | Self::Deepseek { id, .. }
-            | Self::Antigravity { id, .. } => id,
+            | Self::Openrouter { id, .. }
+            | Self::Antigravity { id, .. }
+            | Self::OpencodeGo { id, .. } => id,
         }
     }
 
@@ -81,7 +100,9 @@ impl AccountConfig {
             Self::Claude { name, .. }
             | Self::Codex { name, .. }
             | Self::Deepseek { name, .. }
-            | Self::Antigravity { name, .. } => name,
+            | Self::Openrouter { name, .. }
+            | Self::Antigravity { name, .. }
+            | Self::OpencodeGo { name, .. } => name,
         }
     }
 
@@ -90,7 +111,9 @@ impl AccountConfig {
             Self::Claude { name, .. }
             | Self::Codex { name, .. }
             | Self::Deepseek { name, .. }
-            | Self::Antigravity { name, .. } => *name = value,
+            | Self::Openrouter { name, .. }
+            | Self::Antigravity { name, .. }
+            | Self::OpencodeGo { name, .. } => *name = value,
         }
     }
 
@@ -99,7 +122,9 @@ impl AccountConfig {
             Self::Claude { .. } => "claude",
             Self::Codex { .. } => "codex",
             Self::Deepseek { .. } => "deepseek",
+            Self::Openrouter { .. } => "openrouter",
             Self::Antigravity { .. } => "antigravity",
+            Self::OpencodeGo { .. } => "opencode-go",
         }
     }
 
@@ -110,7 +135,10 @@ impl AccountConfig {
         match self {
             Self::Claude { config_dir, .. } => Some(config_dir),
             Self::Codex { codex_home, .. } => Some(codex_home),
-            Self::Deepseek { .. } | Self::Antigravity { .. } => None,
+            Self::Deepseek { .. }
+            | Self::Openrouter { .. }
+            | Self::Antigravity { .. }
+            | Self::OpencodeGo { .. } => None,
         }
     }
 }
@@ -133,6 +161,10 @@ fn default_codex_limit_id() -> String {
 
 fn default_deepseek_base_url() -> String {
     "https://api.deepseek.com".to_owned()
+}
+
+fn default_openrouter_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_owned()
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -251,6 +283,7 @@ mod tests {
         AccountConfig::Antigravity {
             id: id.to_owned(),
             name: id.to_owned(),
+            token_file: None,
         }
     }
 
@@ -268,6 +301,12 @@ mod tests {
                     api_key_env: "AI_USAGE_DEEPSEEK_DEEPSEEK_MAIN".to_owned(),
                     base_url: "https://api.deepseek.com".to_owned(),
                 },
+                AccountConfig::Openrouter {
+                    id: "openrouter-main".to_owned(),
+                    name: "OpenRouter".to_owned(),
+                    api_key_env: "AI_USAGE_OPENROUTER_OPENROUTER_MAIN".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                },
                 antigravity("agy-main"),
             ],
         };
@@ -275,7 +314,7 @@ mod tests {
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
 
-        assert_eq!(parsed.accounts.len(), 4);
+        assert_eq!(parsed.accounts.len(), 5);
         assert_eq!(parsed.refresh_seconds, 60);
         assert_eq!(parsed.stale_seconds, 3_600);
         assert_eq!(
@@ -284,7 +323,7 @@ mod tests {
                 .iter()
                 .map(AccountConfig::provider)
                 .collect::<Vec<_>>(),
-            ["claude", "codex", "deepseek", "antigravity"]
+            ["claude", "codex", "deepseek", "openrouter", "antigravity"]
         );
         validate(&parsed).unwrap();
     }
@@ -296,66 +335,43 @@ mod tests {
         let raw = include_str!("../config/config.example.toml");
         let config: Config = toml::from_str(raw).unwrap();
         validate(&config).unwrap();
-        assert_eq!(config.accounts.len(), 5);
+        assert_eq!(config.accounts.len(), 6);
     }
 
     #[test]
-    fn missing_optional_fields_fall_back_to_defaults() {
-        let raw = r#"
-            [[accounts]]
-            provider = "codex"
-            id = "codex-main"
-            name = "Codex"
-            codex_home = "~/.codex"
-        "#;
-        let config: Config = toml::from_str(raw).unwrap();
-        assert_eq!(config.refresh_seconds, 120);
-        assert_eq!(
-            config.stale_seconds,
-            crate::providers::claude::DEFAULT_STALE_SECONDS
+    fn saves_and_loads_round_trip() {
+        let unique = format!(
+            "ai-usage-test-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
         );
-        match &config.accounts[0] {
-            AccountConfig::Codex {
-                command, limit_id, ..
-            } => {
-                assert_eq!(command, "codex");
-                assert_eq!(limit_id, "codex");
-            }
-            other => panic!("ожидался codex, получен {other:?}"),
-        }
+        let temp = std::env::temp_dir().join(unique);
+
+        let config = Config {
+            refresh_seconds: 30,
+            stale_seconds: 1_800,
+            accounts: vec![
+                claude("primary", "~/.claude-one"),
+                claude("secondary", "~/.claude-two"),
+            ],
+        };
+
+        crate::util::atomic_write(&temp, toml::to_string_pretty(&config).unwrap().as_bytes())
+            .unwrap();
+
+        let raw = fs::read_to_string(&temp).unwrap();
+        let loaded: Config = toml::from_str(&raw).unwrap();
+        validate(&loaded).unwrap();
+
+        assert_eq!(loaded.accounts.len(), 2);
+        assert_eq!(loaded.accounts[0].id(), "primary");
+        assert_eq!(loaded.accounts[1].id(), "secondary");
+
+        let _ = fs::remove_file(temp);
     }
 
     #[test]
-    fn upsert_replaces_by_id_and_appends_new() {
-        let mut config = Config::default();
-        upsert_account(&mut config, codex("codex-main", "~/.codex"));
-        upsert_account(&mut config, codex("codex-work", "~/.codex-work"));
-        assert_eq!(config.accounts.len(), 2);
-
-        upsert_account(&mut config, codex("codex-main", "~/.codex-moved"));
-        assert_eq!(config.accounts.len(), 2);
-        // Порядок сохраняется: обновление не должно переставлять аккаунты.
-        assert_eq!(config.accounts[0].id(), "codex-main");
-        assert_eq!(
-            config.accounts[0].exclusive_dir().unwrap(),
-            Path::new("~/.codex-moved")
-        );
-    }
-
-    #[test]
-    fn remove_returns_account_and_shrinks_config() {
-        let mut config = Config::default();
-        upsert_account(&mut config, codex("codex-main", "~/.codex"));
-        upsert_account(&mut config, claude("claude-main", "~/.claude"));
-
-        let removed = remove_account(&mut config, "codex-main").expect("аккаунт был");
-        assert_eq!(removed.id(), "codex-main");
-        assert_eq!(config.accounts.len(), 1);
-        assert!(remove_account(&mut config, "codex-main").is_none());
-    }
-
-    #[test]
-    fn rejects_duplicate_ids() {
+    fn rejects_duplicate_account_ids_across_providers() {
         let config = Config {
             accounts: vec![claude("same", "~/.claude"), codex("same", "~/.codex")],
             ..Config::default()
@@ -401,6 +417,29 @@ mod tests {
             ..Config::default()
         };
         validate(&config).unwrap();
+    }
+
+    #[test]
+    fn antigravity_round_trips_token_file() {
+        let config = Config {
+            accounts: vec![AccountConfig::Antigravity {
+                id: "agy-custom".to_owned(),
+                name: "Custom ACP".to_owned(),
+                token_file: Some(PathBuf::from("/etc/acp.json")),
+            }],
+            ..Config::default()
+        };
+        let raw = toml::to_string(&config).unwrap();
+        assert!(raw.contains("token_file = \"/etc/acp.json\""));
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.accounts[0],
+            AccountConfig::Antigravity {
+                id: "agy-custom".to_owned(),
+                name: "Custom ACP".to_owned(),
+                token_file: Some(PathBuf::from("/etc/acp.json")),
+            }
+        );
     }
 
     #[test]

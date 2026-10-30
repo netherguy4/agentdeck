@@ -100,8 +100,8 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn env_name_for_id(id: &str) -> String {
-    let normalized: String = id
+pub fn env_name_for_provider_and_id(provider: &str, id: &str) -> String {
+    let prov_norm: String = provider
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
@@ -111,7 +111,21 @@ pub fn env_name_for_id(id: &str) -> String {
             }
         })
         .collect();
-    format!("AI_USAGE_DEEPSEEK_{normalized}")
+    let id_norm: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("AI_USAGE_{prov_norm}_{id_norm}")
+}
+
+pub fn env_name_for_id(id: &str) -> String {
+    env_name_for_provider_and_id("deepseek", id)
 }
 
 /// `claude_max_5x` → `Max 5x`, `plus` → `Plus`.

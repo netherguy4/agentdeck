@@ -30,6 +30,19 @@
   icon-size: 16px;
 }
 
+/* Кнопка, а не ссылка: сбрасываем рамку и фон темы, оставляя только
+   подсказку о фокусе и наведении. */
+.ai-usage-reveal {
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.ai-usage-reveal:hover,
+.ai-usage-reveal:focus {
+  text-decoration: underline;
+}
+
 .ai-usage-header {
   font-weight: 700;
 }
