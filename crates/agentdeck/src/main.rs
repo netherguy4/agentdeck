@@ -2,6 +2,7 @@ use agentdeck_core::{AddSpec, Harness, Paths, t3};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod cmd_claude;
+mod cmd_codex;
 mod cmd_pool;
 mod cmd_t3;
 
@@ -28,6 +29,11 @@ enum Cmd {
     Claude {
         #[command(subcommand)]
         cmd: cmd_claude::ClaudeCmd,
+    },
+    /// Sync, check and fix Codex shadow homes.
+    Codex {
+        #[command(subcommand)]
+        cmd: cmd_codex::CodexCmd,
     },
     /// T3 integration: status, sync and import of providerInstances.
     T3 {
@@ -107,6 +113,7 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
+        Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
             InstanceCmd::List { json } => {
