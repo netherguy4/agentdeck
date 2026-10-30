@@ -190,7 +190,22 @@ fn provider_icon(provider: &str) -> widget::icon::Handle {
     widget::icon::from_svg_bytes(bytes).symbolic(true)
 }
 
-fn state_path() -> PathBuf {
+fn new_state_path() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .map(|path| path.join("agentdeck").join("usage"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join(format!(
+                    "agentdeck-{}",
+                    std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+                ))
+                .join("usage")
+        })
+        .join("state.json")
+}
+
+fn old_state_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .map(|path| path.join("ai-usage"))
@@ -203,9 +218,19 @@ fn state_path() -> PathBuf {
         .join("state.json")
 }
 
+fn pick_state_path(new: PathBuf, old: PathBuf) -> PathBuf {
+    // The new path wins when present, so one build works before and after
+    // cutover without an atomic release.
+    if new.exists() { new } else { old }
+}
+
+fn state_path() -> PathBuf {
+    pick_state_path(new_state_path(), old_state_path())
+}
+
 fn read_state() -> Result<AppState, String> {
-    let bytes =
-        std::fs::read(state_path()).map_err(|e| format!("Ожидание ai-usage.service: {e}"))?;
+    let bytes = std::fs::read(state_path())
+        .map_err(|e| format!("Ожидание agentdeck-daemon.service: {e}"))?;
     let state: AppState =
         serde_json::from_slice(&bytes).map_err(|e| format!("Не удалось прочитать квоты: {e}"))?;
     if state.schema_version != model::SCHEMA_VERSION {
@@ -445,6 +470,27 @@ fn main() -> cosmic::iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn state_path_prefers_new_runtime_file_falls_back_to_old() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-applet-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let new = dir.join("new.json");
+        let old = dir.join("old.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only old exists: use it (pre-cutover).
+        std::fs::write(&old, "{}").unwrap();
+        assert_eq!(pick_state_path(new.clone(), old.clone()), old);
+        // New appears: switch without an atomic release.
+        std::fs::write(&new, "{}").unwrap();
+        assert_eq!(pick_state_path(new.clone(), old.clone()), new);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn future_or_missing_update_times_do_not_claim_zero_minutes_ago() {
         assert_eq!(updated_text(1_001, 1_000), "время обновления неизвестно");

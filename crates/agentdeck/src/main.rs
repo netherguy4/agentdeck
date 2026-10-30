@@ -6,6 +6,7 @@ mod cmd_codex;
 mod cmd_daemon;
 mod cmd_login;
 mod cmd_pool;
+mod cmd_service;
 mod cmd_t3;
 mod cmd_usage;
 mod cmd_wrapper;
@@ -55,6 +56,11 @@ enum Cmd {
     Wrapper {
         #[command(subcommand)]
         cmd: cmd_wrapper::WrapperCmd,
+    },
+    /// Install, remove or inspect the systemd user unit. Never enables/starts.
+    Service {
+        #[command(subcommand)]
+        cmd: cmd_service::ServiceCmd,
     },
     /// Run the official login CLI for an instance inside a PTY.
     Login {
@@ -167,6 +173,7 @@ fn main() -> anyhow::Result<()> {
 async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pool { cmd } => cmd_pool::run(paths, cmd)?,
+        Cmd::Service { cmd } => cmd_service::run(paths, cmd)?,
         Cmd::Usage { cmd } => cmd_usage::run(paths, cmd).await?,
         Cmd::Daemon(args) => cmd_daemon::run(paths, args).await?,
         Cmd::Wrapper { cmd } => cmd_wrapper::run(paths, cmd)?,
