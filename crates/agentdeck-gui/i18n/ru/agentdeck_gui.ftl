@@ -9,6 +9,7 @@ loading = Загрузка…
 load-error = Не удалось загрузить: { $what }
 
 instances-title = Инстансы
+instances-loading = Загрузка…
 instances-empty = В реестре пока нет инстансов.
 instances-add = Добавить
 instances-remove = Удалить

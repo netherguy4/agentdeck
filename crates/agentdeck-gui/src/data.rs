@@ -67,6 +67,8 @@ pub struct PluginRow {
 
 #[derive(Debug, Clone, Default)]
 pub struct Data {
+    /// False until the first load finished, so the UI never claims "empty" while reading.
+    pub loaded: bool,
     pub instances: Vec<InstanceRow>,
     pub standalone: Vec<UsageQuotas>,
     pub plugins: Vec<PluginRow>,
@@ -127,6 +129,7 @@ pub fn load(paths: &Paths) -> Data {
         Ok(registry) => registry,
         Err(error) => {
             return Data {
+                loaded: true,
                 error: Some(format!("registry: {error:#}")),
                 ..Data::default()
             };
@@ -147,7 +150,10 @@ pub fn load(paths: &Paths) -> Data {
         .map(|s| s.accounts)
         .unwrap_or_default();
 
-    let mut data = Data::default();
+    let mut data = Data {
+        loaded: true,
+        ..Data::default()
+    };
     for inst in &registry.instances {
         let quotas = registry
             .usage

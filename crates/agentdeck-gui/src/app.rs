@@ -84,6 +84,17 @@ pub struct RemoveAsk {
     pub working: bool,
 }
 
+fn load_data(paths: agentdeck_core::Paths) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || data::load(&paths))
+                .await
+                .unwrap_or_default()
+        },
+        Message::Loaded,
+    )
+}
+
 fn drift_ctx(paths: &agentdeck_core::Paths) -> DriftCtx {
     DriftCtx {
         paths: paths.clone(),
@@ -97,6 +108,7 @@ fn drift_ctx(paths: &agentdeck_core::Paths) -> DriftCtx {
 pub struct State {
     page: Page,
     data: Data,
+    loading: bool,
     drift: drift::State,
     paths: Option<agentdeck_core::Paths>,
     add: add_instance::Wizard,
@@ -137,6 +149,7 @@ impl State {
             Self {
                 page: Page::Instances,
                 data: Data::default(),
+                loading: first.is_some(),
                 drift: drift::State::default(),
                 paths,
                 add: add_instance::Wizard::default(),
@@ -148,7 +161,7 @@ impl State {
                 harnesses: harnesses::State::default(),
             },
             match first {
-                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                Some(paths) => load_data(paths),
                 None => Task::none(),
             },
         )
@@ -159,6 +172,7 @@ impl State {
         Self {
             page: Page::Instances,
             data,
+            loading: false,
             drift: drift::State::default(),
             paths: Some(paths),
             add: add_instance::Wizard::default(),
@@ -203,23 +217,30 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 _ => Task::none(),
             }
         }
+        // A slow disk must not stack refreshes: each tick waits for the previous load.
         Message::Tick => match state.paths.clone() {
-            Some(paths) => {
-                let drift_paths = paths.clone();
-                Task::batch([
-                    Task::perform(async move { data::load(&paths) }, Message::Loaded),
-                    Task::perform(
-                        async move {
-                            let ctx = drift_ctx(&drift_paths);
-                            drift::load(ctx)
-                        },
-                        Message::Drift,
-                    ),
-                ])
+            Some(paths) if !state.loading => {
+                state.loading = true;
+                let load = load_data(paths.clone());
+                if state.page == Page::Drift {
+                    Task::batch([
+                        load,
+                        Task::perform(
+                            async move {
+                                let ctx = drift_ctx(&paths);
+                                drift::load(ctx)
+                            },
+                            Message::Drift,
+                        ),
+                    ])
+                } else {
+                    load
+                }
             }
-            None => Task::none(),
+            _ => Task::none(),
         },
         Message::Loaded(data) => {
+            state.loading = false;
             state.data = data;
             Task::none()
         }
@@ -285,7 +306,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
             match state.paths.clone() {
-                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                Some(paths) => load_data(paths),
                 None => Task::none(),
             }
         }
@@ -365,7 +386,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.proc_ui.result = Some(result);
             // Refresh behind the result line.
             match state.paths.clone() {
-                Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
+                Some(paths) => load_data(paths),
                 None => Task::none(),
             }
         }

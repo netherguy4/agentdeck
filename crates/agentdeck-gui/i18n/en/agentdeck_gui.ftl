@@ -9,6 +9,7 @@ loading = Loading…
 load-error = Could not load: { $what }
 
 instances-title = Instances
+instances-loading = Loading…
 instances-empty = No instances in the registry yet.
 instances-add = Add
 instances-remove = Remove

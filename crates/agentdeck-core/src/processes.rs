@@ -331,45 +331,6 @@ fn live_entries(root: &Path, dir: &Path) -> Vec<RegEntry> {
         .collect()
 }
 
-/// T3 thread label for a scope, read-only. The known statev2 schema (R4) has
-/// no scope binding, so this scans for any scope/thread column pair and falls
-/// back to the bare scope name.
-fn scope_thread_label(t3_root: Option<&Path>, scope: &str) -> Option<String> {
-    let t3 = t3_root?;
-    let db = t3.join("userdata/statev2.sqlite");
-    if !db.exists() {
-        return None;
-    }
-    let conn =
-        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()?;
-    let tables: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .ok()?
-        .query_map([], |r| r.get(0))
-        .ok()?
-        .filter_map(|r| r.ok())
-        .collect();
-    for table in tables {
-        let cols: Vec<String> = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .ok()?
-            .query_map([], |r| r.get::<_, String>(1))
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-        let scope_col = cols.iter().find(|c| c.to_lowercase().contains("scope"));
-        let thread_col = cols.iter().find(|c| c.to_lowercase().contains("thread"));
-        if let (Some(s), Some(t)) = (scope_col, thread_col) {
-            let sql = format!("SELECT {t} FROM {table} WHERE {s} = ?1 LIMIT 1");
-            if let Ok(thread) = conn.query_row(&sql, [scope], |r| r.get::<_, String>(0)) {
-                return Some(format!("{scope} ({thread})"));
-            }
-        }
-    }
-    None
-}
-
 struct RawProc {
     pid: u32,
     st: Stat,
@@ -437,12 +398,7 @@ fn to_info(root: &Path, raw: &RawProc) -> ProcInfo {
     }
 }
 
-fn snapshot_from_raw(
-    root: &Path,
-    reg_dir: &Path,
-    t3_root: Option<&Path>,
-    raw: &[RawProc],
-) -> Snapshot {
+fn snapshot_from_raw(root: &Path, reg_dir: &Path, raw: &[RawProc]) -> Snapshot {
     let entries = live_entries(root, reg_dir);
     let by_pid: HashMap<u32, &RawProc> = raw.iter().map(|r| (r.pid, r)).collect();
     let tag_by_pid: HashMap<u32, &str> = raw
@@ -533,7 +489,7 @@ fn snapshot_from_raw(
             continue;
         }
         if let Some(scope) = &r.scope {
-            let label = scope_thread_label(t3_root, scope).unwrap_or_else(|| scope.clone());
+            let label = scope.clone();
             meta.entry(format!("t3:{scope}")).or_insert_with(|| {
                 (
                     GroupKind::T3 { scope: label },
@@ -619,18 +575,17 @@ fn snapshot_from_raw(
     snap
 }
 
-fn snapshot_with_roots(root: &Path, reg_dir: &Path, t3_root: Option<&Path>) -> Snapshot {
+fn snapshot_with_roots(root: &Path, reg_dir: &Path) -> Snapshot {
     let prev = take_sample(root);
     std::thread::sleep(Duration::from_millis(200));
     let curr = take_sample(root);
     let raw = collect_raw(root, &prev, &curr);
-    snapshot_from_raw(root, reg_dir, t3_root, &raw)
+    snapshot_from_raw(root, reg_dir, &raw)
 }
 
 /// Live snapshot (two /proc samples 200 ms apart). Read-only, never fails.
 pub fn snapshot() -> Snapshot {
-    let t3 = crate::t3::t3_root().ok();
-    snapshot_with_roots(&proc_root(), &registry_dir(), t3.as_deref())
+    snapshot_with_roots(&proc_root(), &registry_dir())
 }
 
 fn read_stat_in(root: &Path, pid: u32) -> anyhow::Result<Stat> {
@@ -923,7 +878,7 @@ mod tests {
         let curr = take_sample(&root);
         let raw = collect_raw(&root, &prev, &curr);
         assert_eq!(raw.len(), 6);
-        let snap = snapshot_from_raw(&root, &reg, None, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw);
         assert_eq!(snap.groups.len(), 3);
         let agent = snap
             .groups
@@ -952,7 +907,7 @@ mod tests {
         // Unreadable IO is None, never an error.
         std::fs::remove_file(root.join("300/io")).unwrap();
         let raw = collect_raw(&root, &prev, &curr);
-        let snap = snapshot_from_raw(&root, &reg, None, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw);
         let h = snap
             .groups
             .iter()
@@ -987,7 +942,7 @@ mod tests {
         unsafe { std::env::set_var("AGENTDECK_CGROUP_DIR", &cg) };
         let prev = take_sample(&root);
         let raw = collect_raw(&root, &prev, &prev);
-        let snap = snapshot_from_raw(&root, &reg, None, &raw);
+        let snap = snapshot_from_raw(&root, &reg, &raw);
         unsafe { std::env::remove_var("AGENTDECK_CGROUP_DIR") };
         assert_eq!(snap.groups.len(), 1);
         assert_eq!(snap.groups[0].scope_mem_bytes, Some(12345678));

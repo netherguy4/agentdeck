@@ -125,7 +125,9 @@ pub fn view<'a>(data: &'a Data, remove: Option<&'a RemoveAsk>) -> Element<'a, Me
     if let Some(error) = &data.error {
         col = col.push(st::muted(fl!(loader(), "load-error", what = error)));
     }
-    if data.instances.is_empty() {
+    if !data.loaded {
+        col = col.push(st::muted(fl!(loader(), "instances-loading")));
+    } else if data.instances.is_empty() {
         col = col.push(st::muted(fl!(loader(), "instances-empty")));
     }
     for (i, inst) in data.instances.iter().enumerate() {
