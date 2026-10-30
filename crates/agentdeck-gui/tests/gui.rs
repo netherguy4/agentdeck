@@ -245,17 +245,31 @@ fn snapshots_en_ru_and_sidebar_navigation() {
         assert!(bytes > 1_024, "golden {} looks empty", goldens[0].display());
     }
 
-    // Sidebar navigation: click Drift, the Drift page replaces Instances.
+    // Sidebar navigation: every page reachable by clicking.
     agentdeck_gui::i18n::set_language("en");
     let mut state = app::State::for_tests(paths, data);
+    for (button, page) in [
+        ("Drift", agentdeck_gui::Page::Drift),
+        ("Plugins", agentdeck_gui::Page::Plugins),
+        ("Processes", agentdeck_gui::Page::Processes),
+        ("Instances", agentdeck_gui::Page::Instances),
+    ] {
+        let mut ui = iced_test::simulator(app::view(&state));
+        ui.click(button).expect("nav button");
+        for message in ui.into_messages() {
+            let _ = app::update(&mut state, message);
+        }
+        assert_eq!(state.page(), page);
+    }
+    // AddInstance is reached from the Instances page button, not the sidebar.
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.click("Drift").expect("drift nav button");
+    ui.click("Add").expect("add instance button");
     for message in ui.into_messages() {
         let _ = app::update(&mut state, message);
     }
-    assert!(matches!(state.page(), agentdeck_gui::Page::Drift));
+    assert!(matches!(state.page(), agentdeck_gui::Page::AddInstance));
     let mut ui = iced_test::simulator(app::view(&state));
-    ui.find("Drift").expect("drift page title");
+    ui.find("Add instance").expect("add page title");
 }
 
 /// Drift fixture: fake HOME + registry + T3 dir with real drift in every
