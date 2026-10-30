@@ -262,14 +262,16 @@ impl Registry {
 }
 
 fn check_id(id: &str) -> anyhow::Result<()> {
+    // T3 slug rule: instance ids double as T3 providerInstance ids
+    // (e.g. `claudeAgent`, `codex_second`), so uppercase is allowed.
     if id.is_empty() || id.len() > 64 {
-        anyhow::bail!("bad instance id {id:?}: must be 1-64 chars of [a-z0-9_-]");
+        anyhow::bail!("bad instance id {id:?}: must be 1-64 chars of [A-Za-z0-9_-]");
     }
     if !id
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        anyhow::bail!("bad instance id {id:?}: must match [a-z0-9_-]+");
+        anyhow::bail!("bad instance id {id:?}: must match [A-Za-z0-9_-]+");
     }
     Ok(())
 }
@@ -496,6 +498,9 @@ mod tests {
         Registry::update(&paths, |r| r.add(spec("dup"))).unwrap();
         assert!(Registry::update(&paths, |r| r.add(spec("dup"))).is_err());
         assert!(Registry::update(&paths, |r| r.add(spec("Bad ID!"))).is_err());
+        // T3 slug rule: camelCase ids like T3's own `claudeAgent` are legal.
+        Registry::update(&paths, |r| r.add(spec("claudeAgent"))).unwrap();
+        Registry::update(&paths, |r| r.add(spec("codex_second"))).unwrap();
         assert!(
             Registry::from_toml(
                 "version = 1\n[[instance]]\nid = \"x\"\nharness = \"bogus\"\nhome = \"h\"\n"

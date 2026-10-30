@@ -1,8 +1,9 @@
-use agentdeck_core::{AddSpec, Harness, Paths};
+use agentdeck_core::{AddSpec, Harness, Paths, t3};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod cmd_claude;
 mod cmd_pool;
+mod cmd_t3;
 
 #[derive(Parser)]
 #[command(name = "agentdeck", version, about = "Manage harness instances")]
@@ -27,6 +28,11 @@ enum Cmd {
     Claude {
         #[command(subcommand)]
         cmd: cmd_claude::ClaudeCmd,
+    },
+    /// T3 integration: status, sync and import of providerInstances.
+    T3 {
+        #[command(subcommand)]
+        cmd: cmd_t3::T3Cmd,
     },
 }
 
@@ -101,6 +107,7 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Pool { cmd } => cmd_pool::run(&paths, cmd)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
+        Cmd::T3 { cmd } => cmd_t3::run_t3(&paths, cmd)?,
         Cmd::Instance { cmd } => match cmd {
             InstanceCmd::List { json } => {
                 if json {
@@ -149,6 +156,15 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             InstanceCmd::Remove { id, dry_run } => {
+                // Warn when T3 still holds thread history for the id (kept, but orphaned).
+                let threads = t3::t3_root()
+                    .ok()
+                    .and_then(|root| t3::thread_count(&root, &id).unwrap_or(None));
+                if let Some(n) = threads.filter(|&n| n > 0) {
+                    eprintln!(
+                        "warning: T3 keeps {n} thread(s) for {id:?}; history stays but cannot launch"
+                    );
+                }
                 let (changes, home) =
                     agentdeck_core::registry::remove_instance(&paths, &id, dry_run)?;
                 for c in &changes {
