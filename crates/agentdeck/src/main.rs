@@ -217,6 +217,15 @@ fn main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>(),
         ));
     }
+    // Plain CLI output ends quietly at `| head`. Daemon, GUI and the route proxies
+    // write to child pipes and must keep handling EPIPE themselves.
+    let first = std::env::args().nth(1).unwrap_or_default();
+    let plain = !first.is_empty() && !matches!(first.as_str(), "daemon" | "route")
+        || std::env::args().any(|a| a == "--check");
+    if plain {
+        // SAFETY: single-threaded here; restoring the default disposition.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let cli = Cli::parse();
     // No subcommand opens the GUI; every subcommand keeps its CLI behavior.
     let Some(cmd) = cli.cmd else {

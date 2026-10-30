@@ -8,6 +8,7 @@ repository = "https://github.com/netherguy4/agentdeck"
 rust-version = "1.93"
 
 [dependencies]
+libc = "0.2"
 agent-process = { path = "../agent-process" }
 agentdeck-core = { path = "../agentdeck-core" }
 agentdeck-router = { path = "../agentdeck-router" }

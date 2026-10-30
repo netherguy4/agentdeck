@@ -125,6 +125,7 @@ dependencies = [
  "agentdeck-usage",
  "anyhow",
  "clap",
+ "libc",
  "notify",
  "notify-debouncer-mini",
  "serde_json",

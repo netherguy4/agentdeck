@@ -342,7 +342,10 @@ pub fn check(main: &Path, shadow: &Path) -> anyhow::Result<Vec<Drift>> {
                 if links.contains(&name) || is_excluded(&name) {
                     continue;
                 }
-                out.push(Drift::ExtraEntry { path: entry.path() });
+                // SQLite sidecars of a linked db appear next to the link while it is open.
+                if !(name.ends_with("-shm") || name.ends_with("-wal")) {
+                    out.push(Drift::ExtraEntry { path: entry.path() });
+                }
             }
         }
     }
