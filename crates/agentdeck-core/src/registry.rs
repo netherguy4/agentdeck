@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::changes::{Change, plan_write_file};
 use crate::paths::Paths;
+use crate::pool::PoolEntry;
 
 const CURRENT_VERSION: u32 = 1;
 
@@ -83,7 +84,9 @@ pub struct Registry {
     pub version: u32,
     #[serde(rename = "instance", default)]
     pub instances: Vec<Instance>,
-    /// Unknown top-level tables/keys (e.g. a future `[pool]`) survive rewrites.
+    #[serde(rename = "pool", default)]
+    pub pool: Vec<PoolEntry>,
+    /// Unknown top-level tables/keys survive rewrites.
     #[serde(flatten)]
     pub extra: toml::map::Map<String, toml::Value>,
 }
@@ -93,6 +96,7 @@ impl Registry {
         Self {
             version: CURRENT_VERSION,
             instances: Vec::new(),
+            pool: Vec::new(),
             extra: Default::default(),
         }
     }
@@ -108,7 +112,7 @@ impl Registry {
         Ok(reg)
     }
 
-    fn validate(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&mut self) -> anyhow::Result<()> {
         if self.version != CURRENT_VERSION {
             anyhow::bail!(
                 "unsupported instances.toml version {}: expected {CURRENT_VERSION}",
@@ -126,6 +130,26 @@ impl Registry {
             }
             if inst.display_name.is_empty() {
                 inst.display_name.clone_from(&inst.id);
+            }
+        }
+        for e in &self.pool {
+            if self.get(&e.instance).is_none() {
+                anyhow::bail!(
+                    "pool entry {:?} refers to unknown instance {:?}",
+                    e.model,
+                    e.instance
+                );
+            }
+            if e.model.is_empty() {
+                anyhow::bail!(
+                    "pool entry for instance {:?} has an empty model",
+                    e.instance
+                );
+            }
+        }
+        for (i, a) in self.pool.iter().enumerate() {
+            if self.pool[i + 1..].iter().any(|b| a.key_eq(b)) {
+                anyhow::bail!("duplicate pool entry {:?}", a.describe());
             }
         }
         Ok(())
@@ -206,6 +230,18 @@ impl Registry {
     }
 
     pub fn remove(&mut self, id: &str) -> anyhow::Result<Instance> {
+        let refs: Vec<String> = self
+            .pool
+            .iter()
+            .filter(|e| e.instance == id)
+            .map(|e| e.describe())
+            .collect();
+        if !refs.is_empty() {
+            anyhow::bail!(
+                "cannot remove instance {id:?}: still used by pool entries:\n  {}",
+                refs.join("\n  ")
+            );
+        }
         let pos = self
             .instances
             .iter()
@@ -475,7 +511,7 @@ mod tests {
         fs::create_dir_all(&paths.config_dir).unwrap();
         fs::write(
             paths.registry_file(),
-            "version = 1\nmystery_top = 42\n[pool]\nfoo = \"bar\"\n\
+            "version = 1\nmystery_top = 42\n[pond]\nfoo = \"bar\"\n\
              [[instance]]\nid = \"k\"\nharness = \"agy\"\nhome = \"h\"\nnick = \"x\"\n",
         )
         .unwrap();
@@ -486,7 +522,7 @@ mod tests {
         .unwrap();
         let raw = fs::read_to_string(paths.registry_file()).unwrap();
         assert!(raw.contains("mystery_top"), "{raw}");
-        assert!(raw.contains("[pool]"), "{raw}");
+        assert!(raw.contains("[pond]"), "{raw}");
         assert!(raw.contains("nick"), "{raw}");
         assert!(raw.contains("enabled = false"), "{raw}");
     }
