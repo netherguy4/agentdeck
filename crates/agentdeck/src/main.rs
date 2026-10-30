@@ -11,9 +11,11 @@ mod cmd_pool;
 mod cmd_ps;
 mod cmd_service;
 mod cmd_shared;
+mod cmd_sync;
 mod cmd_t3;
 mod cmd_usage;
 mod cmd_wrapper;
+mod sync_watch;
 
 #[derive(Parser)]
 #[command(name = "agentdeck", version, about = "Manage harness instances")]
@@ -45,6 +47,11 @@ enum Cmd {
     Claude {
         #[command(subcommand)]
         cmd: cmd_claude::ClaudeCmd,
+    },
+    /// Background sync: drift status, manual runs, auto-apply flag.
+    Sync {
+        #[command(subcommand)]
+        cmd: cmd_sync::SyncCmd,
     },
     /// Sync, check and fix Codex shadow homes.
     Codex {
@@ -247,6 +254,7 @@ async fn async_main(paths: &Paths, cmd: Cmd) -> anyhow::Result<()> {
             open,
         } => cmd_login::run(paths, &id, device_auth, open)?,
         Cmd::Claude { cmd } => cmd_claude::run(&cmd)?,
+        Cmd::Sync { cmd } => cmd_sync::run(&cmd)?,
         Cmd::Codex { cmd } => cmd_codex::run(&cmd)?,
         Cmd::T3 { cmd } => cmd_t3::run_t3(paths, cmd)?,
         Cmd::Migrate { cmd } => cmd_migrate::run(paths, cmd)?,

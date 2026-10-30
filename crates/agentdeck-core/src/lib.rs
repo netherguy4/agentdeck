@@ -11,6 +11,7 @@ pub mod processes;
 pub mod registry;
 pub mod service;
 pub mod shared;
+pub mod sync;
 pub mod t3;
 pub mod usage;
 pub mod wrappers;

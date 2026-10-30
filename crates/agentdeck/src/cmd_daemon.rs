@@ -2,6 +2,8 @@ use agentdeck_core::Paths;
 use agentdeck_usage::daemon;
 use clap::Args;
 
+use crate::sync_watch;
+
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
     /// Also write the old ai-usage state paths (the router and the current
@@ -30,12 +32,17 @@ pub async fn run(paths: &Paths, args: DaemonArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     // Re-read policy: at start only (restart to apply).
-    daemon::run_daemon(&dpaths, daemon::old_service_active, || {
+    // Background sync watches beside quota polling; its failure is logged
+    // inside the task and never stops the poller.
+    let sync_task = tokio::spawn(sync_watch::run(paths.clone()));
+    let result = daemon::run_daemon(&dpaths, daemon::old_service_active, || {
         Ok((
             accounts.clone(),
             defaults.refresh_seconds,
             defaults.stale_seconds,
         ))
     })
-    .await
+    .await;
+    sync_task.abort();
+    result
 }
