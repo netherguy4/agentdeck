@@ -1,9 +1,8 @@
-//! Built-in plugins: marker-block instruction files plus the
-//! `agent-process` and `ai-usage` plugins (`router` arrives in M6).
-//!
-//! Plugin state lives in `instances.toml` under `[plugins]` (absent table =
-//! nothing enabled, so old files stay valid). Enabling a plugin lays out its
-//! files and instruction block; disabling removes them; plugin data is kept.
+//! Built-in plugins: the `agent-process` launcher, the `ai-usage` daemon unit
+//! and the `router` (model-route copy). Plugin state lives in `instances.toml`
+//! under `[plugins]` (absent table = nothing enabled, so old files stay
+//! valid). Enabling a plugin lays out its files and instruction block;
+//! disabling removes them; plugin data is kept.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +34,7 @@ fn check_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The router needs T3; until M6 it is listed but unavailable.
+/// The router needs T3 present (it reads providerInstances and caches).
 pub fn router_available() -> bool {
     crate::t3::t3_root().is_ok_and(|root| root.exists())
 }
@@ -400,11 +399,95 @@ pub fn status(paths: &Paths, home: &Path, exe: &Path) -> Vec<PluginStatus> {
     out.push(PluginStatus {
         name: PLUGIN_ROUTER,
         enabled: plugin_enabled(&reg, PLUGIN_ROUTER),
-        // Unavailable until M6, which gates it on T3 presence.
-        available: false,
-        detail: vec!["unavailable until M6 (needs T3)".to_string()],
+        available: router_available(),
+        detail: router_detail(paths, home),
     });
     out
+}
+
+fn router_detail(paths: &Paths, home: &Path) -> Vec<String> {
+    use crate::router as r;
+    let dir = r::router_dir(paths);
+    let installed = if dir.join("route.mjs").exists() {
+        "files: installed"
+    } else {
+        "files: missing"
+    }
+    .to_string();
+    let present = r::hooks_present(home, paths);
+    let hooks = format!(
+        "hooks: {}/4 targets",
+        present.iter().filter(|p| **p).count()
+    );
+    let begin = format!("<!-- {}:begin -->", r::ROUTER_MARKER);
+    let mut with_block = 0;
+    let mut present_files = 0;
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for file in default_instruction_files(home) {
+        let key = fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let Ok(bytes) = fs::read(&file) else { continue };
+        present_files += 1;
+        if String::from_utf8_lossy(&bytes)
+            .lines()
+            .any(|l| l.trim() == begin)
+        {
+            with_block += 1;
+        }
+    }
+    vec![
+        installed,
+        hooks,
+        format!("block: {with_block}/{present_files} files"),
+    ]
+}
+
+/// Enable order: files, then hooks, then the marker block (hooks fail closed,
+/// so they must never point at a missing router).
+fn plan_enable_router(
+    paths: &Paths,
+    home: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<Vec<Change>> {
+    if !router_available() {
+        anyhow::bail!("router needs T3 present (no T3 root found)");
+    }
+    let reg = Registry::load(paths)?;
+    let mut changes = crate::router::plan_router_files(paths, &reg)?;
+    changes.extend(crate::router::plan_hooks_enable(
+        home,
+        paths,
+        &paths.state_dir,
+    )?);
+    changes.extend(crate::router::plan_router_marker(
+        files,
+        Some(&crate::router::router_block(paths)),
+        &paths.state_dir,
+    )?);
+    Ok(changes)
+}
+
+/// Disable order: hooks first (fail closed), then files, then the block.
+/// `router.json` is generated data and is kept.
+fn plan_disable_router(
+    paths: &Paths,
+    home: &Path,
+    files: &[PathBuf],
+) -> anyhow::Result<Vec<Change>> {
+    if !router_available() {
+        anyhow::bail!("router needs T3 present (no T3 root found)");
+    }
+    let mut changes = crate::router::plan_hooks_disable(home, paths, &paths.state_dir)?;
+    changes.extend(crate::router::plan_remove_router_files(paths));
+    changes.extend(crate::router::plan_router_marker(
+        files,
+        None,
+        &paths.state_dir,
+    )?);
+    Ok(changes)
 }
 
 fn agent_process_detail(home: &Path, exe: &Path, files: &[PathBuf]) -> Vec<String> {
@@ -446,14 +529,15 @@ pub fn plan_enable(
     replace: bool,
 ) -> anyhow::Result<Vec<Change>> {
     check_name(name)?;
-    if name == PLUGIN_ROUTER {
-        anyhow::bail!("router is unavailable until M6 (needs T3)");
+    if name == PLUGIN_ROUTER && !router_available() {
+        anyhow::bail!("router needs T3 present (no T3 root found)");
     }
     let mut changes = match name {
         PLUGIN_AGENT_PROCESS => {
             plan_enable_agent_process(home, files, exe, replace, &paths.state_dir)?
         }
         PLUGIN_AI_USAGE => plan_enable_ai_usage(paths)?,
+        PLUGIN_ROUTER => plan_enable_router(paths, home, files)?,
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -481,12 +565,13 @@ pub fn plan_disable(
     name: &str,
 ) -> anyhow::Result<Vec<Change>> {
     check_name(name)?;
-    if name == PLUGIN_ROUTER {
-        anyhow::bail!("router is unavailable until M6 (needs T3)");
+    if name == PLUGIN_ROUTER && !router_available() {
+        anyhow::bail!("router needs T3 present (no T3 root found)");
     }
     let mut changes = match name {
         PLUGIN_AGENT_PROCESS => plan_disable_agent_process(home, files, exe, &paths.state_dir)?,
         PLUGIN_AI_USAGE => plan_disable_ai_usage()?,
+        PLUGIN_ROUTER => plan_disable_router(paths, home, files)?,
         _ => unreachable!(),
     };
     let old = fs::read(paths.registry_file()).ok();
@@ -758,6 +843,67 @@ mod tests {
         assert_eq!(changes.len(), 1);
         apply_disable_ai_usage(&changes).unwrap();
         assert!(!unit_path().unwrap().exists());
+    }
+
+    #[test]
+    fn router_enable_disable_round_trip() {
+        let _env = test_env_lock();
+        let (_g, home, paths, files, exe) = setup("router");
+        let t3 = _g.0.join("t3");
+        std::fs::create_dir_all(&t3).unwrap();
+        unsafe {
+            env::set_var("AGENTDECK_T3_DIR", &t3);
+        }
+        assert!(router_available());
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&files[0], "handwritten\n").unwrap();
+        // Enable: files, then hooks, then marker (+ registry flag last).
+        let changes = plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, false).unwrap();
+        assert!(!changes.is_empty());
+        let dir = crate::router::router_dir(&paths);
+        let first_router = changes
+            .iter()
+            .position(|c| matches!(c, Change::WriteFile { path, .. } if path.starts_with(&dir)))
+            .unwrap();
+        let first_other = changes
+            .iter()
+            .position(|c| {
+                matches!(c, Change::WriteFile { path, .. }
+                    if !path.starts_with(&dir) && *path != paths.registry_file())
+            })
+            .unwrap();
+        assert!(first_router < first_other, "files come before hooks/marker");
+        apply_all(&paths, PLUGIN_ROUTER, true, &changes).unwrap();
+        assert!(dir.join("route.mjs").exists());
+        assert!(dir.join("router.json").exists());
+        let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+        assert!(settings.contains("hook.mjs --harness claude"));
+        let text = fs::read_to_string(&files[0]).unwrap();
+        assert!(text.contains("<!-- model-route:begin -->"));
+        assert!(
+            plan_enable(&paths, &home, &files, &exe, PLUGIN_ROUTER, false)
+                .unwrap()
+                .is_empty()
+        );
+        // Disable: hooks first (fail closed), then files, then the block.
+        let changes = plan_disable(&paths, &home, &files, &exe, PLUGIN_ROUTER).unwrap();
+        assert!(!changes.is_empty());
+        let is_settings = |c: &Change| matches!(c, Change::WriteFile { path, .. } if path.ends_with("settings.json"));
+        let first_hook = changes.iter().position(is_settings).unwrap();
+        let first_remove = changes
+            .iter()
+            .position(|c| matches!(c, Change::Remove { .. }))
+            .unwrap();
+        assert!(first_hook < first_remove, "hooks go before files");
+        apply_all(&paths, PLUGIN_ROUTER, false, &changes).unwrap();
+        let settings = fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+        assert!(!settings.contains("hook.mjs"));
+        assert!(!dir.join("route.mjs").exists());
+        assert!(dir.join("router.json").exists(), "data is kept");
+        assert_eq!(fs::read(&files[0]).unwrap(), b"handwritten\n");
+        unsafe {
+            env::remove_var("AGENTDECK_T3_DIR");
+        }
     }
 
     #[test]

@@ -5,13 +5,14 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ACCOUNT, MIN_FIT, NO_REVIEW_BAN, REVIEW_TASK, enabledFavorites, ownsUsage, quotaWindows, reserveActiveQuota, quotaBudget, rankCandidates,
-  validAnswer, validateTarget } from './policy.mjs';
+import { MIN_FIT, NO_REVIEW_BAN, REVIEW_TASK, enabledFavorites, ownsUsage, quotaWindows, reserveActiveQuota, quotaBudget, rankCandidates,
+  validAnswer, validateTarget, routerConfig } from './policy.mjs';
 import { readActiveAgents } from './load.mjs';
 import { saveCatalog, readCatalog, reasoningTarget } from './reasoning.mjs';
 
 const home = os.homedir();
 const here = path.dirname(new URL(import.meta.url).pathname);
+const expandUser = p => p.startsWith('~/') ? path.join(home, p.slice(2)) : p;
 const runtime = process.env.XDG_RUNTIME_DIR ?? os.tmpdir();
 const readJson = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 const settings = readJson(path.join(home, '.t3/userdata/settings.json'));
@@ -61,8 +62,17 @@ while (argv[0]?.startsWith('--') && argv[0] !== '--check') {
   else { console.error(USAGE); process.exit(2); }
 }
 source ??= detectSource();
+// Pool, account maps and usage path come from the agentdeck router JSON
+// (`agentdeck router json` refreshes it); a missing or invalid file fails closed.
+let routerJson;
+try {
+  routerJson = routerConfig();
+} catch (e) {
+  console.error(e.message);
+  process.exit(1);
+}
 // Unknown instances are routed without shared-quota protection instead of failing the caller's hook.
-const sourceWarning = source && !Object.hasOwn(ACCOUNT, source)
+const sourceWarning = source && !Object.hasOwn(routerJson.ACCOUNT, source)
   ? `unknown source instance "${source}": no shared-quota protection` : undefined;
 
 const roster = readJson(path.join(here, 'roster.json'));
@@ -193,7 +203,7 @@ function codexCosts() {
   return result;
 }
 
-let usage = readJson(path.join(home, '.local/state/ai-usage/state.json'));
+let usage = readJson(expandUser(routerJson.usageStatePath ?? '~/.local/state/ai-usage/state.json'));
 let activeLoad = readActiveAgents();
 const measured = codexCosts();
 
@@ -240,10 +250,10 @@ function quota(provider, model) {
   };
 }
 
-// T3 hides favorites whose providers were removed. Do not resurrect them under new provider ids.
-// T3 moved favorites from client-settings.json to settings.json; the old file keeps a stale copy.
-const configured = enabledFavorites(settings.favorites
-  ?? readJson(path.join(home, '.t3/userdata/client-settings.json')).favorites, settings);
+// The pool is agentdeck's own; T3 favorites stay UI-only and are never read.
+const configured = enabledFavorites(routerJson.pool
+  .filter(e => e.enabled !== false)
+  .map(e => ({ provider: e.providerInstanceId, model: e.model, ...(e.options && { options: e.options }) })), settings);
 // Not `opencode models`: on a cold OpenCode location it prints nothing, then a list taken before
 // enabled_providers/plugins settle (Zen, no opencode-go). T3's saved catalog is what delegate_task accepts.
 const opencodeModels = new Set(configured.some(f => f.provider === 'opencode')
@@ -296,7 +306,7 @@ const complete = a => validAnswer(a?.size, false) && validAnswer(a?.difficulty, 
 // files hold scores only, never the brief.
 const JEV_TTL = 10 * 60e3;
 const cacheDir = path.join(runtime, 'model-route-jev-cache');
-const cacheFile = path.join(cacheDir, createHash('sha256').update(JSON.stringify([source ?? null, request])).digest('hex') + '.json');
+const cacheFile = path.join(cacheDir, createHash('sha256').update(JSON.stringify([source ?? null, routerJson.version, request])).digest('hex') + '.json');
 const fresh = t => Date.now() - t >= 0 && Date.now() - t < JEV_TTL;
 let cached;
 try { const e = readJson(cacheFile); if (fresh(e.t) && complete(e.answers)) cached = e.answers; } catch {}
@@ -330,7 +340,7 @@ const difficulty = Math.max(0, Math.min(3, Math.round(answers.difficulty.score))
 const catalog = readCatalog();
 const targetOf = (provider, model) => reasoningTarget(catalog, provider, model, difficulty);
 // Work can start while Jev is judging; refresh both snapshots before committing the ranking.
-usage = readJson(path.join(home, '.local/state/ai-usage/state.json'));
+usage = readJson(expandUser(routerJson.usageStatePath ?? '~/.local/state/ai-usage/state.json'));
 activeLoad = readActiveAgents();
 for (const f of favorites) f.quota = quota(f.provider, f.model);
 // Thresholds and scores use raw values; rounding is display only.
@@ -358,7 +368,7 @@ const brief = r => ({ provider: r.provider, model: r.model, quality: +r.quality.
 console.log(JSON.stringify({
   target: best?.target ?? null,
   ...(best && hintOf(best.model) && { briefHint: hintOf(best.model) }),
-  source: source ?? null, sourceAccount: ACCOUNT[source] ?? null, ...(sourceWarning && { sourceWarning }),
+  source: source ?? null, sourceAccount: routerJson.ACCOUNT[source] ?? null, ...(sourceWarning && { sourceWarning }),
   reason: !best ? 'no adequate model with enough quota' : 'highest estimated quality with enough quota, after shared-quota and paid-credit penalties and cheap-model bonus',
   size: `${size}: ${SIZES[size]}`, difficulty: `${difficulty}: ${DIFFICULTY[difficulty]}`,
   jevConfidence: +jevConfidence.toFixed(3), confidence: round(confidence),

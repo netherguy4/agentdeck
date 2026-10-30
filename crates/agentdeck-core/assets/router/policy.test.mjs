@@ -6,6 +6,29 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { MIN_FIT, NO_REVIEW_BAN, REVIEW_TASK, enabledFavorites, ownsUsage, quotaWindows, reserveActiveQuota, quotaBudget, rankCandidates, validAnswer, validateTarget } from './policy.mjs';
 
+// The pool and account maps moved from T3 favorites and hardcoded maps into the
+// agentdeck router JSON; every direct and spawned use below reads this fixture.
+const routerHome = fs.mkdtempSync(path.join(os.tmpdir(), 'model-route-router-json-'));
+const routerFile = path.join(routerHome, 'router.json');
+const writeRouterJson = ({ pool, accounts, usageStatePath }) => fs.writeFileSync(routerFile, JSON.stringify({
+  version: 1, pool, accounts, ...(usageStatePath && { usageStatePath }),
+}));
+process.env.MODEL_ROUTE_ROUTER_JSON = routerFile;
+const allAccounts = {
+  claude: { instances: ['claudeAgent'], usageProvider: 'claude', usageId: 'claude-main' },
+  claude_second: { instances: ['claude_second'], usageProvider: 'claude', usageId: 'claude-second' },
+  claude_third: { instances: ['claude_third'], usageProvider: 'claude', usageId: 'claude-third' },
+  claude_fourth: { instances: ['claude_fourth'], usageProvider: 'claude', usageId: 'claude-fourth' },
+  codex: { instances: ['codex'], usageProvider: 'codex', usageId: 'codex-main' },
+  codex_second: { instances: ['codex_second'], usageProvider: 'codex', usageId: 'codex-second' },
+  antigravity: { instances: ['antigravity'], usageProvider: 'antigravity' },
+  openrouter: { instances: ['opencode', 'claudeAgent_openrouter'], usageProvider: 'openrouter' },
+  'opencode-go': { instances: ['opencode'], usageProvider: 'opencode-go', modelPrefix: 'opencode-go/' },
+};
+const allPool = Object.keys(allAccounts).filter(a => a !== 'opencode-go')
+  .flatMap(a => allAccounts[a].instances.map(providerInstanceId => ({ providerInstanceId, model: providerInstanceId, enabled: true })));
+writeRouterJson({ pool: allPool, accounts: allAccounts });
+
 const weights = JSON.parse(fs.readFileSync(new URL('./roster.json', import.meta.url), 'utf8')).routing;
 const model = (provider, overrides = {}) => ({ provider, model: provider, fit: 0.95,
   quality: 0.8, allowed: true, ...overrides });
@@ -217,8 +240,9 @@ try {
   // Exercise route.mjs itself: a failed refresh must not bypass retained account limits.
   const models = ['claude-opus-5-5', 'claude-fable-5-1'];
   for (const rel of ['.t3/userdata', '.local/state/ai-usage']) fs.mkdirSync(path.join(dir, rel), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.t3/userdata/client-settings.json'), JSON.stringify({
-    favorites: models.map(model => ({ provider: 'claudeAgent', model })) }));
+  writeRouterJson({ pool: models.map(model => ({ providerInstanceId: 'claudeAgent', model, enabled: true })),
+    accounts: { claude: { instances: ['claudeAgent'], usageProvider: 'claude', usageId: 'claude-main' } },
+    usageStatePath: path.join(dir, '.local/state/ai-usage/state.json') });
   fs.writeFileSync(path.join(dir, '.t3/userdata/settings.json'), '{}');
   fs.writeFileSync(path.join(dir, 'model-route-codex-costs-v4.json'), '{"version":4,"costs":{}}');
   const cachedAccount = { provider: 'claude', plan: 'Max 5x', status: 'stale', error: 'quota HTTP 429',
@@ -233,7 +257,8 @@ try {
       os.homedir = () => process.cwd();
       process.argv = [process.execPath, 'route.mjs', '--check'];
       await import(${JSON.stringify(new URL('./route.mjs', import.meta.url).href)});
-    `], { cwd: dir, env: { ...process.env, XDG_RUNTIME_DIR: dir, XDG_STATE_HOME: path.join(dir, 'test-state') }, encoding: 'utf8' });
+    `], { cwd: dir, env: { ...process.env, XDG_RUNTIME_DIR: dir, XDG_STATE_HOME: path.join(dir, 'test-state'),
+      MODEL_ROUTE_ROUTER_JSON: routerFile }, encoding: 'utf8' });
   };
   for (const status of ['ok', 'stale', 'error']) {
     const output = checkRoute({ ...cachedAccount, status });
@@ -243,8 +268,9 @@ try {
   const expired = { ...cachedAccount, windows: cachedAccount.windows.map(w => ({ ...w, resets_at: 1 })) };
   assert.match(checkRoute(expired), / 0% left[^]*?allowed sizes: none/);
   assert.match(checkRoute({ ...cachedAccount, windows: [], balances: [] }), /quota unknown[^]*?allowed sizes: 0,1,2,3/);
-  fs.writeFileSync(path.join(dir, '.t3/userdata/client-settings.json'), JSON.stringify({
-    favorites: [{ provider: 'claudeAgent_openrouter', model: 'meta/muse-spark-1.3-contributor[1m]' }] }));
+  writeRouterJson({ pool: [{ providerInstanceId: 'claudeAgent_openrouter', model: 'meta/muse-spark-1.3-contributor[1m]', enabled: true }],
+    accounts: { openrouter: { instances: ['claudeAgent_openrouter'], usageProvider: 'openrouter' } },
+    usageStatePath: path.join(dir, '.local/state/ai-usage/state.json') });
   assert.match(checkRoute({ ...cachedAccount, provider: 'openrouter', windows: [], balances: [{ total: '0' }] }),
     /\$0\.00 left[^]*?allowed sizes: none/);
 } finally { fs.rmSync(dir, { recursive: true }); }
@@ -264,15 +290,16 @@ const cli = (dir, args, jev, input) => {
   process.argv = [process.execPath, 'route.mjs', ...JSON.parse(process.env.ROUTE_ARGS)];
   await import(${JSON.stringify(new URL('./route.mjs', import.meta.url).href)});
 `], { cwd: dir, timeout: 10_000, input, encoding: 'utf8', env: { ...process.env, XDG_RUNTIME_DIR: dir, XDG_STATE_HOME: path.join(dir, 'test-state'), JEV_OPENROUTER_API_KEY: 'test',
-  MOCK_JEV: JSON.stringify(jev), ROUTE_ARGS: JSON.stringify(args) } });
+  MOCK_JEV: JSON.stringify(jev), ROUTE_ARGS: JSON.stringify(args), MODEL_ROUTE_ROUTER_JSON: routerFile } });
 };
 const routeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-route-cli-test-'));
 try {
   for (const rel of ['.t3/userdata', '.local/state/ai-usage']) fs.mkdirSync(path.join(routeDir, rel), { recursive: true });
   fs.mkdirSync(path.join(routeDir, 'test-state/model-route'), { recursive: true });
   fs.copyFileSync(new URL('./catalog.fixture.json', import.meta.url), path.join(routeDir, 'test-state/model-route/catalog.json'));
-  fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'), JSON.stringify({ favorites: [
-    { provider: 'claudeAgent', model: 'claude-opus-5-5' }, { provider: 'claudeAgent', model: 'claude-haiku-5-5' }] }));
+  const setPool = entries => writeRouterJson({ pool: entries.map(([provider, model]) => ({ providerInstanceId: provider, model, enabled: true })),
+    accounts: allAccounts, usageStatePath: path.join(routeDir, '.local/state/ai-usage/state.json') });
+  setPool([['claudeAgent', 'claude-opus-5-5'], ['claudeAgent', 'claude-haiku-5-5']]);
   fs.writeFileSync(path.join(routeDir, '.t3/userdata/settings.json'), '{}');
   const t = Date.now() / 1000;
   fs.writeFileSync(path.join(routeDir, '.local/state/ai-usage/state.json'), JSON.stringify({ accounts: [{
@@ -350,8 +377,7 @@ try {
     ['claudeAgent', 'claude-opus-4-5', 'effort', ['low', 'medium', 'high', 'high']],
     ['claudeAgent_openrouter', 'claude-opus-5-5', 'effort', ['low', 'medium', 'high', 'xhigh']],
   ]) {
-    fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'),
-      JSON.stringify({ favorites: [{ provider, model }] }));
+    setPool([[provider, model]]);
     for (const [difficulty, effort] of levels.entries()) {
       const answers = { answers: { size: { score: 3 - difficulty, confidence: 0.9 },
         difficulty: { score: difficulty, confidence: 0.9 },
@@ -365,8 +391,7 @@ try {
     }
   }
   const agy = { providerInstanceId: 'antigravity', model: 'gemini-3.8-flash-high' };
-  fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'), JSON.stringify({ favorites: [
-    { provider: 'antigravity', model: agy.model }, { provider: 'codex_second', model: 'gpt-6.1-sol' }] }));
+  setPool([['antigravity', agy.model], ['codex_second', 'gpt-6.1-sol']]);
   const crossProvider = { answers: { size: { score: 0, confidence: 0.9 }, difficulty: { score: 3, confidence: 0.9 },
     antigravity_gemini_3_8_flash_high: level(2.9), codex_second_gpt_6_1_sol: level(2.1) } };
   out = run(['--source', 'codex', '--validate-target', 'codex_second', 'gpt-6.1-sol', brief], crossProvider);
@@ -384,8 +409,7 @@ try {
   customCatalog.providers.find(p => p.providerInstanceId === 'claudeAgent_openrouter').models.push({
     id: custom, options: [{ id: 'effort', type: 'select', options: [{ id: 'high' }] }] });
   fs.writeFileSync(catalogPath, JSON.stringify(customCatalog));
-  fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'), JSON.stringify({ favorites: [
-    { provider: 'claudeAgent_openrouter', model: custom }, { provider: 'codex_second', model: 'gpt-6.1-sol' }] }));
+  setPool([['claudeAgent_openrouter', custom], ['codex_second', 'gpt-6.1-sol']]);
   const unsuitable = { answers: { size: { score: 0, confidence: 0.9 }, difficulty: { score: 2, confidence: 0.9 },
     claudeagent_openrouter_meta_muse_spark_1_3_contributor_1m_: level(3), codex_second_gpt_6_1_sol: level(2) } };
   out = run(['--source', 'codex', '--validate-target', 'claudeAgent_openrouter', custom, brief], unsuitable);
@@ -393,8 +417,7 @@ try {
   assert.equal(out.validation.allowed, false);
   assert.match(out.validation.reason, /cannot apply/);
   assert.equal(out.ranking.find(r => r.model === custom).eligible, false);
-  fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'), JSON.stringify({ favorites: [
-    { provider: 'claudeAgent_openrouter', model: custom }] }));
+  setPool([['claudeAgent_openrouter', custom]]);
   out = run(['--source', 'codex', '--validate-target', 'claudeAgent_openrouter', custom, brief], unsuitable);
   assert.equal(out.target, null);
   assert.match(out.validation.reason, /cannot apply/);
@@ -403,8 +426,7 @@ try {
   opaqueCatalog.providers.find(p => p.providerInstanceId === 'opencode').models[0].options = [
     { id: 'variant', type: 'select', options: [{ id: 'quick' }, { id: 'deep' }] }];
   fs.writeFileSync(catalogPath, JSON.stringify(opaqueCatalog));
-  fs.writeFileSync(path.join(routeDir, '.t3/userdata/client-settings.json'), JSON.stringify({ favorites: [
-    { provider: 'opencode', model: 'anthropic/claude-opus-5-5' }, { provider: 'codex_second', model: 'gpt-6.1-sol' }] }));
+  setPool([['opencode', 'anthropic/claude-opus-5-5'], ['codex_second', 'gpt-6.1-sol']]);
   const unmappable = { answers: { size: { score: 0, confidence: 0.9 }, difficulty: { score: 2, confidence: 0.9 },
     opencode_anthropic_claude_opus_5_5: level(3), codex_second_gpt_6_1_sol: level(2) } };
   out = run(['--source', 'codex', '--validate-target', 'opencode', 'anthropic/claude-opus-5-5', brief], unmappable);

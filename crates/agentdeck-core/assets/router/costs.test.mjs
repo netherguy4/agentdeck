@@ -10,9 +10,12 @@ try {
   const sessions = path.join(dir, '.codex/sessions/2026/10/01');
   for (const rel of ['.t3/userdata', '.local/state/ai-usage']) fs.mkdirSync(path.join(dir, rel), { recursive: true });
   fs.mkdirSync(sessions, { recursive: true });
-  fs.writeFileSync(path.join(dir, '.t3/userdata/client-settings.json'), JSON.stringify({
-    favorites: ['gpt-x', 'gpt-y', 'gpt-z', 'gpt-w', 'gpt-v'].map(model => ({ provider: 'codex', model })) }));
+  fs.writeFileSync(path.join(dir, 'router.json'), JSON.stringify({ version: 1,
+    pool: ['gpt-x', 'gpt-y', 'gpt-z', 'gpt-w', 'gpt-v'].map(model => ({ providerInstanceId: 'codex', model, enabled: true })),
+    accounts: { codex: { instances: ['codex'], usageProvider: 'codex', usageId: 'codex-main' } },
+    usageStatePath: path.join(dir, '.local/state/ai-usage/state.json') }));
   fs.writeFileSync(path.join(dir, '.t3/userdata/settings.json'), '{}');
+  process.env.MODEL_ROUTE_ROUTER_JSON = path.join(dir, 'router.json');
   // Legacy caches (v4 includes an earlier draft's calibration) and an unversioned current cache must not be trusted.
   const bogus = JSON.stringify({ plan: 'plus', costs: { 'prolite|gpt-x': { n: 99, pct: [9, 9, 9, 9] } } });
   fs.writeFileSync(path.join(dir, 'model-route-codex-costs-v2.json'), bogus);

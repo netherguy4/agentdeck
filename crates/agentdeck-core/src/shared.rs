@@ -979,7 +979,7 @@ pub fn describe_codex_change(path: &Path, old: Option<&[u8]>, new: &[u8]) -> Str
         }
         out.join("\n")
     };
-    let old_text = old.map(&mask).unwrap_or_default();
+    let old_text = old.map(mask).unwrap_or_default();
     let new_text = mask(new);
     if old.is_some_and(|b| b == new) {
         return format!("write {} (unchanged)", path.display());

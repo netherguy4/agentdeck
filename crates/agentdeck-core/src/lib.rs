@@ -9,6 +9,7 @@ pub mod plugins;
 pub mod pool;
 pub mod processes;
 pub mod registry;
+pub mod router;
 pub mod service;
 pub mod shared;
 pub mod t3;

@@ -1,15 +1,67 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 // Provider instances sharing one subscription or credit balance compete for the same quota.
+// The maps live in the agentdeck router JSON (pool + [[usage]]); `agentdeck router json` writes it.
 // codex_second is a separate Codex Plus login (shadow CODEX_HOME); claude_second/claude_third/claude_fourth are separate Claude logins.
-export const ACCOUNT = { claudeAgent: 'claude', claude_second: 'claude_second', claude_third: 'claude_third', claude_fourth: 'claude_fourth', codex: 'codex',
-  codex_second: 'codex_second', antigravity: 'antigravity', opencode: 'openrouter', claudeAgent_openrouter: 'openrouter' };
-// ai-usage reports each Codex and Claude login under one provider name; only their account ids tell them apart.
-const USAGE_ID = { codex: 'codex-main', codex_second: 'codex-second',
-  claudeAgent: 'claude-main', claude_second: 'claude-second', claude_third: 'claude-third', claude_fourth: 'claude-fourth' };
+let ROUTER = null;
+export function routerConfig() {
+  if (!ROUTER) ROUTER = loadRouterJson();
+  return ROUTER;
+}
+function loadRouterJson() {
+  const file = process.env.MODEL_ROUTE_ROUTER_JSON
+    ?? path.join(path.dirname(new URL(import.meta.url).pathname), 'router.json');
+  const fail = why => { throw new Error(`model-route: router JSON unusable at ${file}: ${why}; regenerate it with \`agentdeck router json\``); };
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    fail(e.message);
+  }
+  if (!data || typeof data !== 'object' || !Array.isArray(data.pool)
+    || !data.accounts || typeof data.accounts !== 'object') fail('expected {pool[], accounts{}}');
+  for (const e of data.pool)
+    if (!e || typeof e !== 'object' || typeof e.providerInstanceId !== 'string' || typeof e.model !== 'string'
+      || (e.options !== undefined && (!e.options || typeof e.options !== 'object' || Array.isArray(e.options)))) fail('bad pool entry');
+  if (data.usageStatePath !== undefined && typeof data.usageStatePath !== 'string') fail('bad usageStatePath');
+  // An account groups the instances sharing one subscription; a modelPrefix account (OpenCode Go)
+  // additionally matches only its models on the listed instances.
+  const ACCOUNT = {}, USAGE_ID = {}, META = {};
+  for (const [account, meta] of Object.entries(data.accounts)) {
+    if (!meta || typeof meta !== 'object' || !Array.isArray(meta.instances) || !meta.instances.length
+      || typeof meta.usageProvider !== 'string') fail(`bad account ${JSON.stringify(account)}`);
+    META[account] = { usageProvider: meta.usageProvider, instances: meta.instances };
+    if (meta.modelPrefix !== undefined) {
+      if (typeof meta.modelPrefix !== 'string') fail(`bad account ${JSON.stringify(account)}`);
+      META[account].modelPrefix = meta.modelPrefix;
+      for (const instance of meta.instances)
+        if (!ACCOUNT[instance]) fail(`prefix account ${JSON.stringify(account)} lists unmapped instance ${JSON.stringify(instance)}`);
+    } else {
+      for (const instance of meta.instances) {
+        if (typeof instance !== 'string' || ACCOUNT[instance]) fail(`bad or duplicate instance ${JSON.stringify(instance)}`);
+        ACCOUNT[instance] = account;
+        if (meta.usageId !== undefined) {
+          if (typeof meta.usageId !== 'string') fail(`bad account ${JSON.stringify(account)}`);
+          USAGE_ID[instance] = meta.usageId;
+        }
+      }
+    }
+  }
+  return { file, version: data.version ?? 1, pool: data.pool, usageStatePath: data.usageStatePath, ACCOUNT, USAGE_ID, META };
+}
 // The OpenCode instance mixes OpenRouter credits with the OpenCode Go subscription; the model prefix decides.
-export const accountOf = (instance, model) =>
-  instance === 'opencode' && /^opencode-go\//.test(model ?? '') ? 'opencode-go' : ACCOUNT[instance];
+export const accountOf = (instance, model) => {
+  const { ACCOUNT, META } = routerConfig();
+  for (const [account, meta] of Object.entries(META))
+    if (meta.modelPrefix && meta.instances.includes(instance) && (model ?? '').startsWith(meta.modelPrefix)) return account;
+  return ACCOUNT[instance];
+};
 export function ownsUsage(account, instance, model) {
-  return USAGE_ID[instance] && account.id ? account.id === USAGE_ID[instance] : account.provider === accountOf(instance, model);
+  const { USAGE_ID } = routerConfig();
+  // ai-usage reports each Codex and Claude login under one provider name; only their account ids tell them apart.
+  if (USAGE_ID[instance] && account.id) return account.id === USAGE_ID[instance];
+  return account.provider === accountOf(instance, model);
 }
 export const MIN_FIT = 0.7;
 // A requested delegate may differ from the selected best only by this many score points.
@@ -78,7 +130,7 @@ export const NO_REVIEW_BAN = 'never for audits or reviews (user rule 2026-10-17)
 
 // Score is one scalar per candidate, so the ranking stays transitive. Remaining quota only gates eligibility.
 export function rankCandidates(candidates, difficulty, source, weights) {
-  const account = ACCOUNT[source];
+  const account = routerConfig().ACCOUNT[source];
   const scale = difficulty > 1 ? 0.5 : 1;
   // Jev judges one model separately per account, so the copies differ only by sampling noise (0.86 vs 0.84 for
   // the same gpt-6.1-sol, 2026-10-17). Their mean gives every copy one verdict; the load tie-break then spreads work.

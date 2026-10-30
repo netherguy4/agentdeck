@@ -16,8 +16,12 @@ try {
     fs.copyFileSync(new URL(f, import.meta.url), path.join(code, f));
   for (const rel of ['.t3/userdata', '.local/state/ai-usage']) fs.mkdirSync(path.join(dir, rel), { recursive: true });
   fs.writeFileSync(path.join(dir, '.t3/userdata/settings.json'), '{}');
-  const favorites = models => fs.writeFileSync(path.join(dir, '.t3/userdata/client-settings.json'),
-    JSON.stringify({ favorites: models.map(([provider, model]) => ({ provider, model })) }));
+  const favorites = models => fs.writeFileSync(path.join(code, 'router.json'), JSON.stringify({ version: 1,
+    pool: models.map(([provider, model]) => ({ providerInstanceId: provider, model, enabled: true })),
+    accounts: {
+      claude: { instances: ['claudeAgent'], usageProvider: 'claude', usageId: 'claude-main' },
+      codex: { instances: ['codex'], usageProvider: 'codex', usageId: 'codex-main' } },
+    usageStatePath: path.join(dir, '.local/state/ai-usage/state.json') }));
   favorites([['claudeAgent', 'claude-opus-5-5'], ['codex', 'gpt-6.1-sol']]);
   const quota = claudeLeft => {
     const t = Date.now() / 1000;
