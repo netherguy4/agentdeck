@@ -32,21 +32,25 @@ pub enum HarnessChoice {
 }
 
 impl HarnessChoice {
-    fn as_harness(self) -> Option<Harness> {
+    fn as_harness(self) -> Harness {
         match self {
-            Self::Claude => Some(Harness::Claude),
-            Self::Codex => Some(Harness::Codex),
-            Self::Opencode | Self::Agy => None,
+            Self::Claude => Harness::Claude,
+            Self::Codex => Harness::Codex,
+            Self::Opencode => Harness::Opencode,
+            Self::Agy => Harness::Agy,
         }
     }
 }
 
-/// Suggested home for a new id: `~/.claude-<id>`, or `~/.codex-t3/<id>`.
+/// Suggested home for a new id: `~/.claude-<id>`, `~/.codex-t3/<id>`, an
+/// OpenCode data dir (its parent becomes XDG_DATA_HOME) or an agy login dir.
 pub fn suggest_home(harness: HarnessChoice, id: &str) -> String {
     let id = id.trim();
     match harness {
         HarnessChoice::Codex => format!("~/.codex-t3/{id}"),
-        _ => format!("~/.claude-{id}"),
+        HarnessChoice::Opencode => format!("~/.opencode-{id}/opencode"),
+        HarnessChoice::Agy => format!("~/.agy-{id}"),
+        HarnessChoice::Claude => format!("~/.claude-{id}"),
     }
 }
 
@@ -209,9 +213,7 @@ pub enum AddMsg {
 }
 
 fn spec_of(wiz: &Wizard) -> anyhow::Result<AddSpec> {
-    let Some(harness) = wiz.harness.as_harness() else {
-        anyhow::bail!("opencode/agy instances arrive in M7");
-    };
+    let harness = wiz.harness.as_harness();
     let id = wiz.id.trim().to_string();
     Ok(AddSpec {
         id,
@@ -270,7 +272,8 @@ pub async fn compute_preview(paths: Paths, spec: AddSpec) -> Result<Vec<String>,
                     .map(|c| c.describe()),
             );
         }
-        _ => return Err("opencode/agy instances arrive in M7".into()),
+        // No shared profile to copy: the registry row is the whole change.
+        Harness::Opencode | Harness::Agy => {}
     }
     Ok(lines)
 }
@@ -295,7 +298,7 @@ pub async fn apply_add(paths: Paths, spec: AddSpec) -> Result<Vec<String>, Strin
             let main = main_codex_home(&reg);
             agentdeck_core::codex::plan_materialize(&main, &home, &paths.state_dir).map_err(err)?
         }
-        _ => return Err("opencode/agy instances arrive in M7".into()),
+        Harness::Opencode | Harness::Agy => Vec::new(),
     };
     lines.extend(materialize.iter().map(|c| c.describe()));
     agentdeck_core::apply_changes(&materialize).map_err(err)?;
@@ -686,6 +689,15 @@ fn login_panel(wiz: &Wizard) -> Element<'_, Message> {
     let mut col = column![st::heading(fl!(loader(), "add-login-title"))].spacing(st::SPACE_S);
     match &login.status {
         LoginStatus::Idle | LoginStatus::Cancelled => {
+            if wiz.harness == HarnessChoice::Agy {
+                // No login CLI exists: show the manual step instead.
+                return column![
+                    st::heading(fl!(loader(), "add-login-title")),
+                    st::muted(fl!(loader(), "add-login-agy"))
+                ]
+                .spacing(st::SPACE_S)
+                .into();
+            }
             let is_codex = wiz.harness == HarnessChoice::Codex;
             col = col.push(
                 button(st::body(fl!(loader(), "add-login-start")))
@@ -793,7 +805,15 @@ pub fn view(wiz: &Wizard) -> Element<'_, Message> {
             radio("Codex", HarnessChoice::Codex, Some(wiz.harness), |h| {
                 Message::Add(AddMsg::Harness(h))
             },),
-            st::muted(fl!(loader(), "add-harness-note")),
+            radio(
+                "OpenCode",
+                HarnessChoice::Opencode,
+                Some(wiz.harness),
+                |h| { Message::Add(AddMsg::Harness(h)) },
+            ),
+            radio("agy", HarnessChoice::Agy, Some(wiz.harness), |h| {
+                Message::Add(AddMsg::Harness(h))
+            },),
         ]
         .spacing(st::SPACE_M),
         st::body(fl!(loader(), "add-id")),

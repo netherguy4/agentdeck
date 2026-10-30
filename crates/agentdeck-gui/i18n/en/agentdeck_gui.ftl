@@ -79,7 +79,6 @@ plugins-preview-disable = Disabling { $name } will remove its files (data is kep
 add-title = Add instance
 add-back = Back to Instances
 add-harness = Harness
-add-harness-note = opencode and agy arrive in M7.
 add-id = Instance id
 add-id-note = Ids are never renamed: T3 history binds to them.
 add-display-name = Display name
@@ -114,3 +113,51 @@ remove-threads =
         [one] T3 keeps { $count } thread for this id; history stays but cannot launch.
        *[other] T3 keeps { $count } threads for this id; history stays but cannot launch.
     }
+
+nav-pool = Pool
+nav-shared = Shared
+nav-harnesses = Harnesses
+action-apply = Apply
+action-cancel = Cancel
+action-working = Working…
+action-none = Nothing to change: already in sync.
+
+add-login-agy = agy has no login CLI: sign in with your Google account in the Antigravity IDE. It is a single account per OS user.
+
+pool-title = Pool
+pool-empty = No pool entries yet.
+pool-enabled = enabled
+pool-disabled = disabled
+pool-enable = Enable
+pool-disable = Disable
+pool-remove = Remove
+pool-add-title = Add entry
+pool-instance = Instance
+pool-model = Model
+pool-no-models = No cached models for this instance: type a model id.
+pool-options = Options (k=v, comma separated)
+pool-preview-add = Preview add
+pool-import = Import T3 favorites
+pool-preview-title = Preview pool change
+pool-import-count = { $count } favorites to import.
+pool-warning = Warning: { $what }
+
+shared-title = Shared
+shared-skills = Skills
+shared-skills-sync = Sync skills
+shared-instr = Instruction files
+shared-instr-link = Link instruction files
+shared-mcp = MCP servers
+shared-mcp-sync = Sync MCP servers
+shared-mcp-hidden = Server values are hidden.
+shared-mcp-none = No canonical MCP servers found.
+shared-skills-dir = { $dir }: { $ok } ok, { $todo } need sync
+shared-preview-title = Preview changes
+
+harness-title = Harnesses
+harness-not-installed = not installed
+harness-update = Update
+harness-install = Install
+harness-run-title = Run this command?
+harness-note = The command runs as shown; nothing else is touched.
+harness-result = { $name }: { $what }

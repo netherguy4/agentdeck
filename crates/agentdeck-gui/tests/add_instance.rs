@@ -40,8 +40,14 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Pin every real-machine source to empty temp paths: with the real
+    // ~/.t3 (a multi-GB state DB) and /proc, each data::load took minutes.
+    let empty = std::env::temp_dir().join(format!("agentdeck-gui-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
     unsafe {
-        std::env::remove_var("AGENTDECK_T3_DIR");
+        std::env::set_var("AGENTDECK_T3_DIR", empty.join("t3"));
+        std::env::set_var("AGENTDECK_PROC_DIR", &empty);
+        std::env::set_var("HOME", &empty);
     }
     guard
 }

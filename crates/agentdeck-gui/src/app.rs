@@ -11,6 +11,7 @@ use crate::i18n::loader;
 use crate::pages::add_instance::{self, AddMsg};
 use crate::pages::drift::{self, Ctx as DriftCtx};
 use crate::pages::plugins::Pending;
+use crate::pages::{self, harnesses, pool, shared};
 use crate::style as st;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +22,9 @@ pub enum Page {
     Drift,
     Plugins,
     Processes,
+    Pool,
+    Shared,
+    Harnesses,
 }
 
 impl Page {
@@ -31,6 +35,9 @@ impl Page {
             Self::Drift => fl!(loader(), "nav-drift"),
             Self::Plugins => fl!(loader(), "nav-plugins"),
             Self::Processes => fl!(loader(), "nav-processes"),
+            Self::Pool => fl!(loader(), "nav-pool"),
+            Self::Shared => fl!(loader(), "nav-shared"),
+            Self::Harnesses => fl!(loader(), "nav-harnesses"),
         }
     }
 }
@@ -57,6 +64,9 @@ pub enum Message {
     ProcCancel,
     ProcForce(bool),
     ProcDone { title: String, result: String },
+    Pool(pages::pool::Msg),
+    Shared(pages::shared::Msg),
+    Harnesses(pages::harnesses::Msg),
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +103,29 @@ pub struct State {
     remove: Option<RemoveAsk>,
     pending: Option<Pending>,
     proc_ui: crate::pages::processes::ProcUi,
+    pool: pool::State,
+    shared: shared::State,
+    harnesses: harnesses::State,
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+}
+
+fn pool_ctx(paths: &agentdeck_core::Paths) -> pool::Ctx {
+    pool::Ctx {
+        paths: paths.clone(),
+        t3_root: agentdeck_core::t3::t3_root().ok(),
+    }
+}
+
+fn shared_ctx(paths: &agentdeck_core::Paths) -> shared::Ctx {
+    shared::Ctx {
+        paths: paths.clone(),
+        home: home_dir(),
+    }
 }
 
 impl State {
@@ -110,6 +143,9 @@ impl State {
                 remove: None,
                 pending: None,
                 proc_ui: crate::pages::processes::ProcUi::default(),
+                pool: pool::State::default(),
+                shared: shared::State::default(),
+                harnesses: harnesses::State::default(),
             },
             match first {
                 Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
@@ -129,6 +165,9 @@ impl State {
             remove: None,
             pending: None,
             proc_ui: crate::pages::processes::ProcUi::default(),
+            pool: pool::State::default(),
+            shared: shared::State::default(),
+            harnesses: harnesses::State::default(),
         }
     }
 
@@ -150,7 +189,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             if page == Page::AddInstance {
                 state.add = add_instance::Wizard::default();
             }
-            Task::none()
+            // Status for these pages is read when they open and after actions.
+            match (page, state.paths.clone()) {
+                (Page::Pool, Some(paths)) => {
+                    let ctx = pool_ctx(&paths);
+                    Task::perform(async move { pool::load(&ctx) }, Message::Pool)
+                }
+                (Page::Shared, Some(paths)) => {
+                    let ctx = shared_ctx(&paths);
+                    Task::perform(async move { shared::load(&ctx) }, Message::Shared)
+                }
+                (Page::Harnesses, _) => Task::perform(harnesses::load(), Message::Harnesses),
+                _ => Task::none(),
+            }
         }
         Message::Tick => match state.paths.clone() {
             Some(paths) => {
@@ -318,6 +369,19 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
                 None => Task::none(),
             }
         }
+        Message::Pool(msg) => match state.paths.clone() {
+            Some(paths) => pool::update(&mut state.pool, pool_ctx(&paths), msg).map(Message::Pool),
+            None => Task::none(),
+        },
+        Message::Shared(msg) => match state.paths.clone() {
+            Some(paths) => {
+                shared::update(&mut state.shared, shared_ctx(&paths), msg).map(Message::Shared)
+            }
+            None => Task::none(),
+        },
+        Message::Harnesses(msg) => {
+            harnesses::update(&mut state.harnesses, msg).map(Message::Harnesses)
+        }
         Message::Noop => Task::none(),
         Message::Drift(inner) => match state.paths.clone() {
             Some(paths) => {
@@ -423,7 +487,15 @@ pub fn subscription(state: &State) -> Subscription<Message> {
 fn sidebar(state: &State) -> Element<'_, Message> {
     // Light sidebar: plain text buttons, the selected page in accent fill.
     let mut col = column![].spacing(st::SPACE_XS).width(st::SIDEBAR_WIDTH);
-    for page in [Page::Instances, Page::Drift, Page::Plugins, Page::Processes] {
+    for page in [
+        Page::Instances,
+        Page::Drift,
+        Page::Plugins,
+        Page::Pool,
+        Page::Shared,
+        Page::Harnesses,
+        Page::Processes,
+    ] {
         let mut btn = button(text(page.label()).size(st::BODY).width(Length::Fill))
             .width(Length::Fill)
             .style(button::text)
@@ -443,6 +515,9 @@ pub fn view(state: &State) -> Element<'_, Message> {
         Page::Drift => crate::pages::drift::view(&state.drift).map(Message::Drift),
         Page::Plugins => crate::pages::plugins::view(&state.data, state.pending.as_ref()),
         Page::Processes => crate::pages::processes::view(&state.data, &state.proc_ui),
+        Page::Pool => pool::view(&state.pool).map(Message::Pool),
+        Page::Shared => shared::view(&state.shared).map(Message::Shared),
+        Page::Harnesses => harnesses::view(&state.harnesses).map(Message::Harnesses),
     };
     iced::widget::row![
         sidebar(state),

@@ -81,7 +81,6 @@ plugins-preview-disable = Выключение { $name } уберёт его ф�
 add-title = Новый инстанс
 add-back = Назад к инстансам
 add-harness = Harness
-add-harness-note = opencode и agy появятся в M7.
 add-id = ID инстанса
 add-id-note = ID нельзя переименовать: к ним привязана история T3.
 add-display-name = Отображаемое имя
@@ -118,3 +117,51 @@ remove-threads =
         [many] У T3 осталось { $count } потоков этого id; история сохранится, но не запустится.
        *[other] У T3 осталось { $count } потоков этого id; история сохранится, но не запустится.
     }
+
+nav-pool = Пул
+nav-shared = Общее
+nav-harnesses = Харнессы
+action-apply = Применить
+action-cancel = Отмена
+action-working = Выполняется…
+action-none = Менять нечего: всё уже синхронизировано.
+
+add-login-agy = У agy нет CLI для входа: войдите аккаунтом Google в Antigravity IDE. Это один аккаунт на пользователя ОС.
+
+pool-title = Пул
+pool-empty = В пуле пока нет записей.
+pool-enabled = включено
+pool-disabled = выключено
+pool-enable = Включить
+pool-disable = Выключить
+pool-remove = Удалить
+pool-add-title = Добавить запись
+pool-instance = Инстанс
+pool-model = Модель
+pool-no-models = Для этого инстанса нет кеша моделей: введите id модели.
+pool-options = Опции (k=v через запятую)
+pool-preview-add = Предпросмотр
+pool-import = Импорт избранного T3
+pool-preview-title = Предпросмотр изменения пула
+pool-import-count = К импорту избранных: { $count }.
+pool-warning = Предупреждение: { $what }
+
+shared-title = Общее
+shared-skills = Навыки
+shared-skills-sync = Синхронизировать навыки
+shared-instr = Файлы инструкций
+shared-instr-link = Связать файлы инструкций
+shared-mcp = MCP-серверы
+shared-mcp-sync = Синхронизировать MCP
+shared-mcp-hidden = Значения серверов скрыты.
+shared-mcp-none = Канонических MCP-серверов не найдено.
+shared-skills-dir = { $dir }: в порядке — { $ok }, нужна синхронизация — { $todo }
+shared-preview-title = Предпросмотр изменений
+
+harness-title = Харнессы
+harness-not-installed = не установлен
+harness-update = Обновить
+harness-install = Установить
+harness-run-title = Выполнить эту команду?
+harness-note = Команда выполняется как показано, больше ничего не затрагивается.
+harness-result = { $name }: { $what }

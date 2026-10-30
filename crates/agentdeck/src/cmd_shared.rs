@@ -3,9 +3,9 @@
 //! `Change` list with backups and supports --dry-run; status/list are
 //! read-only with secrets redacted.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use agentdeck_core::{Harness, Paths, Registry, claude, shared};
+use agentdeck_core::{Paths, shared};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -123,27 +123,11 @@ pub fn run_instructions(paths: &Paths, cmd: InstructionsCmd) -> anyhow::Result<(
     }
 }
 
-fn claude_secondaries(paths: &Paths, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let reg = Registry::load(paths)?;
-    let primary = home.join(".claude");
-    let mut out = Vec::new();
-    for inst in &reg.instances {
-        if inst.harness != Harness::Claude {
-            continue;
-        }
-        let dir = crate::cmd_claude::expand_tilde(&inst.home, home);
-        if dir != primary {
-            out.push(dir);
-        }
-    }
-    Ok(out)
-}
-
 pub fn run_mcp(paths: &Paths, cmd: McpCmd) -> anyhow::Result<()> {
     let home = home_dir()?;
     match cmd {
         McpCmd::List => {
-            let secondaries = claude_secondaries(paths, &home)?;
+            let secondaries = shared::claude_secondaries(paths, &home)?;
             let (redacted, targets) = shared::mcp_status(&home, paths, &secondaries);
             println!(
                 "canonical ({} servers, values redacted):",
@@ -162,7 +146,7 @@ pub fn run_mcp(paths: &Paths, cmd: McpCmd) -> anyhow::Result<()> {
             Ok(())
         }
         McpCmd::Sync { dry_run, prune } => {
-            let secondaries = claude_secondaries(paths, &home)?;
+            let secondaries = shared::claude_secondaries(paths, &home)?;
             let (changes, skipped) =
                 shared::plan_mcp_sync(&home, &paths.state_dir, &secondaries, prune)?;
             for name in &skipped {
@@ -173,7 +157,7 @@ pub fn run_mcp(paths: &Paths, cmd: McpCmd) -> anyhow::Result<()> {
                 return Ok(());
             }
             for c in &changes {
-                println!("{}", describe_mcp_change(c));
+                println!("{}", shared::describe_mcp_change(c));
             }
             if dry_run {
                 println!("dry-run: nothing changed");
@@ -184,30 +168,4 @@ pub fn run_mcp(paths: &Paths, cmd: McpCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
-}
-
-fn describe_mcp_change(change: &agentdeck_core::Change) -> String {
-    let agentdeck_core::Change::WriteFile {
-        path,
-        contents,
-        old,
-        backup,
-    } = change
-    else {
-        return change.describe();
-    };
-    if path.file_name().is_some_and(|n| n == ".claude.json") {
-        return claude::describe_change(change);
-    }
-    if path.file_name().is_some_and(|n| n == "config.toml") {
-        let suffix = match backup {
-            Some(dest) => format!(" (backup {})", dest.display()),
-            None => String::new(),
-        };
-        return format!(
-            "{}{suffix}",
-            shared::describe_codex_change(path, old.as_deref(), contents)
-        );
-    }
-    change.describe()
 }

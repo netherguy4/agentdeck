@@ -2,7 +2,7 @@
 //! secondary text, thin quota bars, a light sidebar and one confirm-panel
 //! shape used by every page. Only presentation: no behaviour lives here.
 
-use iced::widget::{column, container, progress_bar, rule, text};
+use iced::widget::{button, column, container, progress_bar, row, rule, text};
 use iced::{Element, Length};
 
 /// Spacing scale (px). Pages use these instead of ad-hoc numbers.
@@ -73,4 +73,32 @@ pub fn panel<'a, Message: 'a>(
         .padding(SPACE_S)
         .style(container::bordered_box)
         .into()
+}
+
+/// Preview panel with Apply / Cancel; `apply` is `None` while nothing can run.
+pub fn confirm_panel<'a, Message: Clone + 'a>(
+    heading_label: String,
+    lines: &'a [String],
+    (apply_label, on_apply): (String, Option<Message>),
+    (cancel_label, on_cancel): (String, Message),
+) -> Element<'a, Message> {
+    panel(
+        heading_label,
+        lines.iter().map(|l| body(l.clone()).into()).collect(),
+        vec![
+            button(body(apply_label))
+                .style(button::primary)
+                .on_press_maybe(on_apply)
+                .into(),
+            button(body(cancel_label))
+                .style(button::secondary)
+                .on_press(on_cancel)
+                .into(),
+        ],
+    )
+}
+
+/// Buttons side by side.
+pub fn actions<'a, Message: 'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    row(items).spacing(SPACE_S).into()
 }

@@ -818,6 +818,46 @@ fn codex_entry_matches(doc: &toml_edit::DocumentMut, name: &str, spec: &Value) -
     }
 }
 
+/// Non-primary Claude instance homes: the MCP sync targets.
+pub fn claude_secondaries(paths: &Paths, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let reg = crate::Registry::load(paths)?;
+    let primary = home.join(".claude");
+    Ok(reg
+        .instances
+        .iter()
+        .filter(|i| i.harness == crate::Harness::Claude)
+        .map(|i| crate::sync::expand_tilde(&i.home, home))
+        .filter(|dir| *dir != primary)
+        .collect())
+}
+
+/// One MCP change as redacted text (server values never reach output).
+pub fn describe_mcp_change(change: &Change) -> String {
+    let Change::WriteFile {
+        path,
+        contents,
+        old,
+        backup,
+    } = change
+    else {
+        return change.describe();
+    };
+    if path.file_name().is_some_and(|n| n == ".claude.json") {
+        return crate::claude::describe_change(change);
+    }
+    if path.file_name().is_some_and(|n| n == "config.toml") {
+        let suffix = match backup {
+            Some(dest) => format!(" (backup {})", dest.display()),
+            None => String::new(),
+        };
+        return format!(
+            "{}{suffix}",
+            describe_codex_change(path, old.as_deref(), contents)
+        );
+    }
+    change.describe()
+}
+
 /// Planned MCP sync plus server names skipped for an unknown shape.
 #[allow(clippy::type_complexity)]
 pub fn plan_mcp_sync(
