@@ -14,6 +14,12 @@ dependencies = [
 [[package]]
 name = "agentdeck-core"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "ai-usage"
