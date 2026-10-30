@@ -32,3 +32,14 @@ drift-title = Drift
 plugins-title = Plugins
 processes-title = Processes
 coming-soon = Coming in a later unit.
+
+plugins-empty = No plugins available.
+plugins-enable = Enable
+plugins-disable = Disable
+plugins-confirm = Confirm
+plugins-cancel = Cancel
+plugins-enabled = enabled
+plugins-disabled = disabled
+plugins-unavailable = unavailable (needs T3)
+plugins-preview-enable = Enabling { $name } will:
+plugins-preview-disable = Disabling { $name } will remove its files (data is kept):

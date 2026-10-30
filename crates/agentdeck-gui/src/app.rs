@@ -8,6 +8,7 @@ use iced::{Element, Length, Subscription, Task, Theme};
 
 use crate::data::{self, Data};
 use crate::i18n::loader;
+use crate::pages::plugins::Pending;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
@@ -34,12 +35,18 @@ pub enum Message {
     Tick,
     Loaded(Data),
     SelectPage(Page),
+    EnablePlugin(String),
+    DisablePlugin(String),
+    CancelPlugin,
+    ConfirmPlugin,
+    PluginDone(Result<String, String>),
 }
 
 pub struct State {
     page: Page,
     data: Data,
     paths: Option<agentdeck_core::Paths>,
+    pending: Option<Pending>,
 }
 
 impl State {
@@ -52,6 +59,7 @@ impl State {
                 page: Page::Instances,
                 data: Data::default(),
                 paths,
+                pending: None,
             },
             match first {
                 Some(paths) => Task::perform(async move { data::load(&paths) }, Message::Loaded),
@@ -66,6 +74,7 @@ impl State {
             page: Page::Instances,
             data,
             paths: Some(paths),
+            pending: None,
         }
     }
 
@@ -78,6 +87,7 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::SelectPage(page) => {
             state.page = page;
+            state.pending = None;
             Task::none()
         }
         Message::Tick => match state.paths.clone() {
@@ -88,7 +98,90 @@ pub fn update(state: &mut State, message: Message) -> Task<Message> {
             state.data = data;
             Task::none()
         }
+        Message::EnablePlugin(name) => {
+            preview_plugin(state, &name, true);
+            Task::none()
+        }
+        Message::DisablePlugin(name) => {
+            preview_plugin(state, &name, false);
+            Task::none()
+        }
+        Message::CancelPlugin => {
+            state.pending = None;
+            Task::none()
+        }
+        Message::ConfirmPlugin => match (state.paths.clone(), state.pending.clone()) {
+            (Some(paths), Some(pending)) => {
+                state.pending = None;
+                Task::perform(
+                    async move { apply_plugin(&paths, &pending) },
+                    Message::PluginDone,
+                )
+            }
+            _ => Task::none(),
+        },
+        Message::PluginDone(result) => {
+            if let Some(paths) = state.paths.clone() {
+                state.data = data::load(&paths);
+            }
+            if let Err(error) = result {
+                state.data.error = Some(error);
+            }
+            Task::none()
+        }
     }
+}
+
+/// Read-only preview of the enable/disable changes; failures surface as a
+/// one-line pending preview instead of a popup.
+fn preview_plugin(state: &mut State, name: &str, enable: bool) {
+    let Some(paths) = state.paths.clone() else {
+        return;
+    };
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let files = agentdeck_core::plugins::default_instruction_files(&home);
+    let planned = if enable {
+        agentdeck_core::plugins::plan_enable(&paths, &home, &files, &exe, name, false)
+    } else {
+        agentdeck_core::plugins::plan_disable(&paths, &home, &files, &exe, name)
+    };
+    state.pending = Some(match planned {
+        Ok(changes) => Pending {
+            name: name.to_string(),
+            enable,
+            preview: changes.iter().map(|c| c.describe()).collect(),
+        },
+        Err(error) => Pending {
+            name: name.to_string(),
+            enable,
+            preview: vec![format!("{error:#}")],
+        },
+    });
+}
+
+/// Apply a confirmed plugin change off the UI thread.
+fn apply_plugin(paths: &agentdeck_core::Paths, pending: &Pending) -> Result<String, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let files = agentdeck_core::plugins::default_instruction_files(&home);
+    let planned = if pending.enable {
+        agentdeck_core::plugins::plan_enable(paths, &home, &files, &exe, &pending.name, false)
+    } else {
+        agentdeck_core::plugins::plan_disable(paths, &home, &files, &exe, &pending.name)
+    }
+    .map_err(|e| format!("{e:#}"))?;
+    agentdeck_core::plugins::apply_all(paths, &pending.name, pending.enable, &planned)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(if pending.enable {
+        format!("enabled {}", pending.name)
+    } else {
+        format!("disabled {}", pending.name)
+    })
 }
 
 pub fn subscription(_state: &State) -> Subscription<Message> {
@@ -116,7 +209,7 @@ pub fn view(state: &State) -> Element<'_, Message> {
     let content: Element<'_, Message> = match state.page {
         Page::Instances => crate::pages::instances::view(&state.data),
         Page::Drift => crate::pages::other::drift(),
-        Page::Plugins => crate::pages::other::plugins(),
+        Page::Plugins => crate::pages::plugins::view(&state.data, state.pending.as_ref()),
         Page::Processes => crate::pages::other::processes(),
     };
     iced::widget::row![

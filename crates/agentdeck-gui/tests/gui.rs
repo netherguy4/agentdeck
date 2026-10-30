@@ -259,3 +259,106 @@ fn snapshots_en_ru_and_sidebar_navigation() {
     ui.find("Coming in a later unit.")
         .expect("drift placeholder body");
 }
+
+/// Plugins page: three rows, enable/disable preview + cancel, EN/RU snapshots.
+///
+/// HOME and XDG_CONFIG_HOME point at a temp dir so the status/probe reads are
+/// deterministic (launcher missing, unit not installed) and read-only.
+#[test]
+fn plugins_page_preview_cancel_and_snapshots() {
+    let env = lock_env();
+    // Deterministic HOME *before* loading: status reads stay inside the
+    // temp dir (launcher missing, unit not installed) and are read-only.
+    static HOME_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let fakehome = std::env::temp_dir().join(format!(
+        "agentdeck-gui-plughome-{}-{}",
+        std::process::id(),
+        HOME_N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&fakehome);
+    std::fs::create_dir_all(&fakehome).unwrap();
+    let old_home = std::env::var_os("HOME");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let old_systemctl = std::env::var_os("AGENTDECK_SYSTEMCTL");
+    unsafe {
+        std::env::set_var("HOME", &fakehome);
+        std::env::set_var("XDG_CONFIG_HOME", fakehome.join("config"));
+        // No real systemctl probes: nothing is ever installed or active here.
+        std::env::set_var("AGENTDECK_SYSTEMCTL", "/bin/false");
+    }
+    let (data, paths, _guard) = load_with_fixtures("plugins", &env);
+    assert_eq!(data.plugins.len(), 3);
+    std::fs::create_dir_all(SNAPSHOTS).unwrap();
+    let home = fakehome;
+
+    // Navigate to the Plugins page and snapshot EN + RU.
+    agentdeck_gui::i18n::set_language("en");
+    let mut state = app::State::for_tests(paths.clone(), data.clone());
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("Plugins").expect("plugins nav button");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    assert!(matches!(state.page(), agentdeck_gui::Page::Plugins));
+    for (lang, stem) in [("en", "plugins_en"), ("ru", "plugins_ru")] {
+        agentdeck_gui::i18n::set_language(lang);
+        let mut ui = iced_test::simulator(app::view(&state));
+        let snapshot = ui.snapshot(&iced::Theme::Dark).expect("headless snapshot");
+        assert!(
+            snapshot
+                .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
+                .expect("snapshot compare/write"),
+            "snapshot {stem} changed"
+        );
+        let golden = std::fs::read_dir(SNAPSHOTS)
+            .expect("snapshots dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with(stem))
+                    && p.extension().and_then(|e| e.to_str()) == Some("png")
+            })
+            .expect("golden written");
+        let bytes = std::fs::metadata(&golden).expect("golden png").len();
+        assert!(bytes > 1_024, "golden {} looks empty", golden.display());
+        assert!(bytes < 100 * 1024, "golden {} too big", golden.display());
+    }
+
+    // Enable flow: the preview lists changes, Cancel drops it without writes.
+    agentdeck_gui::i18n::set_language("en");
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.click("Enable agent-process").expect("enable button");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    let mut ui = iced_test::simulator(app::view(&state));
+    ui.find("Confirm").expect("preview confirm button");
+    ui.click("Cancel").expect("preview cancel button");
+    for message in ui.into_messages() {
+        let _ = app::update(&mut state, message);
+    }
+    // Nothing was applied: the link was never created, the registry untouched.
+    assert!(!home.join(".local/bin/agent-process").exists());
+    let raw = std::fs::read_to_string(paths.registry_file()).unwrap();
+    assert!(!raw.contains("[plugins]"), "{raw}");
+    let mut ui = iced_test::simulator(app::view(&state));
+    assert!(ui.find("Confirm").is_err(), "preview cleared after cancel");
+
+    unsafe {
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match old_systemctl {
+            Some(v) => std::env::set_var("AGENTDECK_SYSTEMCTL", v),
+            None => std::env::remove_var("AGENTDECK_SYSTEMCTL"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
