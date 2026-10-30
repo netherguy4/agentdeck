@@ -15,12 +15,15 @@ const SNAPSHOTS: &str = "tests/snapshots";
 // Goldens depend on this machine's fonts and GPU rasterizer, so CI only checks that rendering works.
 fn assert_snapshot(snapshot: &iced_test::simulator::Snapshot, stem: &str) {
     if std::env::var_os("CI").is_none() {
-        assert!(
-            snapshot
-                .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
-                .expect("snapshot compare/write"),
-            "snapshot {stem} changed"
-        );
+        // Goldens depend on this machine's fonts and GPU rasterizer.
+        if std::env::var_os("CI").is_none() {
+            assert!(
+                snapshot
+                    .matches_image(format!("{SNAPSHOTS}/{stem}.png"))
+                    .expect("snapshot compare/write"),
+                "snapshot {stem} changed"
+            );
+        }
         let golden = format!("{SNAPSHOTS}/{stem}-wgpu.png");
         let bytes = std::fs::metadata(&golden).expect("golden png").len();
         assert!(bytes < 100 * 1024, "golden {golden} must stay under 100 KB");
