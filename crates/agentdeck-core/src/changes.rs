@@ -4,6 +4,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub enum Change {
@@ -121,6 +122,19 @@ pub fn apply_changes(changes: &[Change]) -> anyhow::Result<()> {
         change.apply()?;
     }
     Ok(())
+}
+
+/// Backup destination for a path that must be moved aside before linking:
+/// `<state_dir>/backups/<file-name>.<unix-secs>.<nanos>`.
+pub fn backup_dest(state_dir: &Path, file_name: &str) -> PathBuf {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    state_dir.join("backups").join(format!(
+        "{file_name}.{}.{:09}",
+        now.as_secs(),
+        now.subsec_nanos()
+    ))
 }
 
 /// Build a `WriteFile` change, or `None` when old and new bytes are identical.
